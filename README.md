@@ -4,9 +4,12 @@ This project is a pytorch VRAM allocator that implements on-demand offloading of
 
 ## Support:
 
-* **Nvidia GPUs only**
-* **Pytorch 2.8+**
-* **Cuda 12.8+**
+* **Nvidia CUDA GPUs**
+* **Intel XPU GPUs on Linux** through the Level Zero backend
+* **Pytorch 2.8+** for the CUDA backend
+* A PyTorch XPU build exposing the current stream's SYCL queue for the Intel
+  backend and providing `torch.xpu.memory.XPUPluggableAllocator`
+* **Cuda 12.8+** for the Nvidia backend
 * **Windows 11+** / **Linux** as per python ManyLinux support
 
 ---
@@ -48,6 +51,31 @@ see examples/example.py
 
 * VBAR allocation is done with `cuMemAddressReserve()`, faulting with `cuMemCreate()` and `cuMemMap()` and all frees done with appropriate converse APIs.
 * For consistency with VBAR memory management, main pytorch allocator plugin is also implemented with `cuMemAddressReserve` -> `cuMemCreate` -> `cuMemMap`. This also behaves a lot better on Windows systems with System Memory fallback.
+* The Intel XPU backend shares PyTorch's current SYCL queue and Level Zero
+  context, and implements VBAR allocation with `zeVirtualMemReserve()`,
+  `zePhysicalMemCreate()`, `zeVirtualMemMap()`, and their converse APIs. It
+  installs an XPU allocator backed by `sycl::malloc_device()` for regular
+  tensors. Before that allocator grows physically, it evicts unpinned VBAR
+  pages according to the same AIMDO budget. Freed regular allocations are
+  cached per device and SYCL queue, with completion barriers protecting reuse.
+  `torch.xpu.empty_cache()` releases completed cached blocks, and the allocator
+  reports its live and reserved bytes through PyTorch's XPU memory-stat APIs.
+
+### Build the Intel XPU backend
+
+Build in a Linux environment containing PyTorch XPU, the oneAPI DPC++ compiler,
+and Level Zero development files:
+
+```bash
+./scripts/build-linux-xpu.sh
+```
+
+The command creates `comfy_aimdo/aimdo_xpu.so`. Vendor detection selects it
+automatically for a PyTorch build whose version ends in `+xpu`; callers may
+also request `control.init(implementation="xpu")` explicitly. ComfyUI must be
+started with DynamicVRAM enabled so its model patcher creates and faults VBAR
+weights. The XPU allocator must be installed before the first XPU stream or
+allocation is initialized; `control.init()` performs that installation.
 
 ## Caveats:
 

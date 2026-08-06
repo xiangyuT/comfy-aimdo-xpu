@@ -1,4 +1,5 @@
 import ctypes
+import logging
 
 from . import control
 
@@ -54,7 +55,7 @@ class VRAMBuffer:
 
     def __del__(self):
         ptr = getattr(self, "_ptr", None)
-        if ptr:
+        if ptr and getattr(control, "lib", None) is not None:
             if not lib.vrambuf_destroy(ptr):
-                raise RuntimeError("VRAM destroy failed: device context unavailable")
+                logging.warning("VRAM destroy failed: device context unavailable")
             self._ptr = None

@@ -64,7 +64,18 @@ def _file_handle(file_obj):
     return msvcrt.get_osfhandle(fd) if os.name == "nt" else fd
 
 
+def _device_stream_ptr(stream, device):
+    if stream:
+        return int(stream)
+    if control.implementation != "xpu" or device is None or int(device) < 0:
+        return 0
+
+    import torch
+    return int(torch.xpu.current_stream(torch.device("xpu", int(device))).sycl_queue)
+
+
 def read_file_to_device(file_obj, file_offset, size, stream, device_ptr, device, mark_cold=True):
+    stream = _device_stream_ptr(stream, device)
     if not lib.hostbuf_file_reader_read(int(device), _file_handle(file_obj),
                                         int(file_offset), int(size), int(stream) or None,
                                         int(device_ptr), bool(mark_cold)):
@@ -103,6 +114,7 @@ class HostBuffer:
 
     def read_file_slice(self, file_obj, file_offset, size, offset=0, stream=0, device_ptr=0, device=-1):
         device = -1 if device is None else int(device)
+        stream = _device_stream_ptr(stream, device)
         if not lib.hostbuf_read_file_slice(self._ptr, device, _file_handle(file_obj),
                                            int(file_offset), int(size), int(offset),
                                            int(stream) or None, int(device_ptr)):

@@ -1,8 +1,36 @@
 import ctypes
+import itertools
+import os
+import sys
 
 from . import control
 
 lib = control.lib
+
+_trace_enabled = os.environ.get("AIMDO_XPU_VBAR_TRACE") == "1"
+_trace_calls = itertools.count(1)
+
+
+def _trace_vbar(operation, phase, alloc, caller, result=None):
+    if not _trace_enabled:
+        return
+    vbar, offset, size = alloc
+    module = caller.f_locals.get("s") or caller.f_locals.get("m")
+    module_name = getattr(module, "seed_key", None)
+    module_type = type(module).__qualname__ if module is not None else None
+    weight = getattr(module, "weight", None)
+    weight_shape = tuple(weight.shape) if weight is not None else None
+    weight_dtype = str(weight.dtype) if weight is not None else None
+    print(
+        "[AIMDO XPU VBAR] "
+        f"call={next(_trace_calls)} op={operation} phase={phase} "
+        f"vbar=0x{vbar.base_addr:x} offset={offset - vbar.base_addr} "
+        f"size={size} module={module_name!r} type={module_type!r} "
+        f"weight_shape={weight_shape!r} weight_dtype={weight_dtype!r} "
+        f"result={result!r}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 # Bindings
 if lib is not None:
@@ -133,13 +161,23 @@ class ModelVBAR:
             self._ptr = None
 
 def vbar_fault(alloc):
+    caller = sys._getframe(1)
+    _trace_vbar("fault", "begin", alloc, caller)
     vbar, offset, size = alloc
-    return vbar.fault(offset, size)
+    result = vbar.fault(offset, size)
+    _trace_vbar(
+        "fault", "end", alloc, caller,
+        "vbar" if result is not None else "fallback",
+    )
+    return result
 
 def vbar_unpin(alloc):
     if alloc is not None:
+        caller = sys._getframe(1)
+        _trace_vbar("unpin", "begin", alloc, caller)
         vbar, offset, size = alloc
         vbar.unpin(offset, size)
+        _trace_vbar("unpin", "end", alloc, caller)
 
 def vbar_signature_compare(a, b):
     if a is None or b is None:
