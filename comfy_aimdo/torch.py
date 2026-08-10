@@ -8,6 +8,8 @@ from . import control
 def get_tensor_from_raw_ptr(ptr, size, device):
     device = torch.device(device)
     if device.type == "xpu":
+        if device.index is None:
+            device = torch.device("xpu", torch.xpu.current_device())
         # XPU virtual addresses may occupy the unsigned half of the address
         # space, while the private storage constructor accepts a signed
         # int64. Preserve the pointer bits across that boundary.
