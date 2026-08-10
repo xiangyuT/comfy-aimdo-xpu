@@ -157,7 +157,13 @@ class ModelVBAR:
         ptr = getattr(self, "_ptr", None)
         aimdo_lib = getattr(control, "lib", None)
         if aimdo_lib is not None and ptr:
-            aimdo_lib.vbar_free(self._devctx, ptr)
+            # control.init() may create a new CDLL wrapper after a focused
+            # test calls deinit().  That wrapper has not necessarily inherited
+            # the model-vbar argtypes bound above, so preserve pointer width
+            # explicitly when freeing through the current library handle.
+            aimdo_lib.vbar_free(
+                ctypes.c_void_p(self._devctx), ctypes.c_void_p(ptr)
+            )
             self._ptr = None
 
 def vbar_fault(alloc):

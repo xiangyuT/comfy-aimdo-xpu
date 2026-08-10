@@ -1,0 +1,10 @@
+LIBRARY ze_loader.dll
+EXPORTS
+    zeInit
+    zePhysicalMemCreate
+    zePhysicalMemDestroy
+    zeVirtualMemFree
+    zeVirtualMemMap
+    zeVirtualMemQueryPageSize
+    zeVirtualMemReserve
+    zeVirtualMemUnmap

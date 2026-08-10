@@ -2,7 +2,13 @@ extern "C" {
 #include "gpu_dispatch.h"
 }
 
+#if __has_include(<level_zero/ze_api.h>)
 #include <level_zero/ze_api.h>
+#elif __has_include(<ze_api.h>)
+#include <ze_api.h>
+#else
+#error "Level Zero headers were not found"
+#endif
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 #include <sycl/sycl.hpp>
 
@@ -12,6 +18,7 @@ extern "C" {
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -21,6 +28,12 @@ extern "C" {
 extern "C" bool aimdo_xpu_prepare_allocation(int device, size_t size);
 extern "C" bool aimdo_xpu_retry_allocation(int device, size_t size);
 extern "C" bool aimdo_xpu_account_allocation(int device, int64_t delta);
+
+#if defined(_WIN32) || defined(_WIN64)
+#define AIMDO_XPU_EXPORT __declspec(dllexport)
+#else
+#define AIMDO_XPU_EXPORT __attribute__((visibility("default")))
+#endif
 
 struct CUevent_st {
     sycl::event event;
@@ -518,7 +531,35 @@ CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
             1, std::memory_order_relaxed);
         trace_sync("h2d", "end", call, queue, size);
         return CUDA_SUCCESS;
+    } catch (const sycl::exception &error) {
+        const std::error_code code = error.code();
+        std::fprintf(
+            stderr,
+            "[AIMDO XPU ERROR] op=h2d queue=%p destination=%p size=%zu "
+            "sycl_code=%d category=%s message=%s\n",
+            static_cast<void *>(queue), reinterpret_cast<void *>(destination),
+            size, code.value(), code.category().name(), error.what());
+        std::fflush(stderr);
+        trace_sync("h2d", "error", call, queue, size);
+        return kCudaErrorUnknown;
+    } catch (const std::exception &error) {
+        std::fprintf(
+            stderr,
+            "[AIMDO XPU ERROR] op=h2d queue=%p destination=%p size=%zu "
+            "exception=%s\n",
+            static_cast<void *>(queue), reinterpret_cast<void *>(destination),
+            size, error.what());
+        std::fflush(stderr);
+        trace_sync("h2d", "error", call, queue, size);
+        return kCudaErrorUnknown;
     } catch (...) {
+        std::fprintf(
+            stderr,
+            "[AIMDO XPU ERROR] op=h2d queue=%p destination=%p size=%zu "
+            "exception=<non-standard>\n",
+            static_cast<void *>(queue), reinterpret_cast<void *>(destination),
+            size);
+        std::fflush(stderr);
         trace_sync("h2d", "error", call, queue, size);
         return kCudaErrorUnknown;
     }
@@ -726,8 +767,42 @@ void free_torch_block(void *pointer, sycl::queue *queue) {
     }
 }
 
-CUresult xpu_device_get_luid(char *, unsigned int *, CUdevice) {
+CUresult xpu_device_get_luid(char *luid, unsigned int *node_mask,
+                             CUdevice device) {
+#if defined(_WIN32) || defined(_WIN64)
+    auto *state = find_device(device);
+    if (!luid || !node_mask || !state) {
+        return kCudaErrorUnknown;
+    }
+    try {
+        const sycl::device sycl_device = state->queue->get_device();
+        if (!sycl_device.has(sycl::aspect::ext_intel_device_info_luid) ||
+            !sycl_device.has(
+                sycl::aspect::ext_intel_device_info_node_mask)) {
+            return kCudaErrorUnknown;
+        }
+        const auto luid_value = sycl_device.get_info<
+            sycl::ext::intel::info::device::luid>();
+        const uint32_t node_mask_value = sycl_device.get_info<
+            sycl::ext::intel::info::device::node_mask>();
+        constexpr size_t kWindowsLuidSize = 8;
+        if (luid_value.size() != kWindowsLuidSize ||
+            node_mask_value == 0 ||
+            (node_mask_value & (node_mask_value - 1)) != 0) {
+            return kCudaErrorUnknown;
+        }
+        std::memcpy(luid, luid_value.data(), kWindowsLuidSize);
+        *node_mask = node_mask_value;
+        return CUDA_SUCCESS;
+    } catch (...) {
+        return kCudaErrorUnknown;
+    }
+#else
+    (void)luid;
+    (void)node_mask;
+    (void)device;
     return kCudaErrorUnknown;
+#endif
 }
 
 }  // namespace
@@ -737,17 +812,17 @@ extern "C" {
 AimdoCudaDispatch g_cuda{};
 PFN_deviceGetProperties g_device_get_properties = nullptr;
 
-__attribute__((visibility("default"))) void *xpu_alloc_fn(
+AIMDO_XPU_EXPORT void *xpu_alloc_fn(
     size_t size, int device, sycl::queue *queue) {
     return allocate_torch_block(size, device, queue);
 }
 
-__attribute__((visibility("default"))) void xpu_free_fn(
+AIMDO_XPU_EXPORT void xpu_free_fn(
     void *pointer, size_t, int, sycl::queue *queue) {
     free_torch_block(pointer, queue);
 }
 
-__attribute__((visibility("default"))) bool xpu_allocator_empty_cache(
+AIMDO_XPU_EXPORT bool xpu_allocator_empty_cache(
     bool wait) {
     std::lock_guard<std::mutex> guard(g_torch_allocator_mutex);
     for (auto block = g_torch_cached_blocks.begin();
@@ -761,7 +836,7 @@ __attribute__((visibility("default"))) bool xpu_allocator_empty_cache(
     return g_torch_cached_blocks.empty();
 }
 
-__attribute__((visibility("default"))) bool xpu_allocator_get_memory_stats(
+AIMDO_XPU_EXPORT bool xpu_allocator_get_memory_stats(
     int device, uint64_t *values, size_t count) {
     if (!values || count < 4) {
         return false;
@@ -774,14 +849,14 @@ __attribute__((visibility("default"))) bool xpu_allocator_get_memory_stats(
     return true;
 }
 
-__attribute__((visibility("default"))) void xpu_allocator_reset_peak_stats(
+AIMDO_XPU_EXPORT void xpu_allocator_reset_peak_stats(
     int device) {
     std::lock_guard<std::mutex> guard(g_torch_allocator_mutex);
     g_torch_peak_active_bytes[device] = g_torch_active_bytes[device];
     g_torch_peak_reserved_bytes[device] = g_torch_reserved_bytes[device];
 }
 
-__attribute__((visibility("default"))) bool xpu_set_queues(
+AIMDO_XPU_EXPORT bool xpu_set_queues(
     const int *device_ids, const uint64_t *queue_pointers, size_t count) {
     if (!device_ids || !queue_pointers || count == 0) {
         return false;
@@ -826,7 +901,7 @@ __attribute__((visibility("default"))) bool xpu_set_queues(
     }
 }
 
-__attribute__((visibility("default"))) bool xpu_get_vmm_stats(
+AIMDO_XPU_EXPORT bool xpu_get_vmm_stats(
     uint64_t *values, size_t count) {
     if (!values || count < kXpuStatCount) {
         return false;

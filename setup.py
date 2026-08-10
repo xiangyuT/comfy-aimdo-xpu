@@ -10,6 +10,7 @@ class BinaryDistribution(Distribution):
             "comfy_aimdo/aimdo.so",
             "comfy_aimdo/aimdo_xpu.so",
             "comfy_aimdo/aimdo.dll",
+            "comfy_aimdo/aimdo_xpu.dll",
         ))
     def get_tag(self):
         t = super().get_tag()

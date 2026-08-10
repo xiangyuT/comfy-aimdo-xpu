@@ -45,7 +45,15 @@ bool aimdo_wddm_init(CUdevice dev)
 #else
     unsigned int node_mask;
     if (!CHECK_CU(cuDeviceGetLuid((char *)&cuda_luid, &node_mask, dev))) {
+#if defined(AIMDO_XPU)
+        /* Keep AIMDO functional on older runtimes or drivers that do not
+         * expose the SYCL/Level Zero device LUID properties. */
+        log(INFO,
+            "comfy-aimdo XPU WDDM LUID unavailable; using Level Zero memory pressure\n");
+        return true;
+#else
         goto fail;
+#endif
     }
 #endif
 
@@ -108,6 +116,7 @@ fail:
 bool poll_budget_deficit(const char **prevailing_deficit_method)
 {
     DXGI_QUERY_VIDEO_MEMORY_INFO info;
+    uint64_t effective_usage = total_vram_usage;
     uint64_t effective_budget = vram_capacity;
     size_t free_vram = 0, total_vram = 0;
     bool used_nvml = false;
@@ -122,10 +131,20 @@ bool poll_budget_deficit(const char **prevailing_deficit_method)
 
     if (g_wddm_adapter) {
         if (SUCCEEDED(g_wddm_adapter->lpVtbl->QueryVideoMemoryInfo(g_wddm_adapter, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+            /*
+             * CurrentUsage is WDDM's complete local-memory accounting for
+             * this process. Unlike total_vram_usage it includes allocations
+             * made directly by SYCL, oneDNN, the driver, and other libraries
+             * that do not pass through AIMDO. Use it as the sampled baseline;
+             * budget_deficit() applies AIMDO's recorded usage delta until the
+             * next rate-limited DXGI query.
+             */
+            effective_usage = info.CurrentUsage;
             effective_budget = info.Budget;
             log(DEBUG,
-                "%s: WDDM budget=%zu MB usage=%zu MB reservation=%zu MB available=%zu MB\n",
+                "%s: WDDM budget=%zu MB usage=%zu MB recorded=%zu MB reservation=%zu MB available=%zu MB\n",
                 __func__, (size_t)(info.Budget / M), (size_t)(info.CurrentUsage / M),
+                (size_t)(total_vram_usage / M),
                 (size_t)(info.CurrentReservation / M),
                 (size_t)(info.AvailableForReservation / M));
         } else {
@@ -133,8 +152,11 @@ bool poll_budget_deficit(const char **prevailing_deficit_method)
         }
     }
 
-    deficit_sync = (ssize_t)(total_vram_usage + WDDM_BUDGET_HEADROOM) - (ssize_t)effective_budget;
-    *prevailing_deficit_method = "WDDM budget";
+    deficit_sync = (ssize_t)effective_usage + (ssize_t)WDDM_BUDGET_HEADROOM -
+                   (ssize_t)effective_budget;
+    *prevailing_deficit_method = g_wddm_adapter
+        ? "WDDM budget"
+        : "physical capacity";
 
 #if defined(AIMDO_CUDA)
     used_nvml = nvml_device && aimdo_nvml_memory_info(nvml_device, &free_vram, &total_vram);

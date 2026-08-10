@@ -1,6 +1,7 @@
 import os
 import ctypes
 import platform
+import sys
 from pathlib import Path
 import logging
 import importlib.util
@@ -15,6 +16,8 @@ _xpu_allocator_ready = False
 _torch_xpu_empty_cache_original = None
 _torch_xpu_memory_stats_original = None
 _torch_xpu_reset_peak_stats_original = None
+_windows_dll_directories = []
+_windows_dll_directory_paths = set()
 
 _LOG_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p)
 _LOG_LEVELS = {
@@ -57,6 +60,21 @@ def detect_vendor():
     return None
 
 
+def _add_xpu_runtime_dll_directories():
+    if platform.system() != "Windows" or not hasattr(os, "add_dll_directory"):
+        return
+
+    candidates = (
+        Path(sys.executable).resolve().parent / "Library" / "bin",
+        Path(sys.prefix).resolve() / "Library" / "bin",
+    )
+    for candidate in candidates:
+        candidate = candidate.resolve()
+        if candidate.is_dir() and str(candidate) not in _windows_dll_directory_paths:
+            _windows_dll_directories.append(os.add_dll_directory(str(candidate)))
+            _windows_dll_directory_paths.add(str(candidate))
+
+
 def init(implementation: str | None = None, simple_vram_headroom: int | None = None, nvml_pressure: bool = False):
     global lib, _log_callback, _torch_allocator
     global _torch_allocator_library, _xpu_allocator_ready
@@ -89,6 +107,8 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
         base_path = Path(__file__).parent.resolve()
         system = platform.system()
         if system == "Windows":
+            if implementation == "xpu":
+                _add_xpu_runtime_dll_directories()
             ext = "dll"
             mode = 0
         elif system == "Linux":
