@@ -1,4 +1,5 @@
 import gc
+import sys
 import tempfile
 
 import pytest
@@ -258,6 +259,40 @@ def test_torch_allocator_reuses_completed_same_size_block():
     )
     assert active_empty == active_before
     assert reserved_empty == reserved_before
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="Windows keeps completed USM blocks out of the allocation hot path",
+)
+def test_windows_torch_allocator_defers_different_size_usm_release():
+    device = torch.device("xpu", torch.xpu.current_device())
+    assert control.empty_xpu_allocator_cache(wait=True)
+    stats_before = control.get_xpu_vmm_stats()
+
+    first = torch.empty(3 << 20, dtype=torch.uint8, device=device)
+    first.fill_(11)
+    del first
+    torch.xpu.synchronize()
+
+    second = None
+    try:
+        # A cache miss of a different size must not synchronously call
+        # sycl::free from the allocator callback on Windows. The Level Zero
+        # USM release can wait indefinitely under high residency while the
+        # prompt worker holds the GIL and allocator mutex.
+        second = torch.empty(5 << 20, dtype=torch.uint8, device=device)
+        second.fill_(13)
+        torch.xpu.synchronize()
+        stats_after = control.get_xpu_vmm_stats()
+        assert (
+            stats_after["torch_allocator_physical_release_calls"]
+            == stats_before["torch_allocator_physical_release_calls"]
+        )
+    finally:
+        del second
+        torch.xpu.synchronize()
+        assert control.empty_xpu_allocator_cache(wait=True)
 
 
 def test_priority_evicts_the_lowest_vbar_first():

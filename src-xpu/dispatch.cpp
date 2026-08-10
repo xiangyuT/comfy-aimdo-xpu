@@ -130,6 +130,18 @@ bool sync_trace_enabled() {
     return enabled;
 }
 
+bool proactive_cache_release_enabled() {
+#if defined(_WIN32) || defined(_WIN64)
+    static const bool enabled = [] {
+        const char *value = std::getenv("AIMDO_XPU_EAGER_USM_RELEASE");
+        return value && std::strcmp(value, "1") == 0;
+    }();
+    return enabled;
+#else
+    return true;
+#endif
+}
+
 void trace_sync(const char *operation, const char *phase, uint64_t call,
                 const void *queue, size_t size = 0) {
     if (!sync_trace_enabled()) {
@@ -629,9 +641,15 @@ bool event_is_complete(const sycl::event &event) {
 }
 
 bool release_torch_block(XpuTorchBlock &block, bool wait) {
+    const uint64_t call =
+        g_stats[kTorchAllocatorPhysicalReleaseCalls].load(
+            std::memory_order_relaxed) + 1;
+    trace_sync("torch_usm_free", "begin", call, &block.queue, block.size);
     try {
         if (block.has_ready) {
             if (!wait && !event_is_complete(block.ready)) {
+                trace_sync("torch_usm_free", "deferred", call, &block.queue,
+                           block.size);
                 return false;
             }
             block.ready.wait_and_throw();
@@ -645,8 +663,10 @@ bool release_torch_block(XpuTorchBlock &block, bool wait) {
             1, std::memory_order_relaxed);
         g_stats[kTorchAllocatorPhysicalReleaseBytes].fetch_add(
             block.size, std::memory_order_relaxed);
+        trace_sync("torch_usm_free", "end", call, &block.queue, block.size);
         return true;
     } catch (...) {
+        trace_sync("torch_usm_free", "error", call, &block.queue, block.size);
         return false;
     }
 }
@@ -696,9 +716,15 @@ void *allocate_torch_block(size_t size, int device, sycl::queue *queue) {
         }
     }
 
-    // Retain exact-size blocks for the next iteration, but return completed
-    // blocks of other sizes to Level Zero before physically growing the pool.
-    release_cached_torch_blocks(device, false);
+    // Retain exact-size blocks for the next iteration. Linux also returns
+    // completed blocks of other sizes before physically growing the pool.
+    // On Windows, sycl::free can wait indefinitely in the Level Zero/UMF
+    // residency path under high WDDM usage. Keep it out of the allocator hot
+    // path by default; explicit empty_cache and the allocation retry path
+    // remain able to release cached storage.
+    if (proactive_cache_release_enabled()) {
+        release_cached_torch_blocks(device, false);
+    }
     if (!aimdo_xpu_prepare_allocation(device, size)) {
         return nullptr;
     }

@@ -111,6 +111,13 @@ allocation delta between rate-limited DXGI samples. Older runtimes without the
 LUID properties fall back to Level Zero free-memory.
 ComfyUI must be launched with `--enable-dynamic-vram` on XPU until
 upstream ComfyUI enables DynamicVRAM by default for that device type.
+On Windows, completed USM blocks of other sizes remain cached instead of being
+synchronously released on every allocator cache miss. This avoids a Level
+Zero/UMF residency wait that can stall the ComfyUI prompt worker under high
+WDDM usage. Explicit `torch.xpu.empty_cache()` and the allocation retry path
+can still release cached storage. Set `AIMDO_XPU_EAGER_USM_RELEASE=1` before
+process startup only when the previous eager-release behavior is needed for
+diagnosis. Linux retains the existing eager-release policy.
 
 When the Visual Studio installation does not include the Windows SDK/UCRT, the
 script also recognizes the project-local Microsoft Windows SDK NuGet packages
