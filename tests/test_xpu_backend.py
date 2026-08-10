@@ -67,6 +67,35 @@ def test_vbar_raw_tensor_hit_evict_and_refault_signature():
     _destroy_vbar(vbar)
 
 
+@pytest.mark.parametrize(
+    "device_arg",
+    ["xpu", torch.device("xpu")],
+    ids=["string", "torch-device"],
+)
+def test_aimdo_to_tensor_resolves_indexless_xpu_to_current_device(
+    device_arg,
+):
+    from comfy_aimdo.model_vbar import ModelVBAR
+    from comfy_aimdo.torch import aimdo_to_tensor
+
+    current_device = torch.xpu.current_device()
+    concrete_device = torch.device("xpu", current_device)
+    vbar = ModelVBAR(32 << 20, current_device)
+    allocation = vbar.alloc(8 << 20)
+    assert vbar.fault(allocation[1], allocation[2]) is not None
+
+    tensor = aimdo_to_tensor(allocation, device_arg)
+    assert tensor.device == concrete_device
+    assert tensor.data_ptr() == allocation[1]
+    tensor.fill_(53)
+    torch.xpu.synchronize()
+    assert tensor[:4096].cpu().eq(53).all()
+
+    vbar.unpin(allocation[1], allocation[2])
+    del tensor, allocation
+    _destroy_vbar(vbar)
+
+
 def test_unmap_waits_for_inflight_xpu_work():
     from comfy_aimdo.model_vbar import ModelVBAR
     from comfy_aimdo.torch import aimdo_to_tensor
