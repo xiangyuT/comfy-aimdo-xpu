@@ -76,6 +76,11 @@ also request `control.init(implementation="xpu")` explicitly. ComfyUI must be
 started with DynamicVRAM enabled so its model patcher creates and faults VBAR
 weights. The XPU allocator must be installed before the first XPU stream or
 allocation is initialized; `control.init()` performs that installation.
+Within ComfyUI, installing this package does not enable the XPU allocator by
+itself: launch ComfyUI with `--enable-dynamic-vram` to opt in. Starting without
+that option, or with `--disable-dynamic-vram`, preserves PyTorch's native XPU
+allocator and the legacy ComfyUI model patcher. Standalone callers can opt in
+programmatically with `control.init(implementation="xpu")`.
 
 ### Build the Intel XPU backend on Windows
 

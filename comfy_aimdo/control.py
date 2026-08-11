@@ -60,6 +60,22 @@ def detect_vendor():
     return None
 
 
+def _xpu_initialization_requested(implementation_was_explicit):
+    """Keep ComfyUI XPU allocator installation explicitly opt-in."""
+    if implementation_was_explicit:
+        return True
+
+    comfy_cli_args = sys.modules.get("comfy.cli_args")
+    if comfy_cli_args is None:
+        return True
+
+    parsed_args = getattr(comfy_cli_args, "args", None)
+    if parsed_args is None or not hasattr(parsed_args, "enable_dynamic_vram"):
+        return True
+
+    return bool(parsed_args.enable_dynamic_vram)
+
+
 def _add_xpu_runtime_dll_directories():
     if platform.system() != "Windows" or not hasattr(os, "add_dll_directory"):
         return
@@ -88,12 +104,23 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
         lib.set_nvml_pressure(bool(nvml_pressure))
         return True
 
+    implementation_was_explicit = implementation is not None
     if implementation is None:
         implementation = detect_vendor()
 
     if implementation is None:
         logging.warning("Could not autodetect AIMDO implementation, assuming Nvidia")
         implementation = "cuda"
+
+    if (
+        implementation == "xpu"
+        and not _xpu_initialization_requested(implementation_was_explicit)
+    ):
+        logging.info(
+            "comfy-aimdo XPU allocator was not explicitly enabled; "
+            "using the native PyTorch XPU allocator"
+        )
+        return False
 
     globals()["implementation"] = implementation
 
