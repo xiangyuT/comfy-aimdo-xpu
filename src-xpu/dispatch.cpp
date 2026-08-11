@@ -838,6 +838,30 @@ extern "C" {
 AimdoCudaDispatch g_cuda{};
 PFN_deviceGetProperties g_device_get_properties = nullptr;
 
+int aimdo_xpu_device_index_from_native(void *native_device) {
+    std::lock_guard<std::mutex> guard(g_devices_mutex);
+    for (const auto &state : g_devices) {
+        if (reinterpret_cast<void *>(state.device) == native_device) {
+            return state.id;
+        }
+    }
+    return -1;
+}
+
+void aimdo_xpu_record_native_allocation(size_t size) {
+    g_stats[kTorchAllocatorPhysicalAllocCalls].fetch_add(
+        1, std::memory_order_relaxed);
+    g_stats[kTorchAllocatorPhysicalAllocBytes].fetch_add(
+        size, std::memory_order_relaxed);
+}
+
+void aimdo_xpu_record_native_release(size_t size) {
+    g_stats[kTorchAllocatorPhysicalReleaseCalls].fetch_add(
+        1, std::memory_order_relaxed);
+    g_stats[kTorchAllocatorPhysicalReleaseBytes].fetch_add(
+        size, std::memory_order_relaxed);
+}
+
 AIMDO_XPU_EXPORT void *xpu_alloc_fn(
     size_t size, int device, sycl::queue *queue) {
     return allocate_torch_block(size, device, queue);

@@ -12,10 +12,53 @@ import os
 import runpy
 import signal
 import sys
+import threading
+import time
 from pathlib import Path
 
 
 _stats_emitted = False
+_stats_stop = threading.Event()
+
+
+def _xpu_stats_snapshot():
+    from comfy_aimdo import control
+
+    vmm = control.get_xpu_vmm_stats()
+    if not vmm:
+        return None
+    allocator = control.get_xpu_allocator_memory_stats()
+    return {
+        "monotonic_seconds": round(time.monotonic(), 3),
+        "recorded_vram_bytes": control.get_total_vram_usage(),
+        "allocator_active_bytes": allocator[0],
+        "allocator_reserved_bytes": allocator[1],
+        "physical_alloc_calls": vmm["torch_allocator_physical_alloc_calls"],
+        "physical_alloc_bytes": vmm["torch_allocator_physical_alloc_bytes"],
+        "physical_release_calls": vmm[
+            "torch_allocator_physical_release_calls"
+        ],
+        "physical_release_bytes": vmm[
+            "torch_allocator_physical_release_bytes"
+        ],
+        "map_bytes": vmm["map_bytes"],
+        "unmap_bytes": vmm["unmap_bytes"],
+        "host_to_device_bytes": vmm["host_to_device_bytes"],
+    }
+
+
+def _sample_xpu_stats(interval):
+    while not _stats_stop.wait(interval):
+        try:
+            snapshot = _xpu_stats_snapshot()
+        except Exception:
+            continue
+        if snapshot is not None:
+            print(
+                f"[AIMDO XPU PERIODIC STATS] "
+                f"{json.dumps(snapshot, sort_keys=True)}",
+                flush=True,
+            )
 
 
 def _emit_xpu_vmm_stats():
@@ -52,6 +95,16 @@ def main():
     main_path = Path(known.comfyui_main).resolve()
     sys.path.insert(0, str(main_path.parent))
     sys.argv = [str(main_path), *remaining]
+    stats_interval = float(os.environ.get("AIMDO_XPU_STATS_INTERVAL", "0"))
+    if stats_interval > 0:
+        stats_thread = threading.Thread(
+            target=_sample_xpu_stats,
+            args=(stats_interval,),
+            name="aimdo-xpu-stats",
+            daemon=True,
+        )
+        stats_thread.start()
+        atexit.register(_stats_stop.set)
     atexit.register(_emit_xpu_vmm_stats)
     signal.signal(signal.SIGTERM, _terminate)
     signal.signal(signal.SIGINT, _terminate)

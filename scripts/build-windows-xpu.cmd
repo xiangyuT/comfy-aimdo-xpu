@@ -73,6 +73,9 @@ for %%S in (hostbuf-plat.c model-mmap.c thread-plat.c xfer-file-plat.c shmem-det
 
 cl.exe %COMMON_FLAGS% "%ROOT_DIR%\src-xpu\stubs.c" /Fo"%BUILD_DIR%\xpu-stubs.obj"
 if errorlevel 1 exit /b 1
+cl.exe %COMMON_FLAGS% /EHsc /I"%LEVEL_ZERO_INCLUDE%" ^
+    "%ROOT_DIR%\src-xpu\ze-tracer.cpp" /Fo"%BUILD_DIR%\xpu-ze-tracer.obj"
+if errorlevel 1 exit /b 1
 icx-cl.exe /nologo /c /O2 /MD /EHsc /std:c++17 -fsycl /DAIMDO_XPU ^
     /I"%ROOT_DIR%\src" /I"%LEVEL_ZERO_INCLUDE%" ^
     "%ROOT_DIR%\src-xpu\dispatch.cpp" /Fo"%BUILD_DIR%\xpu-dispatch.obj"
@@ -95,6 +98,7 @@ icx-cl.exe /nologo -fsycl /LD /Fe:"%OUTPUT_PATH%" ^
     "%BUILD_DIR%\win-xfer-file-plat.obj" ^
     "%BUILD_DIR%\win-shmem-detect.obj" ^
     "%BUILD_DIR%\xpu-stubs.obj" ^
+    "%BUILD_DIR%\xpu-ze-tracer.obj" ^
     "%BUILD_DIR%\xpu-dispatch.obj" ^
     /link /LIBPATH:"%BUILD_DIR%" ze_loader.lib dxgi.lib dxguid.lib onecore.lib
 if errorlevel 1 exit /b 1

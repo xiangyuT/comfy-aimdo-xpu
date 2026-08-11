@@ -166,7 +166,7 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
         lib.xpu_allocator_reset_peak_stats.restype = None
 
         try:
-            if _torch_allocator is None:
+            if system != "Windows" and _torch_allocator is None:
                 import torch
                 from . import torch as aimdo_torch
 
@@ -309,7 +309,11 @@ def deinit():
     global lib, devctxs, _log_callback, _xpu_allocator_ready
     if lib is not None:
         if implementation == "xpu" and _xpu_allocator_ready:
-            lib.xpu_allocator_empty_cache(True)
+            if platform.system() == "Windows":
+                import torch
+                torch.xpu.empty_cache()
+            else:
+                lib.xpu_allocator_empty_cache(True)
         lib.cleanup()
         devctxs = []
         lib.plat_cleanup()
@@ -379,6 +383,10 @@ def get_xpu_vmm_stats():
 def empty_xpu_allocator_cache(wait=False):
     if lib is None or implementation != "xpu" or not _xpu_allocator_ready:
         return False
+    if platform.system() == "Windows":
+        import torch
+        torch.xpu.empty_cache()
+        return True
     return bool(lib.xpu_allocator_empty_cache(bool(wait)))
 
 
@@ -396,6 +404,15 @@ def _xpu_device_index(device=None):
 def get_xpu_allocator_memory_stats(device=None):
     if lib is None or implementation != "xpu" or not _xpu_allocator_ready:
         return (0, 0, 0, 0)
+    if platform.system() == "Windows":
+        import torch
+        stats = torch.xpu.memory_stats(device)
+        return (
+            int(stats.get("active_bytes.all.current", 0)),
+            int(stats.get("reserved_bytes.all.current", 0)),
+            int(stats.get("active_bytes.all.peak", 0)),
+            int(stats.get("reserved_bytes.all.peak", 0)),
+        )
     values = (ctypes.c_uint64 * 4)()
     if not lib.xpu_allocator_get_memory_stats(
         _xpu_device_index(device), values, len(values)
@@ -406,5 +423,9 @@ def get_xpu_allocator_memory_stats(device=None):
 
 def reset_xpu_allocator_peak_stats(device=None):
     if lib is None or implementation != "xpu" or not _xpu_allocator_ready:
+        return
+    if platform.system() == "Windows":
+        import torch
+        torch.xpu.reset_peak_memory_stats(device)
         return
     lib.xpu_allocator_reset_peak_stats(_xpu_device_index(device))

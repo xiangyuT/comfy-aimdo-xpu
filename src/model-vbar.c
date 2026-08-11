@@ -2,6 +2,14 @@
 
 #define VBAR_PAGE_SIZE (32 << 20)
 
+/* A WDDM physical allocation can still fail after the sampled budget says a
+ * single page fits.  Keep this second-stage margin Windows/XPU-only: Linux
+ * receives exact allocator-time pressure and must retain its existing
+ * behavior. */
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+#define VBAR_WDDM_RETRY_RECLAIM (512 << 20)
+#endif
+
 #define VBAR_GET_PAGE_NR(x) ((x) / VBAR_PAGE_SIZE)
 #define VBAR_GET_PAGE_NR_UP(x) VBAR_GET_PAGE_NR((x) + VBAR_PAGE_SIZE - 1)
 
@@ -110,7 +118,7 @@ static inline bool mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unp
     return do_free;
 }
 
-size_t vbars_free(ssize_t size) {
+static size_t vbars_free_except(ssize_t size, ModelVBAR *preserved) {
     size_t pages_needed;
     bool dirty = false;
 
@@ -125,6 +133,9 @@ size_t vbars_free(ssize_t size) {
 
     for (ModelVBAR *i = lowest_priority.higher; pages_needed && i != &highest_priority;
          i = i->higher) {
+        if (i == preserved) {
+            continue;
+        }
         for (;pages_needed && i->watermark > i->watermark_limit; i->watermark--) {
             if (!dirty) {
                 CHECK_CU(cuCtxSynchronize());
@@ -141,6 +152,10 @@ size_t vbars_free(ssize_t size) {
     }
 
     return pages_needed;
+}
+
+size_t vbars_free(ssize_t size) {
+    return vbars_free_except(size, NULL);
 }
 
 static inline size_t move_cursor_to_absent(ModelVBAR *mv, size_t cursor) {
@@ -293,6 +308,21 @@ void vbars_reset_watermark_limits(void *devctx) {
 }
 
 SHARED_EXPORT
+void vbars_prepare_allocation(void *devctx, void *vbar, uint64_t size) {
+    set_devctx((AimdoContext *)devctx);
+    one_time_setup();
+    /*
+     * Windows cannot evict from the Level Zero allocation callback because
+     * doing so waits re-entrantly on the same SYCL queue.  Its model-boundary
+     * reclaim is therefore only a prediction based on native allocator
+     * history.  It may discard lower-priority models, but it must not discard
+     * pages from the active model on the strength of that prediction alone.
+     * A later vbar_fault() still applies exact live pressure to every VBAR.
+     */
+    vbars_free_except(budget_deficit((size_t)size), (ModelVBAR *)vbar);
+}
+
+SHARED_EXPORT
 void vbar_prioritize(void *devctx, void *vbar, uint64_t clamp) {
     ModelVBAR *mv = (ModelVBAR *)vbar;
 
@@ -365,6 +395,7 @@ int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size, uint32_
         CUresult err = CUDA_ERROR_OUT_OF_MEMORY;
         CUdeviceptr vaddr = mv->vbar + page_nr * VBAR_PAGE_SIZE;
         ResidentPage *rp = &mv->residency_map[page_nr];
+        ssize_t allocation_deficit;
 
         if (rp->handle) {
             signature[signature_index++] = rp->serial;
@@ -387,19 +418,47 @@ int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size, uint32_
 
         log(VERBOSE, "VBAR needs to allocate VRAM for page %d\n", (int)page_nr);
 
-        if (budget_deficit(VBAR_PAGE_SIZE) > 0 ||
+        allocation_deficit = budget_deficit(VBAR_PAGE_SIZE);
+        if (allocation_deficit > 0 ||
             (err = three_stooges(vaddr, VBAR_PAGE_SIZE, mv->device, &rp->handle)) != CUDA_SUCCESS) {
+            size_t retry_reclaim = allocation_deficit > (ssize_t)VBAR_PAGE_SIZE
+                ? (size_t)allocation_deficit
+                : (size_t)VBAR_PAGE_SIZE;
+
             if (err != CUDA_ERROR_OUT_OF_MEMORY) {
                 log(AIMDO_LOG_ERROR, "VRAM Allocation failed (non OOM)\n");
                 return VBAR_FAULT_ERROR;
             }
-            log(DEBUG, "VBAR allocator attempt exceeds available VRAM ...\n");
-            vbars_free(VBAR_PAGE_SIZE);
+            log(DEBUG,
+                "VBAR allocator attempt exceeds available VRAM; reclaiming %zu MB ...\n",
+                retry_reclaim / M);
+            vbars_free((ssize_t)retry_reclaim);
             if (page_end > mv->watermark) {
                 log(DEBUG, "VBAR allocation cancelled due to backup-free watermark reduction\n");
                 return VBAR_FAULT_OOM;
             }
             if ((err = three_stooges(vaddr, VBAR_PAGE_SIZE, mv->device, &rp->handle)) != CUDA_SUCCESS) {
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+                if (err == CUDA_ERROR_OUT_OF_MEMORY) {
+                    /* The DXGI budget is sampled and Level Zero may need more
+                     * contiguous physical headroom than one VBAR page.  This
+                     * path is reached only after a real allocation failure,
+                     * so reclaiming the WDDM safety margin is not speculative. */
+                    log(DEBUG,
+                        "VBAR Windows XPU retry reclaiming an additional %zu MB ...\n",
+                        (size_t)VBAR_WDDM_RETRY_RECLAIM / M);
+                    vbars_free(VBAR_WDDM_RETRY_RECLAIM);
+                    if (page_end > mv->watermark) {
+                        log(DEBUG,
+                            "VBAR allocation cancelled after Windows XPU retry reclaim\n");
+                        return VBAR_FAULT_OOM;
+                    }
+                    err = three_stooges(vaddr, VBAR_PAGE_SIZE, mv->device,
+                                        &rp->handle);
+                }
+#endif
+            }
+            if (err != CUDA_SUCCESS) {
                 log(AIMDO_LOG_ERROR, "VRAM Allocation failed\n");
                 return VBAR_FAULT_ERROR;
             }

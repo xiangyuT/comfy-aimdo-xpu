@@ -55,6 +55,7 @@ typedef struct AimdoContext {
 #if defined(_WIN32) || defined(_WIN64)
     void *_wddm_adapter; /* IDXGIAdapter3* */
     uint64_t _wddm_timestamp_last_check;
+    uint64_t _wddm_nonlocal_usage_baseline;
 #endif
 } AimdoContext;
 
@@ -91,6 +92,7 @@ bool set_devctx_for_current_cuda_device(void);
 #if defined(_WIN32) || defined(_WIN64)
 #define g_wddm_adapter              (*(IDXGIAdapter3 **)&g_devctx->_wddm_adapter)
 #define wddm_timestamp_last_check   (g_devctx->_wddm_timestamp_last_check)
+#define wddm_nonlocal_usage_baseline (g_devctx->_wddm_nonlocal_usage_baseline)
 #endif
 #define control_timestamp_last_check (g_devctx->_control_timestamp_last_check)
 

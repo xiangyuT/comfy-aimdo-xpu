@@ -87,6 +87,18 @@ bool aimdo_wddm_init(CUdevice dev)
                 (unsigned long)(unsigned int)desc.AdapterLuid.HighPart,
                 (unsigned long)desc.AdapterLuid.LowPart);
 
+#if defined(AIMDO_XPU)
+            {
+                DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal_info;
+                if (SUCCEEDED(g_wddm_adapter->lpVtbl->QueryVideoMemoryInfo(
+                        g_wddm_adapter, 0,
+                        DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
+                        &nonlocal_info))) {
+                    wddm_nonlocal_usage_baseline = nonlocal_info.CurrentUsage;
+                }
+            }
+#endif
+
             adapter->lpVtbl->Release(adapter);
             factory->lpVtbl->Release(factory);
             return true;
@@ -113,11 +125,31 @@ fail:
 #define WDDM_BUDGET_HEADROOM (512 * 1024 * 1024)
 #define CUDA_BUDGET_HEADROOM (192 * 1024 * 1024)
 
+static bool wddm_trace_enabled(void)
+{
+    static int enabled = -1;
+    char value[2];
+
+    if (enabled < 0) {
+        enabled = GetEnvironmentVariableA(
+            "AIMDO_XPU_WDDM_TRACE", value, sizeof(value)) > 0 &&
+            value[0] == '1';
+    }
+    return enabled != 0;
+}
+
+void aimdo_wddm_force_poll(void)
+{
+    wddm_timestamp_last_check = 0;
+}
+
 bool poll_budget_deficit(const char **prevailing_deficit_method)
 {
     DXGI_QUERY_VIDEO_MEMORY_INFO info;
+    DXGI_QUERY_VIDEO_MEMORY_INFO nonlocal_info;
     uint64_t effective_usage = total_vram_usage;
     uint64_t effective_budget = vram_capacity;
+    uint64_t nonlocal_excess = 0;
     size_t free_vram = 0, total_vram = 0;
     bool used_nvml = false;
 
@@ -147,6 +179,30 @@ bool poll_budget_deficit(const char **prevailing_deficit_method)
                 (size_t)(total_vram_usage / M),
                 (size_t)(info.CurrentReservation / M),
                 (size_t)(info.AvailableForReservation / M));
+#if defined(AIMDO_XPU)
+            if (SUCCEEDED(g_wddm_adapter->lpVtbl->QueryVideoMemoryInfo(
+                    g_wddm_adapter, 0,
+                    DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
+                    &nonlocal_info))) {
+                if (!wddm_nonlocal_usage_baseline) {
+                    wddm_nonlocal_usage_baseline = nonlocal_info.CurrentUsage;
+                }
+                if (nonlocal_info.CurrentUsage >
+                    wddm_nonlocal_usage_baseline) {
+                    nonlocal_excess = nonlocal_info.CurrentUsage -
+                                      wddm_nonlocal_usage_baseline;
+                }
+                if (wddm_trace_enabled()) {
+                    log(INFO,
+                        "AIMDO XPU WDDM local_budget=%zu local_usage=%zu nonlocal_budget=%zu nonlocal_usage=%zu nonlocal_baseline=%zu recorded=%zu\n",
+                        (size_t)info.Budget, (size_t)info.CurrentUsage,
+                        (size_t)nonlocal_info.Budget,
+                        (size_t)nonlocal_info.CurrentUsage,
+                        (size_t)wddm_nonlocal_usage_baseline,
+                        (size_t)total_vram_usage);
+                }
+            }
+#endif
         } else {
             log(WARNING, "comfy-aimdo WDDM VRAM query failed. Using physical capacity as fallback\n");
         }
@@ -157,6 +213,17 @@ bool poll_budget_deficit(const char **prevailing_deficit_method)
     *prevailing_deficit_method = g_wddm_adapter
         ? "WDDM budget"
         : "physical capacity";
+#if defined(AIMDO_XPU)
+    /* Runtime bookkeeping can move a small amount of memory into the
+     * non-local segment without indicating device-memory fallback. Only
+     * react once the excess clears the same 512 MiB safety margin used for
+     * the local WDDM budget. */
+    if (nonlocal_excess > WDDM_BUDGET_HEADROOM &&
+        (ssize_t)nonlocal_excess > deficit_sync) {
+        deficit_sync = (ssize_t)nonlocal_excess;
+        *prevailing_deficit_method = "WDDM non-local usage";
+    }
+#endif
 
 #if defined(AIMDO_CUDA)
     used_nvml = nvml_device && aimdo_nvml_memory_info(nvml_device, &free_vram, &total_vram);
