@@ -4,6 +4,10 @@ Status: unresolved. This document records confirmed evidence and failed local
 experiments; it is not a claim that MiniMax H3 acceptance passes on Windows.
 Last consolidated: 2026-08-11.
 
+The exact build toolchain, Portable runtime, model set, launch policy, and
+four-part acceptance gate are recorded in
+`WINDOWS_XPU_BUILD_TEST_ACCEPTANCE.md`.
+
 ## Source state retained after the investigation
 
 The worktree was returned to commit `323c0e0`. All later uncommitted allocator,

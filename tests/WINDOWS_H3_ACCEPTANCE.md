@@ -1,5 +1,11 @@
 # Windows XPU MiniMax H3 acceptance
 
+The complete build/test environment and the performance, WDDM, and liveness
+gates are defined in
+`docs/WINDOWS_XPU_BUILD_TEST_ACCEPTANCE.md`. This file describes the automated
+prompt and media portion only. `ACCEPTANCE_PASS` from the client is not, by
+itself, complete Windows DynamicVRAM acceptance.
+
 ## Workload
 
 The Windows AIMDO milestone is accepted with a MiniMax H3 text-to-video
@@ -35,7 +41,7 @@ acceptance client with the Portable Python environment:
 
 ## Pass criteria
 
-The test passes only when:
+The automated output/media portion passes only when:
 
 1. All three prompts report `execution_success`.
 2. Every output is a non-empty MP4 with 1280x736 resolution, 24 fps, 362
@@ -48,5 +54,7 @@ The test passes only when:
    error.
 
 The acceptance client prints `ACCEPTANCE_PASS` after its automated prompt and
-media checks succeed. Server-log and Windows system-event checks are performed
-separately for the same test window.
+media checks succeed. Performance stability, WDDM local/non-local behavior,
+forward progress, server-log errors, and Windows system events must be checked
+separately for the same test window according to the complete environment and
+acceptance document.
