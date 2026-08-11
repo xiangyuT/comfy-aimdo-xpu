@@ -94,8 +94,11 @@ def main():
             established_watermark = active_vbar.get_watermark()
             active_vbar.prioritize()
             reprioritized_watermark = active_vbar.get_watermark()
-            assert reprioritized_watermark == established_watermark
-            expected = "speculative reclaim preserved the active VBAR"
+            assert reprioritized_watermark == active_vbar.get_nr_pages()
+            expected = (
+                "speculative reclaim preserved the active VBAR and "
+                "reprioritization reopened its fault range"
+            )
         else:
             after_lower = _resident(lower_vbar)
             after_active = _resident(active_vbar)

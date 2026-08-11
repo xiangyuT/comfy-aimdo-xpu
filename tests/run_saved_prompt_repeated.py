@@ -21,18 +21,31 @@ def load_prompt(path: Path) -> dict:
     return record["prompt"][2]
 
 
-def make_uncached(prompt: dict, run_index: int) -> tuple[int, str]:
+def make_uncached(
+    prompt: dict,
+    run_index: int,
+    megapixels: float | None = None,
+    duration_seconds: float | None = None,
+    steps: int | None = None,
+) -> tuple[int, str]:
     seed = 917_000_000_000_000 + run_index
     prefix = f"video/aimdo_saved_prompt_run{run_index}_{uuid.uuid4().hex[:8]}"
     found_seed = False
     found_output = False
     for node in prompt.values():
-        if node.get("class_type") == "RandomNoise":
+        class_type = node.get("class_type")
+        if class_type == "RandomNoise":
             node["inputs"]["noise_seed"] = seed
             found_seed = True
-        elif node.get("class_type") == "SaveVideo":
+        elif class_type == "SaveVideo":
             node["inputs"]["filename_prefix"] = prefix
             found_output = True
+        elif class_type == "ResolutionSelector" and megapixels is not None:
+            node["inputs"]["megapixels"] = megapixels
+        elif class_type == "PrimitiveFloat" and duration_seconds is not None:
+            node["inputs"]["value"] = duration_seconds
+        elif class_type == "BasicScheduler" and steps is not None:
+            node["inputs"]["steps"] = steps
     if not found_seed or not found_output:
         raise RuntimeError("saved prompt lacks RandomNoise or SaveVideo")
     return seed, prefix
@@ -59,7 +72,13 @@ async def run(args):
     async with aiohttp.ClientSession(timeout=timeout, trust_env=False) as session:
         for run_index in range(1, args.runs + 1):
             prompt = copy.deepcopy(base_prompt)
-            seed, prefix = make_uncached(prompt, run_index)
+            seed, prefix = make_uncached(
+                prompt,
+                run_index,
+                megapixels=args.megapixels,
+                duration_seconds=args.duration_seconds,
+                steps=args.steps,
+            )
             started = time.monotonic()
             async with session.post(
                 f"{server}/prompt",
@@ -102,6 +121,9 @@ def main():
     parser.add_argument("--server", default="http://127.0.0.1:8188")
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--timeout-seconds", type=float, default=4 * 60 * 60)
+    parser.add_argument("--megapixels", type=float)
+    parser.add_argument("--duration-seconds", type=float)
+    parser.add_argument("--steps", type=int)
     asyncio.run(run(parser.parse_args()))
 
 

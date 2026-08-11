@@ -249,9 +249,9 @@ def test_torch_allocator_pressure_preserves_active_vbar_priority():
 
 @pytest.mark.skipif(
     sys.platform != "win32",
-    reason="Linux reprioritization intentionally reopens the VBAR watermark",
+    reason="Windows model-boundary pressure uses deferred native growth",
 )
-def test_windows_reprioritize_retains_established_watermark():
+def test_windows_reprioritize_reopens_pressure_reduced_watermark():
     from comfy_aimdo.model_vbar import ModelVBAR
 
     device = torch.device("xpu", torch.xpu.current_device())
@@ -259,8 +259,7 @@ def test_windows_reprioritize_retains_established_watermark():
     allocation = vbar.alloc(64 << 20)
     assert vbar.fault(allocation[1], allocation[2]) is not None
     vbar.unpin(allocation[1], allocation[2])
-    # First activation keeps normal reset-to-full semantics. The watermark
-    # established after it represents a completed sampler working set.
+    # Establish a pressure-reduced working set after the first activation.
     vbar.prioritize()
     vbar.set_watermark(32 << 20)
     assert vbar.get_watermark() == 1
@@ -279,8 +278,14 @@ def test_windows_reprioritize_retains_established_watermark():
 
     vbar.prioritize()
 
-    assert vbar.get_watermark() == 1
+    # Reprioritization must reopen the whole address range. Restoring the old
+    # watermark as a hard ceiling makes tiled models reload every later layer
+    # through the temporary host-to-device fallback on every tile.
+    assert vbar.get_watermark() == vbar.get_nr_pages() == 2
     assert vbar.get_residency() == [1, 0]
+    assert vbar.fault(allocation[1] + (32 << 20), 32 << 20) is not None
+    vbar.unpin(allocation[1] + (32 << 20), 32 << 20)
+    assert vbar.get_residency() == [1, 1]
     del allocation
     _destroy_vbar(vbar)
 

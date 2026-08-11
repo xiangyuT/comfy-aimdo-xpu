@@ -66,14 +66,12 @@ see examples/example.py
   model-prioritization boundary, AIMDO instead uses Torch's observed peak minus
   current reserved memory as the next native-growth hint and reclaims VBAR
   pages before sampler work is submitted. This speculative reclaim may evict
-  lower-priority VBARs but explicitly preserves the active VBAR at the
-  watermark established by earlier exact faults. Reprioritizing on Windows
-  retains that working-set watermark on repeated activation when deferred
-  native growth is pending, instead of reopening previously offloaded tail
-  pages immediately before a speculative reclaim. First activation and calls
-  without deferred growth keep the normal reset-to-full behavior. Subsequent
-  VBAR faults account for exact live pressure and may lower the watermark
-  further when actually required.
+  lower-priority VBARs but explicitly preserves the active VBAR. Reprioritizing
+  on Windows reopens the active model's full virtual address range; retaining a
+  pressure-reduced watermark as a hard ceiling would make tiled models stream
+  all later weights from host storage on every tile. Subsequent VBAR faults
+  account for exact live pressure and may lower the watermark again when
+  actually required.
 * On Linux, AIMDO continues to install its XPU pluggable allocator backed by
   `sycl::malloc_device()`. Freed regular allocations are cached per device and
   SYCL queue, with completion barriers protecting reuse.
