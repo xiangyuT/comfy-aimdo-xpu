@@ -8,6 +8,10 @@ from . import control
 lib = control.lib
 
 _trace_enabled = os.environ.get("AIMDO_XPU_VBAR_TRACE") == "1"
+_boundary_trace_enabled = (
+    os.environ.get("AIMDO_XPU_BOUNDARY_TRACE") == "1"
+)
+_VBAR_PAGE_SIZE = 32 << 20
 _trace_calls = itertools.count(1)
 
 
@@ -42,6 +46,10 @@ if lib is not None:
     lib.vbar_set_watermark.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
 
     lib.vbars_reset_watermark_limits.argtypes = [ctypes.c_void_p]
+
+    lib.vbars_prepare_allocation.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64
+    ]
 
     lib.vbar_prioritize.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
 
@@ -84,11 +92,74 @@ class ModelVBAR:
         self.max_size = size
         self.offset = 0
         self.base_addr = lib.vbar_get(self._devctx, self._ptr)
+        self._prioritized_once = False
 
     def prioritize(self, malloc_async_clamp=None):
         if malloc_async_clamp is None:
             malloc_async_clamp = ctypes.c_uint64(-1).value
+        was_prioritized = self._prioritized_once
+        previous_watermark = None
+        if sys.platform == "win32" and self._prioritized_once:
+            # A lower watermark is the working-set boundary established by
+            # exact pressure during earlier faults. Reopening it on every
+            # model switch makes repeated Windows workflows fault, evict, and
+            # reload the same tail pages until allocation eventually fails.
+            previous_watermark = lib.vbar_get_watermark(
+                self._devctx, self._ptr
+            )
         lib.vbar_prioritize(self._devctx, self._ptr, malloc_async_clamp)
+        if sys.platform == "win32":
+            _, reserved, _, peak_reserved = (
+                control.get_xpu_allocator_memory_stats(self.device)
+            )
+            anticipated_growth = max(0, peak_reserved - reserved)
+            restored_watermark = False
+            if anticipated_growth and self._prioritized_once:
+                # Linux's pluggable allocator can safely grow a newly
+                # prioritized model under exact allocation-time pressure.
+                # Windows only has a historical model-boundary estimate when
+                # deferred native growth exists, so retain the last exact
+                # working-set watermark for this speculative path. With no
+                # deferred growth, prioritize keeps its normal reset-to-full
+                # behavior (needed by explicit free/refault callers).
+                lib.vbar_set_watermark(
+                    self._devctx,
+                    self._ptr,
+                    previous_watermark * _VBAR_PAGE_SIZE,
+                )
+                restored_watermark = True
+                # Level Zero allocation callbacks cannot safely wait on the
+                # same SYCL queue. Reclaim at this model-switch boundary using
+                # the native allocator's observed peak as the next-burst hint.
+                # This is speculative, so the native helper may reclaim other
+                # lower-priority VBARs but must preserve this active VBAR at
+                # the exact working-set watermark restored above.
+                lib.vbars_prepare_allocation(
+                    self._devctx, self._ptr, anticipated_growth
+                )
+            elif anticipated_growth:
+                # First activation has no previous sampler working set. It
+                # keeps the normal full watermark, while speculative reclaim
+                # may still discard lower-priority VBARs.
+                lib.vbars_prepare_allocation(
+                    self._devctx, self._ptr, anticipated_growth
+                )
+            if _boundary_trace_enabled:
+                current_watermark = lib.vbar_get_watermark(
+                    self._devctx, self._ptr
+                )
+                print(
+                    "[AIMDO XPU BOUNDARY] "
+                    f"vbar=0x{self.base_addr:x} "
+                    f"was_prioritized={was_prioritized} "
+                    f"previous_watermark={previous_watermark} "
+                    f"current_watermark={current_watermark} "
+                    f"reserved={reserved} peak_reserved={peak_reserved} "
+                    f"anticipated_growth={anticipated_growth} "
+                    f"restored_watermark={restored_watermark}",
+                    flush=True,
+                )
+        self._prioritized_once = True
 
     def deprioritize(self):
         lib.vbar_deprioritize(self._devctx, self._ptr)

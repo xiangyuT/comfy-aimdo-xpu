@@ -8,7 +8,8 @@ This project is a pytorch VRAM allocator that implements on-demand offloading of
 * **Intel XPU GPUs on Linux and Windows** through the Level Zero backend
 * **Pytorch 2.8+** for the CUDA backend
 * A PyTorch XPU build exposing the current stream's SYCL queue for the Intel
-  backend and providing `torch.xpu.memory.XPUPluggableAllocator`
+  backend. Linux additionally requires
+  `torch.xpu.memory.XPUPluggableAllocator`.
 * **Cuda 12.8+** for the Nvidia backend
 * **Windows 11+** / **Linux** as per python ManyLinux support
 
@@ -53,13 +54,33 @@ see examples/example.py
 * For consistency with VBAR memory management, main pytorch allocator plugin is also implemented with `cuMemAddressReserve` -> `cuMemCreate` -> `cuMemMap`. This also behaves a lot better on Windows systems with System Memory fallback.
 * The Intel XPU backend shares PyTorch's current SYCL queue and Level Zero
   context, and implements VBAR allocation with `zeVirtualMemReserve()`,
-  `zePhysicalMemCreate()`, `zeVirtualMemMap()`, and their converse APIs. It
-  installs an XPU allocator backed by `sycl::malloc_device()` for regular
-  tensors. Before that allocator grows physically, it evicts unpinned VBAR
-  pages according to the same AIMDO budget. Freed regular allocations are
-  cached per device and SYCL queue, with completion barriers protecting reuse.
-  `torch.xpu.empty_cache()` releases completed cached blocks, and the allocator
-  reports its live and reserved bytes through PyTorch's XPU memory-stat APIs.
+  `zePhysicalMemCreate()`, `zeVirtualMemMap()`, and their converse APIs.
+* On Windows, PyTorch retains ownership of its native XPU caching allocator.
+  AIMDO registers official Level Zero tracing callbacks for
+  `zeMemAllocDevice()`, `zeMemFree()`, and `zeMemFreeExt()`. Unpinned VBAR
+  pressure is sampled and native growth is accounted by those callbacks, while
+  Torch keeps its normal block splitting, coalescing, stream ordering, OOM
+  retry, statistics, and `empty_cache()` behavior. Unlike CUDA, VBAR eviction
+  is not performed re-entrantly inside the Level Zero allocation callback:
+  waiting on the same SYCL queue from `zeMemAllocDevice()` can deadlock. At a
+  model-prioritization boundary, AIMDO instead uses Torch's observed peak minus
+  current reserved memory as the next native-growth hint and reclaims VBAR
+  pages before sampler work is submitted. This speculative reclaim may evict
+  lower-priority VBARs but explicitly preserves the active VBAR at the
+  watermark established by earlier exact faults. Reprioritizing on Windows
+  retains that working-set watermark on repeated activation when deferred
+  native growth is pending, instead of reopening previously offloaded tail
+  pages immediately before a speculative reclaim. First activation and calls
+  without deferred growth keep the normal reset-to-full behavior. Subsequent
+  VBAR faults account for exact live pressure and may lower the watermark
+  further when actually required.
+* On Linux, AIMDO continues to install its XPU pluggable allocator backed by
+  `sycl::malloc_device()`. Freed regular allocations are cached per device and
+  SYCL queue, with completion barriers protecting reuse.
+
+The allocator and `--reserve-vram` interaction differs between Linux and
+Windows. See [XPU platform memory policy](docs/XPU_PLATFORM_MEMORY_POLICY.md)
+for the policy boundary and a minimal regression reproducer.
 
 ### Build the Intel XPU backend on Linux
 
@@ -100,8 +121,9 @@ scripts\build-windows-xpu.cmd
 ```
 
 The command creates `comfy_aimdo\aimdo_xpu.dll`. The build generates a small
-import library for the Level Zero entry points used by AIMDO; at runtime the
-DLL uses `ze_loader.dll` installed by the Intel graphics driver. Set
+import library for the Level Zero and tracing entry points used by AIMDO; at
+runtime the DLL uses `ze_loader.dll` installed by the Intel graphics driver.
+Set
 `LEVEL_ZERO_INCLUDE` before running the script when the headers are stored
 elsewhere. On Windows, the XPU device LUID is matched to its DXGI adapter so
 AIMDO can use both WDDM local-memory `CurrentUsage` and `Budget` as its sampled
@@ -111,13 +133,16 @@ allocation delta between rate-limited DXGI samples. Older runtimes without the
 LUID properties fall back to Level Zero free-memory.
 ComfyUI must be launched with `--enable-dynamic-vram` on XPU until
 upstream ComfyUI enables DynamicVRAM by default for that device type.
-On Windows, completed USM blocks of other sizes remain cached instead of being
-synchronously released on every allocator cache miss. This avoids a Level
-Zero/UMF residency wait that can stall the ComfyUI prompt worker under high
-WDDM usage. Explicit `torch.xpu.empty_cache()` and the allocation retry path
-can still release cached storage. Set `AIMDO_XPU_EAGER_USM_RELEASE=1` before
-process startup only when the previous eager-release behavior is needed for
-diagnosis. Linux retains the existing eager-release policy.
+On Windows, do not replace Torch's XPU allocator with AIMDO's pluggable
+allocator. The Level Zero tracer observes only physical pool growth and
+release; completed tensor blocks remain under Torch's native cache policy and
+`torch.xpu.empty_cache()` remains the native implementation. WDDM non-local
+usage is treated as fallback pressure only after it exceeds a 512 MiB margin,
+so normal runtime bookkeeping does not cause repeated VBAR eviction. Linux
+retains the existing pluggable-allocator and immediate-pressure policy.
+For focused Windows diagnosis, set `AIMDO_XPU_WDDM_TRACE=1` to log DXGI
+local/non-local usage and budgets, and `AIMDO_XPU_ALLOCATION_TRACE=1` to log
+physical Level Zero allocation requests. Both traces are disabled by default.
 
 When the Visual Studio installation does not include the Windows SDK/UCRT, the
 script also recognizes the project-local Microsoft Windows SDK NuGet packages

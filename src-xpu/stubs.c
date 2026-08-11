@@ -1,5 +1,6 @@
 #include "plat.h"
 
+#if !defined(_WIN32) && !defined(_WIN64)
 bool aimdo_setup_hooks(void) {
     log(DEBUG, "%s: XPU keeps the native Torch allocator; no allocator hooks installed\n",
         __func__);
@@ -8,6 +9,7 @@ bool aimdo_setup_hooks(void) {
 
 void aimdo_teardown_hooks(void) {
 }
+#endif
 
 int aimdo_xpu_current_device(void) {
     return g_devctx ? g_devctx->_device_id : -1;
@@ -21,7 +23,22 @@ bool aimdo_xpu_prepare_allocation(int device, size_t size) {
     if (!set_devctx_for_device(device)) {
         return false;
     }
+#if defined(_WIN32) || defined(_WIN64)
+    const char *deficit_method = "unknown";
+
+    /* Refresh WDDM before large model allocations so a preceding allocation
+     * that fell back to non-local memory is visible before the next residency
+     * request. The Level Zero tracer runs inside zeMemAllocDevice: evicting a
+     * VBAR here would call queue.wait() re-entrantly and can deadlock. Sample
+     * pressure now; the next VBAR fault applies the recorded allocation delta
+     * and evicts from a normal, queue-safe call site. */
+    if (size >= (size_t)1 << 30) {
+        aimdo_wddm_force_poll();
+    }
+    poll_budget_deficit(&deficit_method);
+#else
     vbars_free(budget_deficit(size));
+#endif
     return true;
 }
 
@@ -29,7 +46,11 @@ bool aimdo_xpu_retry_allocation(int device, size_t size) {
     if (!set_devctx_for_device(device)) {
         return false;
     }
+#if !defined(_WIN32) && !defined(_WIN64)
     vbars_free((ssize_t)size);
+#else
+    (void)size;
+#endif
     return true;
 }
 

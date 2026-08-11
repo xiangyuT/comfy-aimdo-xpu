@@ -44,6 +44,7 @@ typedef SSIZE_T ssize_t;
 /* shmem-detect.c */
 bool aimdo_wddm_init(CUdevice dev);
 void aimdo_wddm_cleanup();
+void aimdo_wddm_force_poll(void);
 bool poll_budget_deficit(const char **prevailing_deficit_method);
 /* cuda-detour.c */
 bool aimdo_setup_hooks();
@@ -55,6 +56,7 @@ void aimdo_teardown_hooks();
 
 static inline bool aimdo_wddm_init(CUdevice dev) { return true; }
 static inline void aimdo_wddm_cleanup() {}
+static inline void aimdo_wddm_force_poll(void) {}
 bool aimdo_setup_hooks(void);
 void aimdo_teardown_hooks(void);
 

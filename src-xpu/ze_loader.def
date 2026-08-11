@@ -8,3 +8,11 @@ EXPORTS
     zeVirtualMemQueryPageSize
     zeVirtualMemReserve
     zeVirtualMemUnmap
+    zelDisableTracingLayer
+    zelEnableTracingLayer
+    zelTracerCreate
+    zelTracerDestroy
+    zelTracerMemAllocDeviceRegisterCallback
+    zelTracerMemFreeExtRegisterCallback
+    zelTracerMemFreeRegisterCallback
+    zelTracerSetEnabled
