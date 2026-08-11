@@ -38,9 +38,8 @@ Because that value is allocator history rather than a live allocation request,
 the reclaim follows an important boundary:
 
 * Lower-priority VBARs may be reclaimed.
-* On repeated activation with deferred native growth pending, the newly
-  prioritized active VBAR is excluded from speculative reclaim and retains the
-  working-set watermark established by its earlier sampler faults.
+* The newly prioritized active VBAR is excluded from speculative reclaim and
+  its full virtual address range is reopened for the new activation.
 * Later VBAR faults use current pressure and may reclaim active, unpinned pages
   when memory is actually required.
 
@@ -49,27 +48,25 @@ Level Zero allocation callback
   -> record native growth only
 
 next active_model.prioritize()
-  -> retain its previous exact-pressure watermark
+  -> reopen its full virtual address range
   -> estimate peak_reserved - reserved
   -> reclaim lower-priority VBARs
-  -> preserve active VBAR at that watermark
+  -> preserve active VBAR during speculative reclaim
 
 later active-model fault
   -> enforce exact current pressure
 ```
 
-Resetting the active watermark to the full virtual range on every Windows model
-switch is also unsafe. Pages above a watermark were removed by real pressure;
-reopening that range causes repeated workflows to fault those pages again while
-evicting other pages from the same fixed-size working set. This can repeatedly
-reload a model boundary and eventually exhaust physical-page allocation.
-Windows reprioritization therefore retains the last exact-pressure watermark
-only after that VBAR has already been activated once and it must also handle
-deferred native growth. First activation has no previous sampler working set;
-it keeps the original reset-to-full behavior. Calls with no deferred growth do
-the same, which explicit free/refault callers require. Linux always keeps the
-original reset behavior because its allocator can arbitrate growth at the
-actual request.
+The pressure-reduced watermark from a completed activation cannot be reused as
+the next activation's hard ceiling. In particular, the MiniMax H3 Video VAE
+revisits the same decoder layers for every spatial and temporal tile. If its
+previous low watermark is restored, every layer above that boundary receives a
+VBAR OOM fallback even when the current activation could reclaim room. The
+roughly 5 GiB decoder is then streamed from host storage once per tile, causing
+hundreds of GiB of repeated host-to-device copies and severe second-run
+slowdown. Reopening the range allows normal faults to rebuild a working set;
+those faults still apply current pressure and can lower the watermark again.
+Linux keeps its existing reset behavior and exact allocation-time arbitration.
 
 Sampler latency changes must not be attributed to VBAR churn without checking
 the VMM counters. A sampler interval with unchanged `map_bytes`, `unmap_bytes`,
@@ -118,7 +115,7 @@ Expected result:
 | Platform | Pressure source | Expected active VBAR result |
 | --- | --- | --- |
 | Linux | Exact live pluggable-allocator request | May lose an unpinned page when real pressure exceeds lower-priority residency |
-| Windows | Historical peak at model boundary | Must retain its established working set during speculative reclaim |
+| Windows | Historical peak at model boundary | Must preserve active residency during speculative reclaim and reopen the full fault range |
 
 The Windows assertion fails with the old global speculative-reclaim behavior,
 where the active VBAR was used after lower-priority residency was exhausted.

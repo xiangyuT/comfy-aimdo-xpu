@@ -62,22 +62,19 @@ def test_windows_model_boundary_applies_deferred_native_pressure():
     assert "previous_watermark = lib.vbar_get_watermark(" in source
     assert "self._prioritized_once = False" in source
     assert 'sys.platform == "win32" and self._prioritized_once' in source
-    assert "anticipated_growth and self._prioritized_once" in source
     assert "self._prioritized_once = True" in source
-    assert (
-        "previous_watermark * _VBAR_PAGE_SIZE" in source
-    )
+    assert "previous_watermark * _VBAR_PAGE_SIZE" not in source
     prioritize_call = source.index("lib.vbar_prioritize(")
     get_watermark_call = source.index(
         "previous_watermark = lib.vbar_get_watermark("
     )
-    restore_watermark_call = source.index("lib.vbar_set_watermark(")
-    prepare_call = source.index("lib.vbars_prepare_allocation(")
+    prepare_call = source.index(
+        "lib.vbars_prepare_allocation(", prioritize_call
+    )
     assert source.count("lib.vbar_prioritize(") == 1
     assert (
         get_watermark_call
         < prioritize_call
-        < restore_watermark_call
         < prepare_call
     )
 

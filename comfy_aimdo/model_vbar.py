@@ -11,7 +11,6 @@ _trace_enabled = os.environ.get("AIMDO_XPU_VBAR_TRACE") == "1"
 _boundary_trace_enabled = (
     os.environ.get("AIMDO_XPU_BOUNDARY_TRACE") == "1"
 )
-_VBAR_PAGE_SIZE = 32 << 20
 _trace_calls = itertools.count(1)
 
 
@@ -100,10 +99,10 @@ class ModelVBAR:
         was_prioritized = self._prioritized_once
         previous_watermark = None
         if sys.platform == "win32" and self._prioritized_once:
-            # A lower watermark is the working-set boundary established by
-            # exact pressure during earlier faults. Reopening it on every
-            # model switch makes repeated Windows workflows fault, evict, and
-            # reload the same tail pages until allocation eventually fails.
+            # Record the prior working set for boundary diagnosis. It must not
+            # become the next activation's hard ceiling: tiled models revisit
+            # weights above a pressure-reduced watermark and would otherwise
+            # stream those weights from host storage for every tile.
             previous_watermark = lib.vbar_get_watermark(
                 self._devctx, self._ptr
             )
@@ -113,37 +112,21 @@ class ModelVBAR:
                 control.get_xpu_allocator_memory_stats(self.device)
             )
             anticipated_growth = max(0, peak_reserved - reserved)
-            restored_watermark = False
-            if anticipated_growth and self._prioritized_once:
+            prepared_allocation = False
+            if anticipated_growth:
                 # Linux's pluggable allocator can safely grow a newly
                 # prioritized model under exact allocation-time pressure.
-                # Windows only has a historical model-boundary estimate when
-                # deferred native growth exists, so retain the last exact
-                # working-set watermark for this speculative path. With no
-                # deferred growth, prioritize keeps its normal reset-to-full
-                # behavior (needed by explicit free/refault callers).
-                lib.vbar_set_watermark(
-                    self._devctx,
-                    self._ptr,
-                    previous_watermark * _VBAR_PAGE_SIZE,
-                )
-                restored_watermark = True
+                # Windows only has a historical model-boundary estimate. Keep
+                # the normal reset-to-full watermark so a tiled/repeated model
+                # can fault its complete address range again, while excluding
+                # the active VBAR from this speculative reclaim.
                 # Level Zero allocation callbacks cannot safely wait on the
                 # same SYCL queue. Reclaim at this model-switch boundary using
                 # the native allocator's observed peak as the next-burst hint.
-                # This is speculative, so the native helper may reclaim other
-                # lower-priority VBARs but must preserve this active VBAR at
-                # the exact working-set watermark restored above.
                 lib.vbars_prepare_allocation(
                     self._devctx, self._ptr, anticipated_growth
                 )
-            elif anticipated_growth:
-                # First activation has no previous sampler working set. It
-                # keeps the normal full watermark, while speculative reclaim
-                # may still discard lower-priority VBARs.
-                lib.vbars_prepare_allocation(
-                    self._devctx, self._ptr, anticipated_growth
-                )
+                prepared_allocation = True
             if _boundary_trace_enabled:
                 current_watermark = lib.vbar_get_watermark(
                     self._devctx, self._ptr
@@ -156,7 +139,7 @@ class ModelVBAR:
                     f"current_watermark={current_watermark} "
                     f"reserved={reserved} peak_reserved={peak_reserved} "
                     f"anticipated_growth={anticipated_growth} "
-                    f"restored_watermark={restored_watermark}",
+                    f"prepared_allocation={prepared_allocation}",
                     flush=True,
                 )
         self._prioritized_once = True
