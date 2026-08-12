@@ -49,6 +49,7 @@ static bool xpu_allocation_trace_enabled(void) {
 extern void aimdo_log(
     int level, const char *file, int line, const char *format, ...);
 extern int aimdo_xpu_device_index_from_native(void *native_device);
+extern bool aimdo_xpu_sample_pressure(int device, size_t size);
 extern bool aimdo_xpu_prepare_allocation(int device, size_t size);
 extern bool aimdo_xpu_retry_allocation(int device, size_t size);
 extern bool aimdo_xpu_account_allocation(int device, int64_t delta);
@@ -60,11 +61,11 @@ static size_t xpu_allocation_hash(void *ptr) {
     return ((value >> 12) ^ (value >> 25)) % XPU_ALLOCATION_HASH_SIZE;
 }
 
-static void xpu_account_allocation(void *ptr, size_t size, int device) {
+void aimdo_xpu_note_native_allocation(void *ptr, size_t size, int device) {
     XpuNativeAllocation *entry;
     size_t bucket;
 
-    if (!ptr || size == 0 || device < 0) {
+    if (!ptr || size == 0 || device < 0 || !g_xpu_allocation_lock_initialized) {
         return;
     }
     entry = (XpuNativeAllocation *)malloc(sizeof(*entry));
@@ -85,7 +86,7 @@ static void xpu_account_allocation(void *ptr, size_t size, int device) {
     aimdo_xpu_record_native_allocation(size);
 }
 
-static void xpu_account_release(void *ptr) {
+void aimdo_xpu_note_native_release(void *ptr) {
     XpuNativeAllocation **previous;
     XpuNativeAllocation *entry;
     size_t bucket;
@@ -133,7 +134,7 @@ static void ZE_APICALL xpu_mem_alloc_device_prologue(
                   device, *params->psize);
     }
     if (device < 0 ||
-        !aimdo_xpu_prepare_allocation(device, *params->psize)) {
+        !aimdo_xpu_sample_pressure(device, *params->psize)) {
         return;
     }
     if (xpu_allocation_trace_enabled()) {
@@ -162,7 +163,9 @@ static void ZE_APICALL xpu_mem_alloc_device_epilogue(
                   params->ppptr ? **params->ppptr : NULL);
     }
     if (result == ZE_RESULT_SUCCESS && **params->ppptr) {
-        xpu_account_allocation(**params->ppptr, *params->psize, device);
+        aimdo_xpu_note_native_allocation(**params->ppptr, *params->psize, device);
+        /* Reclaim only after the driver call has returned. */
+        aimdo_xpu_prepare_allocation(device, 0);
     } else if (result == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY) {
         // PyTorch's native caching allocator releases idle blocks and retries
         // the physical allocation after an OOM. Prepare that retry by
@@ -177,7 +180,7 @@ static void ZE_APICALL xpu_mem_free_epilogue(
     (void)tracer_user_data;
     (void)instance_user_data;
     if (result == ZE_RESULT_SUCCESS && params && params->pptr) {
-        xpu_account_release(*params->pptr);
+        aimdo_xpu_note_native_release(*params->pptr);
     }
 }
 
@@ -187,7 +190,7 @@ static void ZE_APICALL xpu_mem_free_ext_epilogue(
     (void)tracer_user_data;
     (void)instance_user_data;
     if (result == ZE_RESULT_SUCCESS && params && params->pptr) {
-        xpu_account_release(*params->pptr);
+        aimdo_xpu_note_native_release(*params->pptr);
     }
 }
 
@@ -207,50 +210,20 @@ static bool xpu_register_tracer_callbacks(void) {
             xpu_mem_free_ext_epilogue) == ZE_RESULT_SUCCESS;
 }
 
-bool aimdo_setup_hooks(void) {
-    zel_tracer_desc_t descriptor = {
-        ZEL_STRUCTURE_TYPE_TRACER_DESC,
-        NULL,
-        &g_xpu_tracer_user_data,
-    };
-
-    if (g_xpu_tracer) {
-        return true;
+/* The native allocation table is shared by both interception backends: the
+ * Detours hooks used in production and the Level Zero tracing layer kept for
+ * diagnosis. Both are idempotent so either may own the lifecycle. */
+bool aimdo_xpu_native_accounting_init(void) {
+    if (!g_xpu_allocation_lock_initialized) {
+        InitializeCriticalSection(&g_xpu_allocation_lock);
+        g_xpu_allocation_lock_initialized = true;
     }
-    InitializeCriticalSection(&g_xpu_allocation_lock);
-    g_xpu_allocation_lock_initialized = true;
-
-    if (zelEnableTracingLayer() != ZE_RESULT_SUCCESS ||
-        zelTracerCreate(&descriptor, &g_xpu_tracer) != ZE_RESULT_SUCCESS ||
-        !xpu_register_tracer_callbacks() ||
-        zelTracerSetEnabled(g_xpu_tracer, true) != ZE_RESULT_SUCCESS) {
-        aimdo_log(kAimdoTracerLogError, __FILE__, __LINE__,
-                  "%s: failed to enable Level Zero allocation tracing\n",
-                  __func__);
-        if (g_xpu_tracer) {
-            zelTracerDestroy(g_xpu_tracer);
-            g_xpu_tracer = NULL;
-        }
-        zelDisableTracingLayer();
-        DeleteCriticalSection(&g_xpu_allocation_lock);
-        g_xpu_allocation_lock_initialized = false;
-        return false;
-    }
-    aimdo_log(kAimdoTracerLogInfo, __FILE__, __LINE__,
-              "%s: native Torch XPU allocator retained; tracing Level Zero physical allocations\n",
-              __func__);
     return true;
 }
 
-void aimdo_teardown_hooks(void) {
+void aimdo_xpu_native_accounting_cleanup(void) {
     size_t bucket;
 
-    if (g_xpu_tracer) {
-        zelTracerSetEnabled(g_xpu_tracer, false);
-        zelTracerDestroy(g_xpu_tracer);
-        g_xpu_tracer = NULL;
-        zelDisableTracingLayer();
-    }
     if (!g_xpu_allocation_lock_initialized) {
         return;
     }
@@ -267,6 +240,49 @@ void aimdo_teardown_hooks(void) {
     LeaveCriticalSection(&g_xpu_allocation_lock);
     DeleteCriticalSection(&g_xpu_allocation_lock);
     g_xpu_allocation_lock_initialized = false;
+}
+
+bool aimdo_xpu_tracer_install(void) {
+    zel_tracer_desc_t descriptor = {
+        ZEL_STRUCTURE_TYPE_TRACER_DESC,
+        NULL,
+        &g_xpu_tracer_user_data,
+    };
+
+    if (g_xpu_tracer) {
+        return true;
+    }
+    aimdo_xpu_native_accounting_init();
+
+    if (zelEnableTracingLayer() != ZE_RESULT_SUCCESS ||
+        zelTracerCreate(&descriptor, &g_xpu_tracer) != ZE_RESULT_SUCCESS ||
+        !xpu_register_tracer_callbacks() ||
+        zelTracerSetEnabled(g_xpu_tracer, true) != ZE_RESULT_SUCCESS) {
+        aimdo_log(kAimdoTracerLogError, __FILE__, __LINE__,
+                  "%s: failed to enable Level Zero allocation tracing\n",
+                  __func__);
+        if (g_xpu_tracer) {
+            zelTracerDestroy(g_xpu_tracer);
+            g_xpu_tracer = NULL;
+        }
+        zelDisableTracingLayer();
+        aimdo_xpu_native_accounting_cleanup();
+        return false;
+    }
+    aimdo_log(kAimdoTracerLogInfo, __FILE__, __LINE__,
+              "%s: native Torch XPU allocator retained; tracing Level Zero physical allocations\n",
+              __func__);
+    return true;
+}
+
+void aimdo_xpu_tracer_remove(void) {
+    if (g_xpu_tracer) {
+        zelTracerSetEnabled(g_xpu_tracer, false);
+        zelTracerDestroy(g_xpu_tracer);
+        g_xpu_tracer = NULL;
+        zelDisableTracingLayer();
+    }
+    aimdo_xpu_native_accounting_cleanup();
 }
 
 #if defined(__cplusplus)

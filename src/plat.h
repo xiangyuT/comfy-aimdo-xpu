@@ -228,6 +228,18 @@ size_t vbars_free(ssize_t size);
 SHARED_EXPORT
 uint64_t vbars_analyze(void *devctx, bool only_dirty);
 
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+/* dispatch.cpp: retirement epochs for queue-free reclaim */
+uint64_t aimdo_xpu_retire_epoch_current(void);
+uint64_t aimdo_xpu_retired_epoch(void);
+void aimdo_xpu_register_queue(void *queue);
+/* model_vbar.c */
+size_t vbars_free_retired(ssize_t size);
+SHARED_EXPORT
+void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
+                       uint64_t stream);
+#endif
+
 /* pyt-cu-alloc.c */
 int aimdo_cuda_malloc(CUdeviceptr *dptr, size_t size,
                       CUresult (*true_cuMemAlloc_v2)(CUdeviceptr*, size_t));

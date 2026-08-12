@@ -19,23 +19,48 @@ uint64_t aimdo_xpu_recorded_usage(void) {
     return g_devctx ? g_devctx->_total_vram_usage : 0;
 }
 
-bool aimdo_xpu_prepare_allocation(int device, size_t size) {
+bool aimdo_xpu_sample_pressure(int device, size_t size) {
     if (!set_devctx_for_device(device)) {
         return false;
     }
 #if defined(_WIN32) || defined(_WIN64)
     const char *deficit_method = "unknown";
 
-    /* Refresh WDDM before large model allocations so a preceding allocation
-     * that fell back to non-local memory is visible before the next residency
-     * request. The Level Zero tracer runs inside zeMemAllocDevice: evicting a
-     * VBAR here would call queue.wait() re-entrantly and can deadlock. Sample
-     * pressure now; the next VBAR fault applies the recorded allocation delta
-     * and evicts from a normal, queue-safe call site. */
+    /* Read-only. Safe to call while the driver is servicing an allocation,
+     * unlike reclaim, which mutates Level Zero physical memory. */
     if (size >= (size_t)1 << 30) {
         aimdo_wddm_force_poll();
     }
     poll_budget_deficit(&deficit_method);
+#else
+    (void)size;
+#endif
+    return true;
+}
+
+bool aimdo_xpu_prepare_allocation(int device, size_t size) {
+    if (!set_devctx_for_device(device)) {
+        return false;
+    }
+#if defined(_WIN32) || defined(_WIN64)
+    ssize_t deficit;
+
+    /* Called after the driver's allocation call has returned, never during
+     * it: releasing a VBAR page issues zeVirtualMemUnmap and
+     * zePhysicalMemDestroy, and re-entering Level Zero memory management from
+     * inside zeMemAllocDevice corrupts driver state.
+     *
+     * It also must not wait on the compute queue: that queue may be blocked
+     * behind work which itself needs the residency being requested.
+     * vbars_free_retired() releases only pages that are provably idle and
+     * returns immediately otherwise. Any remaining shortage is absorbed by
+     * WDDM, and the next fault or unpin boundary reclaims it. */
+    deficit = budget_deficit(size);
+    log(VVERBOSE, "%s: device=%d size=%zuk recorded=%zuk deficit=%zdk\n", __func__,
+        device, size / K, (size_t)total_vram_usage / K, deficit / (ssize_t)K);
+    if (deficit > 0) {
+        vbars_free_retired(deficit);
+    }
 #else
     vbars_free(budget_deficit(size));
 #endif
@@ -46,10 +71,14 @@ bool aimdo_xpu_retry_allocation(int device, size_t size) {
     if (!set_devctx_for_device(device)) {
         return false;
     }
-#if !defined(_WIN32) && !defined(_WIN64)
-    vbars_free((ssize_t)size);
+#if defined(_WIN32) || defined(_WIN64)
+    /* Reached only after a real Level Zero allocation failure, which on this
+     * platform means the driver could not place the request even in non-local
+     * memory. Re-sample and reclaim again, still without waiting. */
+    aimdo_wddm_force_poll();
+    vbars_free_retired((ssize_t)size);
 #else
-    (void)size;
+    vbars_free((ssize_t)size);
 #endif
     return true;
 }
