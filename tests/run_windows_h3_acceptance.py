@@ -24,10 +24,12 @@ WIDTH = 1280
 HEIGHT = 736
 FRAMES = 362
 FPS = 24.0
-STEPS = 2
+STEPS = 2  # default; override with --steps
 
 
-def build_prompt(seed: int, filename_prefix: str) -> dict:
+def build_prompt(seed: int, filename_prefix: str, steps: int = STEPS,
+                 width: int = WIDTH, height: int = HEIGHT,
+                 frames: int = FRAMES) -> dict:
     return {
         "save": {
             "inputs": {
@@ -61,7 +63,7 @@ def build_prompt(seed: int, filename_prefix: str) -> dict:
         "scheduler": {
             "inputs": {
                 "scheduler": "simple",
-                "steps": STEPS,
+                "steps": steps,
                 "denoise": 1.0,
                 "model": ["model", 0],
             },
@@ -120,9 +122,9 @@ def build_prompt(seed: int, filename_prefix: str) -> dict:
                     "between towers. Natural motion, realistic lighting, coherent "
                     "camera movement, stereo city ambience and music; no text or logos."
                 ),
-                "width": WIDTH,
-                "height": HEIGHT,
-                "length": FRAMES,
+                "width": width,
+                "height": height,
+                "length": frames,
                 "clip": ["clip", 0],
                 "vae": ["video_vae", 0],
             },
@@ -171,7 +173,8 @@ def find_artifacts(output_root: pathlib.Path, basename: str) -> list[dict]:
     return sorted(files, key=lambda item: item["path"])
 
 
-def inspect_video(path: pathlib.Path) -> dict:
+def inspect_video(path: pathlib.Path, width: int = WIDTH, height: int = HEIGHT,
+                  frames: int = FRAMES) -> dict:
     with av.open(str(path)) as container:
         stream = next((item for item in container.streams if item.type == "video"), None)
         if stream is None:
@@ -190,12 +193,12 @@ def inspect_video(path: pathlib.Path) -> dict:
             "duration_seconds": duration,
         }
 
-    expected_duration = FRAMES / FPS
-    if details["width"] != WIDTH or details["height"] != HEIGHT:
+    expected_duration = frames / FPS
+    if details["width"] != width or details["height"] != height:
         raise RuntimeError(f"unexpected video dimensions for {path}: {details}")
     if abs(details["fps"] - FPS) > 1e-6:
         raise RuntimeError(f"unexpected frame rate for {path}: {details}")
-    if details["frames"] != FRAMES:
+    if details["frames"] != frames:
         raise RuntimeError(f"unexpected frame count for {path}: {details}")
     if abs(details["duration_seconds"] - expected_duration) > (1.0 / FPS):
         raise RuntimeError(f"unexpected video duration for {path}: {details}")
@@ -218,7 +221,8 @@ async def run(args: argparse.Namespace) -> list[dict]:
             seed = args.seed + run_index - 1
             basename = f"aimdo_h3_720p_15s_2step_{stamp}_run{run_index}"
             filename_prefix = f"video/{basename}"
-            prompt = copy.deepcopy(build_prompt(seed, filename_prefix))
+            prompt = copy.deepcopy(build_prompt(seed, filename_prefix, args.steps,
+                                        args.width, args.height, args.frames))
             started = time.monotonic()
             async with session.post(
                 f"{base_url}/prompt",
@@ -232,8 +236,8 @@ async def run(args: argparse.Namespace) -> list[dict]:
             prompt_id = body["prompt_id"]
             print(
                 f"RUN_START index={run_index} prompt_id={prompt_id} seed={seed} "
-                f"width={WIDTH} height={HEIGHT} frames={FRAMES} fps={FPS:g} "
-                f"steps={STEPS}",
+                f"width={args.width} height={args.height} frames={args.frames} fps={FPS:g} "
+                f"steps={args.steps}",
                 flush=True,
             )
 
@@ -248,7 +252,8 @@ async def run(args: argparse.Namespace) -> list[dict]:
             for artifact in artifacts:
                 path = pathlib.Path(artifact["path"])
                 if path.suffix.lower() == ".mp4" and artifact["size"] > 0:
-                    videos.append({**artifact, "media": inspect_video(path)})
+                    videos.append({**artifact, "media": inspect_video(
+                    path, args.width, args.height, args.frames)})
             result = {
                 "run": run_index,
                 "prompt_id": prompt_id,
@@ -277,6 +282,13 @@ def main() -> None:
     parser.add_argument("--server", default="http://127.0.0.1:8188")
     parser.add_argument("--output-root", required=True)
     parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--steps", type=int, default=STEPS,
+                        help="sampler steps; the 2-step profile does not "
+                             "reach memory pressure")
+    parser.add_argument("--width", type=int, default=WIDTH)
+    parser.add_argument("--height", type=int, default=HEIGHT)
+    parser.add_argument("--frames", type=int, default=FRAMES,
+                        help="MiniMax H3 requires 17k+5")
     parser.add_argument("--seed", type=int, default=874633819053040)
     parser.add_argument("--timeout-seconds", type=float, default=4 * 60 * 60)
     args = parser.parse_args()
