@@ -2,6 +2,7 @@ import ctypes
 import itertools
 import os
 import sys
+import time
 
 from . import control
 
@@ -12,6 +13,44 @@ _boundary_trace_enabled = (
     os.environ.get("AIMDO_XPU_BOUNDARY_TRACE") == "1"
 )
 _trace_calls = itertools.count(1)
+
+# Torch's native XPU allocator keeps freed blocks cached, and that cache holds
+# WDDM local memory that AIMDO cannot reclaim: a tensor that is freed does not
+# reach zeMemFree, so the allocation hook never sees it come back.  Only
+# empty_cache() returns it.  It cannot be called from the allocation hook -
+# Torch holds its allocator lock across the driver call - but a VBAR fault that
+# is about to give up is a queue-safe boundary and a real, measured shortage.
+_native_cache_trim_enabled = (
+    os.environ.get("AIMDO_XPU_NATIVE_CACHE_TRIM", "1") != "0"
+)
+# empty_cache() calls sycl::free(), which can stall in the Level Zero/UMF
+# residency path under pressure, so this stays rate limited rather than
+# becoming a per-weight operation.
+_NATIVE_CACHE_TRIM_INTERVAL_SECONDS = 2.0
+_native_cache_trim_last = 0.0
+_unpin_stream_supported = (
+    lib is not None
+    and hasattr(lib, "vbar_unpin_stream")
+    and sys.platform == "win32"
+    and control.implementation == "xpu"
+)
+
+if _unpin_stream_supported:
+    lib.vbar_unpin_stream.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+        ctypes.c_uint64,
+    ]
+
+
+def _current_queue_ptr(device):
+    """SYCL queue backing the caller's current Torch XPU stream."""
+    try:
+        import torch
+
+        return int(torch.xpu.current_stream(
+            torch.device("xpu", device)).sycl_queue)
+    except Exception:
+        return 0
 
 
 def _trace_vbar(operation, phase, alloc, caller, result=None):
@@ -80,6 +119,44 @@ if lib is not None:
     lib.vbar_get_watermark.restype = ctypes.c_size_t
 
     lib.vbar_get_residency.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint8), ctypes.c_size_t]
+
+def _release_native_cache(device):
+    """Return Torch's freed-but-cached device memory, if that is the shortage.
+
+    Only worth doing when Torch is actually sitting on dead blocks; a VBAR miss
+    caused by live tensors cannot be helped this way.  Returns True when
+    something was released and a refault is worth attempting.
+    """
+    global _native_cache_trim_last
+
+    if (not _native_cache_trim_enabled
+            or sys.platform != "win32"
+            or control.implementation != "xpu"):
+        return False
+
+    now = time.monotonic()
+    if now - _native_cache_trim_last < _NATIVE_CACHE_TRIM_INTERVAL_SECONDS:
+        return False
+    # Throttle every attempt, including ones that find no cache or raise, and
+    # time from completion: empty_cache() can itself take seconds under
+    # pressure, and timing from the start would allow back-to-back calls.
+    _native_cache_trim_last = now
+
+    try:
+        import torch
+
+        stats = torch.xpu.memory_stats(device)
+        cached = (int(stats.get("reserved_bytes.all.current", 0))
+                  - int(stats.get("allocated_bytes.all.current", 0)))
+        if cached < 32 * 1024 ** 2:
+            return False
+        torch.xpu.empty_cache()
+    except Exception:
+        return False
+    finally:
+        _native_cache_trim_last = time.monotonic()
+    return True
+
 
 class ModelVBAR:
     def __init__(self, size, device):
@@ -168,6 +245,12 @@ class ModelVBAR:
         # +2, one for misalignment and one for rounding
         signature = (ctypes.c_uint32 * (size // (32 * 1024 ** 2) + 2))()
         res = lib.vbar_fault(self._devctx, self._ptr, offset, size, signature)
+        if res == 1 and _release_native_cache(self.device):
+            # The shortage was at least partly Torch's own dead cache, which
+            # AIMDO has no other way to reclaim. Retry once now that it is
+            # back, rather than streaming this weight from host storage.
+            res = lib.vbar_fault(
+                self._devctx, self._ptr, offset, size, signature)
         if res == 0:
             return signature
         elif res == 1:
@@ -177,6 +260,16 @@ class ModelVBAR:
 
     def unpin(self, alloc, size):
         offset = alloc - self.base_addr
+        if _unpin_stream_supported:
+            # VBAR map/unmap carry no stream, so this is the only point where
+            # the queue that actually consumed the weight is visible. ComfyUI
+            # may consume weights on a non-default stream, and a retirement
+            # fence submitted only to the default queue does not order that
+            # work: reclaiming on that proof caused DEVICE_LOST.
+            lib.vbar_unpin_stream(
+                self._devctx, self._ptr, offset, size,
+                _current_queue_ptr(self.device))
+            return
         lib.vbar_unpin(self._devctx, self._ptr, offset, size)
 
     def loaded_size(self):
