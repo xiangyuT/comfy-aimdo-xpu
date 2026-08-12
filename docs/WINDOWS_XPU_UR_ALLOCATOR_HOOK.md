@@ -1,11 +1,13 @@
 # Windows XPU Unified Runtime allocator hook
 
-Status: **implemented and component-verified** on branch
-`dev/windows-xpu-native-allocator-hook`, which is based on the Linux
-`dev/xpu-native-allocator-hook` work with the Windows platform series replayed
-on top. The interception mechanism, the PyTorch retry contract, and the
-production control loop are each verified on the recorded Windows environment.
-No workload has been run through it. Per the maintenance rule in
+Status: **implemented, component-verified, and carrying an unexplained
+performance regression** on branch `dev/windows-xpu-native-allocator-hook`,
+which is based on the Linux `dev/xpu-native-allocator-hook` work with the
+Windows platform series replayed on top. The interception mechanism, the
+PyTorch retry contract, and the production control loop are each verified on
+the recorded Windows environment, and Gate C2 step 1 completes. It completes
+**56 % slower than the recorded baseline**, which is not explained; see
+section 10. Per the maintenance rule in
 [the liveness analysis](WINDOWS_XPU_VBAR_LIVENESS_ANALYSIS.md), that document's
 unresolved 720p/10s failure is *not* erased by anything recorded here.
 
@@ -397,7 +399,54 @@ legitimately retains across `empty_cache()`. The result was that
 `control.deinit()` raised in any process that had ever allocated. Windows now
 drops the tracking table and reports the count instead.
 
-## 10. Remaining plan
+## 10. Performance regression at gradient step 1
+
+Recorded as an open defect, not explained.
+
+Gate C2 step 1 (`--width 864 --height 480 --frames 124 --steps 20 --runs 1`)
+passed and produced a valid 124 frame video, but it is materially slower than
+the recorded baseline for the same configuration:
+
+| Build | Gate C2 step 1 | Source |
+| --- | ---: | --- |
+| `1e14a29`, Level Zero arbitration | 169 s | liveness analysis, "Why the earlier gradient steps passed" |
+| this branch, UR arbitration, `0.4.15.dev1` | 264 s | `build/ur-integration/ladder1.log` |
+
+That is roughly +56 % on a step that does not even reach the pressure point.
+Both runs used `--reserve-vram 4` on the same device, driver and model, so the
+configuration matches; the whole stack differs by more than one change,
+however, so the comparison bounds the regression rather than attributing it.
+
+Two candidate causes, neither yet confirmed:
+
+1. **`release_cached_blocks()` is all-or-nothing.** PyTorch answers a failed
+   `alloc_block` by releasing *every* cached block, not the amount that was
+   short, and only then retries. Each synthetic failure therefore flushes the
+   whole caching allocator, and every later tensor must go back to the driver.
+   The VBAR reproducer recorded 71 synthetic failures during a single 30 GiB
+   ramp, which on this theory is 71 full cache flushes. This is a property of
+   the design, not a tuning constant, and it is the more likely of the two.
+2. **The caller classification is expensive.**
+   `is_torch_native_segment_request()` runs `RtlCaptureStackBackTrace` over up
+   to 48 frames and calls `GetModuleHandleExW` plus `GetModuleFileNameW` on
+   each one, formatting a path per frame. It runs whenever the deficit is
+   positive, which is exactly the hot path under pressure. The Linux hook has
+   the same shape but `dladdr()` is considerably cheaper than resolving and
+   formatting a module path. This one has an obvious fix: resolve the
+   `c10_xpu.dll` image range once and compare frame addresses against it,
+   removing every per-frame Win32 call.
+
+Neither has been measured. The next step is to separate them, because they
+imply different responses: (2) is an implementation cost that can simply be
+removed, while (1) would mean the synthetic-OOM design needs a way to bound how
+much cache PyTorch discards, or a policy that only fails requests when the
+deficit is large enough to be worth a full flush.
+
+Until this is understood, no timing on this branch should be compared against
+the historical figures, and a later gradient step that "passes slowly" must not
+be read as a pass.
+
+## 11. Remaining plan
 
 Phase A - **done, and it changed the design.** See section 9.
 
@@ -406,23 +455,29 @@ mechanisms cover opposite directions and both are required: the synthetic OOM
 when PyTorch allocates, the fault-boundary trim when AIMDO faults. What remains
 is to check they do not oscillate against each other under sustained pressure.
 
-Phase C - investigate whether the fault path needs its own way to demand
-memory from PyTorch, since the trim is rate limited and best effort. The
-measured 32 MiB against 30 GiB of cache suggests the current trim is far too
-weak at that boundary.
+Phase C - separate the two regression candidates in section 10. Remove the
+per-frame module lookups from the classification first, since that is cheap and
+unambiguous, then re-measure step 1. Whatever remains is attributable to the
+cache-flush behaviour.
 
-Phase D - the gradient ladder, in full: 480p/5s, 720p/5s, then 720p/10s with
-243 frames. Only the last step may be reported as a fix.
+Phase D - investigate whether the fault path needs its own way to demand memory
+from PyTorch, since the trim is rate limited and best effort. The measured
+32 MiB against 30 GiB of cache suggests the current trim is far too weak at
+that boundary.
 
-## 11. What this does not establish
+Phase E - the gradient ladder, in full. Step 1 passes but is 56 % slower than
+baseline; step 2 onwards is not yet recorded. Only step 3 or above may be
+reported as a fix, and only if the regression in section 10 is resolved.
 
-1. No ComfyUI workload has been run. The 720p/10s livelock recorded in the
-   liveness analysis is an admission and watermark policy problem, and section 9
-   shows the map/unmap thrash is still present on this branch. Presenting any of
-   this as a fix for that failure would be the third occurrence of the method
-   failure that document records - and section 9 is itself a fourth occurrence
-   caught early, because this document did claim the cache trim was subsumed
-   before it was measured.
+## 12. What this does not establish
+
+1. **Gate C2 is incomplete and step 1 shows a 56 % regression** (section 10).
+   The 720p/10s livelock recorded in the liveness analysis is an admission and
+   watermark policy problem, and section 9 shows the map/unmap thrash is still
+   present on this branch. Presenting any of this as a fix for that failure
+   would be the third occurrence of the method failure that document records -
+   and section 9 is itself a fourth occurrence caught early, because this
+   document did claim the cache trim was subsumed before it was measured.
 2. `native_reclaim_free_calls` has never been observed nonzero outside the
    standalone probe. The mechanism is proven to exist; its usefulness in a real
    allocation pattern is not.
@@ -457,10 +512,26 @@ rem real competition between a VBAR working set and a native Torch ramp
 <portable>\python_embeded\python.exe -s `
     tests\repro_windows_xpu_vbar_vs_torch.py --vbar-gib 6 --torch-gib 30
 
+rem integration: install into Portable first, then run the ladder
+$env:SETUPTOOLS_SCM_PRETEND_VERSION = "0.4.15.dev1"
+build\python-venv\Scripts\python.exe -m build --wheel --no-isolation `
+    --outdir build\wheel-ur-hook-dev1
+Remove-Item Env:SETUPTOOLS_SCM_PRETEND_VERSION
+<portable>\python_embeded\python.exe -s -m pip install `
+    --force-reinstall --no-deps build\wheel-ur-hook-dev1\comfy_aimdo-*.whl
+<portable>\python_embeded\python.exe -s tests\run_windows_h3_acceptance.py `
+    --server http://127.0.0.1:8188 --output-root <portable>\ComfyUI\output `
+    --width 864 --height 480 --frames 124 --steps 20 --runs 1
+
 rem the expandable segments constraint, which must fail
 $env:PYTORCH_ALLOC_CONF = "expandable_segments:True"
 <portable>\python_embeded\python.exe -s tests\run_windows_ur_hook_probe.py
 ```
+
+The installed DLL must hash identically to `comfy_aimdo\aimdo_xpu.dll` from the
+build, and the server log must contain `arbitrating Unified Runtime USM
+allocations` together with the expected version, or the run is testing a
+different build. Both were confirmed for the measurements recorded here.
 
 The first three must print `RESULT: PASS`. The reproducer must complete without
 a fault error and reproduce the table in section 9, including the fourth phase
