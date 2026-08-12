@@ -275,8 +275,22 @@ bool hostbuf_read_file_slice(void *hostbuf_ptr, int device,
                 (ull)(offset + done));
             return false;
         }
-        CUresult copy_result = cuMemcpyHtoDAsync((CUdeviceptr)(device_ptr + done),
-                                                 host + done, chunk, (CUstream)stream);
+        CUresult copy_result;
+
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+        /* Same reasoning as hostbuf_file_reader_read(): this streams a weight
+         * into device memory without going through any hooked allocation, so
+         * nothing else applies pressure before the copy. */
+        {
+            ssize_t deficit = budget_deficit(chunk);
+
+            if (deficit > 0) {
+                vbars_free_retired(deficit);
+            }
+        }
+#endif
+        copy_result = cuMemcpyHtoDAsync((CUdeviceptr)(device_ptr + done),
+                                        host + done, chunk, (CUstream)stream);
         if (!CHECK_CU(copy_result)) {
             log(AIMDO_LOG_ERROR, "%s: device copy failed result=%d device_ptr=%p device=%d stream=%p size=%zu\n",
                 __func__, (int)copy_result, (void *)(uintptr_t)(device_ptr + done),

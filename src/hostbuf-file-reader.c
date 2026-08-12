@@ -4,6 +4,24 @@
 #define HOSTBUF_FILE_READER_WINDOW (64ULL * 1024ULL * 1024ULL)
 #define LEAD_IN_THRESHOLD (HOSTBUF_FILE_READER_WINDOW - 16ULL * 1024ULL * 1024ULL)
 
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+#include <windows.h>
+
+/* Diagnostic switch for the streaming-path reclaim, so its effect can be
+ * measured on the real workload instead of assumed. */
+static bool aimdo_stream_reclaim_disabled(void) {
+    static int disabled = -1;
+    char value[8];
+
+    if (disabled < 0) {
+        DWORD length = GetEnvironmentVariableA(
+            "AIMDO_XPU_NO_STREAM_RECLAIM", value, sizeof(value));
+        disabled = (length > 0 && length < sizeof(value) && value[0] == '1');
+    }
+    return disabled != 0;
+}
+#endif
+
 static bool hostbuf_file_reader_retire_active(void) {
     HostbufFileReaderSlot *slot;
 
@@ -83,6 +101,23 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
                 __func__, (ull)file_handle, (ull)file_offset, chunk);
             return false;
         }
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+        /* Streaming a missed weight is the largest consumer of device memory
+         * that never allocates through a hooked entry point, so nothing else
+         * applies pressure here.
+         *
+         * Under suspicion: reclaim can only skip the destination page while it
+         * is pinned, and that has not been verified for this call path. Set
+         * AIMDO_XPU_NO_STREAM_RECLAIM=1 to disable it and compare.
+         */
+        if (!aimdo_stream_reclaim_disabled()) {
+            ssize_t deficit = budget_deficit(chunk);
+
+            if (deficit > 0) {
+                vbars_free_retired(deficit);
+            }
+        }
+#endif
         CUresult copy_result = cuMemcpyHtoDAsync((CUdeviceptr)device_ptr,
                                                  slot->buffer + slot->offset,
                                                  chunk, (CUstream)stream);
