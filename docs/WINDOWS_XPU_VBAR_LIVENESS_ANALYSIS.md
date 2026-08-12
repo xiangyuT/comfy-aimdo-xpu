@@ -706,3 +706,11 @@ Future experiments must append revision-specific evidence to this record. Do
 not erase a failed large/repeated workload with a later small pass, and do not
 promote arithmetic estimates or asynchronous error codes into hardware limits
 without an isolated reproducer.
+
+## Related records
+
+* [Windows XPU Unified Runtime allocator hook](WINDOWS_XPU_UR_ALLOCATOR_HOOK.md)
+  records a component-verified interception point above the Level Zero driver.
+  It closes the ordering gap described above without the re-entrancy that
+  caused `DEVICE_LOST`, but it has not been run against any workload and does
+  not supersede the unresolved 720p/10s failure recorded here.
