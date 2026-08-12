@@ -208,8 +208,29 @@ bool poll_budget_deficit(const char **prevailing_deficit_method)
         }
     }
 
-    deficit_sync = (ssize_t)effective_usage + (ssize_t)WDDM_BUDGET_HEADROOM -
-                   (ssize_t)effective_budget;
+    /*
+     * Enforce the configured reserve against WDDM's complete-process usage.
+     *
+     * Using only WDDM_BUDGET_HEADROOM here left the two pressure signals each
+     * missing half the picture: this one has the right basis (CurrentUsage
+     * includes SYCL, oneDNN and driver allocations) but only asked for a
+     * 512 MiB margin, while deficit_simple applies the configured reserve to
+     * AIMDO's own recorded usage, which undercounts by whatever those other
+     * libraries hold. Enforcement therefore stopped at target plus that
+     * undercount - a measured, reserve-independent 0.77-0.78 GiB - and a
+     * later host-to-device copy failed with
+     * ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY because VBAR physical pages cannot
+     * be demoted to make room.
+     */
+    {
+        ssize_t wddm_headroom = (ssize_t)WDDM_BUDGET_HEADROOM;
+
+        if (simple_vram_headroom > wddm_headroom) {
+            wddm_headroom = (ssize_t)simple_vram_headroom;
+        }
+        deficit_sync = (ssize_t)effective_usage + wddm_headroom -
+                       (ssize_t)effective_budget;
+    }
     *prevailing_deficit_method = g_wddm_adapter
         ? "WDDM budget"
         : "physical capacity";
