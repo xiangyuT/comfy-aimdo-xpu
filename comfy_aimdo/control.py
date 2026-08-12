@@ -559,6 +559,9 @@ def get_xpu_ur_hook_stats():
         "unknown_device_calls",
         "unknown_free_calls",
         "dropped_metadata_calls",
+        "direct_pressure_calls",
+        "direct_pressure_bytes",
+        "duplicate_pointer_calls",
     )
     values = (ctypes.c_uint64 * len(names))()
     if not lib.xpu_ur_hook_get_stats(values, len(names)):

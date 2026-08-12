@@ -3,7 +3,9 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstring>
 #include <cstdlib>
+#include <execinfo.h>
 #include <dlfcn.h>
 #include <mutex>
 #include <string>
@@ -56,6 +58,9 @@ enum HookStat : size_t {
     kUnknownDeviceCalls,
     kUnknownFreeCalls,
     kDroppedMetadataCalls,
+    kDirectPressureCalls,
+    kDirectPressureBytes,
+    kDuplicatePointerCalls,
     kHookStatCount,
 };
 
@@ -76,13 +81,29 @@ struct RetryState {
     ur_usm_pool_handle_t pool = nullptr;
     size_t size = 0;
     RetryReason reason = RetryReason::kNone;
+    uint64_t generation = 0;
 };
 
 std::atomic<bool> g_enabled{false};
+std::atomic<uint64_t> g_generation{0};
 std::atomic<uint64_t> g_stats[kHookStatCount];
 std::mutex g_hook_mutex;
 std::unordered_map<void *, Allocation> g_allocations;
 thread_local RetryState g_retry;
+
+#ifdef AIMDO_XPU_TESTING
+enum class TestRequestKind {
+    kAutomatic,
+    kDirect,
+    kTorchNative,
+};
+
+DeviceAllocFn g_test_device_alloc = nullptr;
+FreeFn g_test_free = nullptr;
+DeviceGetNativeHandleFn g_test_device_get_native_handle = nullptr;
+std::atomic<TestRequestKind> g_test_request_kind{TestRequestKind::kAutomatic};
+void (*g_test_after_fast_enabled_check)() = nullptr;
+#endif
 
 void *open_ur_loader() {
     static void *loader = dlopen(kUrLoader, RTLD_NOW | RTLD_LOCAL);
@@ -104,17 +125,32 @@ Function resolve_real(const char *name) {
 }
 
 DeviceAllocFn real_device_alloc() {
+#ifdef AIMDO_XPU_TESTING
+    if (g_test_device_alloc) {
+        return g_test_device_alloc;
+    }
+#endif
     static DeviceAllocFn function = resolve_real<DeviceAllocFn>(
         "urUSMDeviceAlloc");
     return function;
 }
 
 FreeFn real_free() {
+#ifdef AIMDO_XPU_TESTING
+    if (g_test_free) {
+        return g_test_free;
+    }
+#endif
     static FreeFn function = resolve_real<FreeFn>("urUSMFree");
     return function;
 }
 
 DeviceGetNativeHandleFn real_device_get_native_handle() {
+#ifdef AIMDO_XPU_TESTING
+    if (g_test_device_get_native_handle) {
+        return g_test_device_get_native_handle;
+    }
+#endif
     static DeviceGetNativeHandleFn function =
         resolve_real<DeviceGetNativeHandleFn>("urDeviceGetNativeHandle");
     return function;
@@ -129,10 +165,12 @@ bool retry_matches(
     ur_context_handle_t context,
     ur_device_handle_t device,
     ur_usm_pool_handle_t pool,
-    size_t size) {
+    size_t size,
+    uint64_t generation) {
     return g_retry.reason != RetryReason::kNone &&
            g_retry.context == context && g_retry.device == device &&
-           g_retry.pool == pool && g_retry.size == size;
+           g_retry.pool == pool && g_retry.size == size &&
+           g_retry.generation == generation;
 }
 
 void arm_retry(
@@ -140,8 +178,10 @@ void arm_retry(
     ur_device_handle_t device,
     ur_usm_pool_handle_t pool,
     size_t size,
-    RetryReason reason) {
-    g_retry = RetryState{context, device, pool, size, reason};
+    RetryReason reason,
+    uint64_t generation) {
+    g_retry = RetryState{
+        context, device, pool, size, reason, generation};
 }
 
 void clear_retry() {
@@ -161,21 +201,101 @@ int resolve_device(ur_device_handle_t device) {
         static_cast<uintptr_t>(native_handle));
 }
 
-bool account_success(void *pointer, size_t size, int device) {
+bool is_torch_native_segment_request() {
+#ifdef AIMDO_XPU_TESTING
+    const TestRequestKind kind =
+        g_test_request_kind.load(std::memory_order_relaxed);
+    if (kind != TestRequestKind::kAutomatic) {
+        return kind == TestRequestKind::kTorchNative;
+    }
+#endif
+    void *frames[48];
+    const int count = backtrace(frames, 48);
+    for (int index = 1; index < count; ++index) {
+        Dl_info info {};
+        if (dladdr(frames[index], &info) == 0 || !info.dli_fname) {
+            continue;
+        }
+        const char *slash = std::strrchr(info.dli_fname, '/');
+        const char *base = slash ? slash + 1 : info.dli_fname;
+        if (std::strcmp(base, "libc10_xpu.so") == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+enum class AccountResult {
+    kSuccess,
+    kInvalidPointer,
+    kDuplicatePointer,
+    kMetadataFailure,
+};
+
+AccountResult account_success(void *pointer, size_t size, int device) {
     if (!pointer) {
-        return false;
+        return AccountResult::kInvalidPointer;
     }
     try {
-        g_allocations.emplace(pointer, Allocation{size, device});
+        const auto inserted =
+            g_allocations.emplace(pointer, Allocation{size, device});
+        if (!inserted.second) {
+            g_stats[kDuplicatePointerCalls].fetch_add(
+                1, std::memory_order_relaxed);
+            return AccountResult::kDuplicatePointer;
+        }
     } catch (...) {
         g_stats[kDroppedMetadataCalls].fetch_add(
             1, std::memory_order_relaxed);
-        return false;
+        return AccountResult::kMetadataFailure;
     }
-    aimdo_xpu_account_allocation(device, static_cast<int64_t>(size));
+    if (!aimdo_xpu_account_allocation(
+            device, static_cast<int64_t>(size))) {
+        g_allocations.erase(pointer);
+        g_stats[kDroppedMetadataCalls].fetch_add(
+            1, std::memory_order_relaxed);
+        return AccountResult::kMetadataFailure;
+    }
     g_stats[kTrackedAllocCalls].fetch_add(1, std::memory_order_relaxed);
     g_stats[kTrackedAllocBytes].fetch_add(size, std::memory_order_relaxed);
-    return true;
+    return AccountResult::kSuccess;
+}
+
+ur_result_t real_allocate_and_account(
+    DeviceAllocFn real,
+    FreeFn free,
+    ur_context_handle_t context,
+    ur_device_handle_t device,
+    const ur_usm_desc_t *description,
+    ur_usm_pool_handle_t pool,
+    size_t size,
+    void **pointer,
+    int aimdo_device) {
+    ur_result_t result =
+        real(context, device, description, pool, size, pointer);
+    if (is_oom(result)) {
+        g_stats[kRuntimeOomCalls].fetch_add(1, std::memory_order_relaxed);
+        return result;
+    }
+    if (result != UR_RESULT_SUCCESS) {
+        return result;
+    }
+    const AccountResult account =
+        account_success(pointer ? *pointer : nullptr, size, aimdo_device);
+    if (account == AccountResult::kSuccess) {
+        return result;
+    }
+    // A duplicate pointer identifies a broken lower-allocation contract. Do
+    // not free it here: the pointer may still belong to the first tracked
+    // allocation. Other failures own a unique new allocation and can roll it
+    // back safely.
+    if (account != AccountResult::kDuplicatePointer && pointer && *pointer) {
+        free(context, *pointer);
+    }
+    if (pointer) {
+        *pointer = nullptr;
+    }
+    return UR_RESULT_ERROR_OUT_OF_HOST_MEMORY;
 }
 
 bool same_file(const char *left, const char *right) {
@@ -232,8 +352,21 @@ extern "C" ur_result_t urUSMDeviceAlloc(
             1, std::memory_order_relaxed);
         return real(context, device, description, pool, size, pointer);
     }
+#ifdef AIMDO_XPU_TESTING
+    if (g_test_after_fast_enabled_check) {
+        g_test_after_fast_enabled_check();
+    }
+#endif
 
     std::lock_guard<std::mutex> guard(g_hook_mutex);
+    if (!g_enabled.load(std::memory_order_relaxed)) {
+        clear_retry();
+        g_stats[kPassThroughAllocCalls].fetch_add(
+            1, std::memory_order_relaxed);
+        return real(context, device, description, pool, size, pointer);
+    }
+    const uint64_t generation =
+        g_generation.load(std::memory_order_relaxed);
     const int aimdo_device = resolve_device(device);
     if (aimdo_device < 0) {
         clear_retry();
@@ -263,7 +396,12 @@ extern "C" ur_result_t urUSMDeviceAlloc(
         return UR_RESULT_ERROR_OUT_OF_HOST_MEMORY;
     }
 
-    if (retry_matches(context, device, pool, size)) {
+    const bool caller_classified =
+        deficit > 0 || g_retry.reason != RetryReason::kNone;
+    bool torch_native_request =
+        caller_classified && is_torch_native_segment_request();
+    if (torch_native_request &&
+        retry_matches(context, device, pool, size, generation)) {
         const RetryReason reason = g_retry.reason;
         clear_retry();
         int64_t eviction = std::max<int64_t>(deficit, 0);
@@ -279,44 +417,46 @@ extern "C" ur_result_t urUSMDeviceAlloc(
                 static_cast<uint64_t>(eviction),
                 std::memory_order_relaxed);
         }
-        ur_result_t result =
-            real(context, device, description, pool, size, pointer);
-        if (is_oom(result)) {
-            g_stats[kRuntimeOomCalls].fetch_add(
-                1, std::memory_order_relaxed);
-        } else if (result == UR_RESULT_SUCCESS && pointer) {
-            if (!account_success(*pointer, size, aimdo_device)) {
-                real_free()(context, *pointer);
-                *pointer = nullptr;
-                return UR_RESULT_ERROR_OUT_OF_HOST_MEMORY;
-            }
-        }
-        return result;
+        return real_allocate_and_account(
+            real, real_free(), context, device, description, pool, size,
+            pointer, aimdo_device);
     }
 
     clear_retry();
     if (deficit > 0) {
-        arm_retry(
-            context, device, pool, size, RetryReason::kBudgetDeficit);
-        if (pointer) {
-            *pointer = nullptr;
+        if (torch_native_request) {
+            arm_retry(
+                context, device, pool, size,
+                RetryReason::kBudgetDeficit, generation);
+            if (pointer) {
+                *pointer = nullptr;
+            }
+            g_stats[kSyntheticOomCalls].fetch_add(
+                1, std::memory_order_relaxed);
+            return UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
         }
-        g_stats[kSyntheticOomCalls].fetch_add(
+        if (!aimdo_xpu_evict_for_allocation(aimdo_device, deficit)) {
+            if (pointer) {
+                *pointer = nullptr;
+            }
+            return UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
+        }
+        g_stats[kDirectPressureCalls].fetch_add(
             1, std::memory_order_relaxed);
-        return UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
+        g_stats[kDirectPressureBytes].fetch_add(
+            static_cast<uint64_t>(deficit), std::memory_order_relaxed);
     }
 
-    ur_result_t result = real(
-        context, device, description, pool, size, pointer);
-    if (is_oom(result)) {
-        arm_retry(context, device, pool, size, RetryReason::kRuntimeOom);
-        g_stats[kRuntimeOomCalls].fetch_add(1, std::memory_order_relaxed);
-    } else if (result == UR_RESULT_SUCCESS && pointer) {
-        if (!account_success(*pointer, size, aimdo_device)) {
-            real_free()(context, *pointer);
-            *pointer = nullptr;
-            return UR_RESULT_ERROR_OUT_OF_HOST_MEMORY;
-        }
+    ur_result_t result = real_allocate_and_account(
+        real, real_free(), context, device, description, pool, size, pointer,
+        aimdo_device);
+    if (is_oom(result) && !caller_classified) {
+        torch_native_request = is_torch_native_segment_request();
+    }
+    if (torch_native_request && is_oom(result)) {
+        arm_retry(
+            context, device, pool, size,
+            RetryReason::kRuntimeOom, generation);
     }
     return result;
 }
@@ -333,6 +473,10 @@ extern "C" ur_result_t urUSMFree(
     }
 
     std::lock_guard<std::mutex> guard(g_hook_mutex);
+    if (!g_enabled.load(std::memory_order_relaxed)) {
+        clear_retry();
+        return real(context, pointer);
+    }
     ur_result_t result = real(context, pointer);
     if (result != UR_RESULT_SUCCESS) {
         return result;
@@ -345,7 +489,9 @@ extern "C" ur_result_t urUSMFree(
     }
     aimdo_xpu_account_allocation(
         found->second.device, -static_cast<int64_t>(found->second.size));
-    if (g_retry.reason != RetryReason::kNone) {
+    if (g_retry.reason != RetryReason::kNone &&
+        g_retry.generation ==
+            g_generation.load(std::memory_order_relaxed)) {
         g_stats[kNativeReclaimFreeCalls].fetch_add(
             1, std::memory_order_relaxed);
         g_stats[kNativeReclaimFreeBytes].fetch_add(
@@ -377,6 +523,12 @@ extern "C" AIMDO_XPU_EXPORT bool xpu_ur_hook_enable() {
         !real_free() || !real_device_get_native_handle()) {
         return false;
     }
+    std::lock_guard<std::mutex> guard(g_hook_mutex);
+    if (g_enabled.load(std::memory_order_relaxed)) {
+        return true;
+    }
+    g_generation.fetch_add(1, std::memory_order_relaxed);
+    clear_retry();
     g_enabled.store(true, std::memory_order_release);
     return true;
 }
@@ -387,6 +539,7 @@ extern "C" AIMDO_XPU_EXPORT bool xpu_ur_hook_disable() {
         return false;
     }
     g_enabled.store(false, std::memory_order_release);
+    g_generation.fetch_add(1, std::memory_order_relaxed);
     clear_retry();
     return true;
 }

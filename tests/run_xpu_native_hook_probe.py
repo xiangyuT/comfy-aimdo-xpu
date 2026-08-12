@@ -1,4 +1,5 @@
 import argparse
+import ctypes
 import gc
 import json
 import threading
@@ -163,6 +164,41 @@ def _live_disable(device):
     }
 
 
+def _direct_sycl(device, library_path):
+    if not library_path:
+        raise ValueError("direct-sycl requires --direct-sycl-library")
+    total = int(torch.xpu.get_device_properties(device).total_memory)
+    headroom = total - (128 << 20)
+    _initialize(device, headroom)
+    helper = ctypes.CDLL(library_path)
+    helper.aimdo_test_direct_sycl_alloc.argtypes = [
+        ctypes.c_uint64,
+        ctypes.c_size_t,
+    ]
+    helper.aimdo_test_direct_sycl_alloc.restype = ctypes.c_bool
+    queue = torch.xpu.current_stream(device)
+    before = control.get_xpu_ur_hook_stats()
+    assert helper.aimdo_test_direct_sycl_alloc(
+        int(queue.sycl_queue), 256 << 20
+    )
+    torch.xpu.synchronize(device)
+    after = control.get_xpu_ur_hook_stats()
+    assert _delta(after, before, "synthetic_oom_calls") == 0
+    assert _delta(after, before, "direct_pressure_calls") == 1
+    assert _delta(after, before, "direct_pressure_bytes") == 128 << 20
+    assert _delta(after, before, "tracked_alloc_calls") == 1
+    assert _delta(after, before, "tracked_free_calls") == 1
+    assert control.get_total_vram_usage() == 0
+    return {
+        "total_bytes": total,
+        "headroom_bytes": headroom,
+        "before": before,
+        "after": after,
+        "usage_after_release": control.get_total_vram_usage(),
+        "caller": "direct SYCL helper outside PyTorch",
+    }
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -172,17 +208,24 @@ def main():
             "native-reclaim",
             "residual-eviction",
             "live-disable",
+            "direct-sycl",
         ),
     )
     parser.add_argument("--device", type=int, default=0)
+    parser.add_argument("--direct-sycl-library")
     args = parser.parse_args()
     device = torch.device("xpu", args.device)
-    result = {
+    scenarios = {
         "lifecycle": _lifecycle,
         "native-reclaim": _native_reclaim,
         "residual-eviction": _residual_eviction,
         "live-disable": _live_disable,
-    }[args.scenario](device)
+    }
+    result = (
+        _direct_sycl(device, args.direct_sycl_library)
+        if args.scenario == "direct-sycl"
+        else scenarios[args.scenario](device)
+    )
     result.update(
         {
             "scenario": args.scenario,
