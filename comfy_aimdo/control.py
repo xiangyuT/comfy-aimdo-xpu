@@ -620,6 +620,48 @@ def get_xpu_ur_hook_stats():
     return dict(zip(names, map(int, values)))
 
 
+def get_xpu_ur_hook_timing():
+    """Hook and classification cost, Windows only.
+
+    Reported separately from the shared statistics table so the Linux and
+    Windows tables stay identical. ``hook_ns`` includes the driver call the
+    hook wraps, which is what distinguishes a slow hook from slow consequences
+    of the hook's decisions.
+    """
+    if (
+        lib is None
+        or implementation != "xpu"
+        or not hasattr(lib, "xpu_ur_hook_get_hook_timing")
+    ):
+        return {}
+    calls = ctypes.c_uint64()
+    nanoseconds = ctypes.c_uint64()
+    hits = ctypes.c_uint64()
+    lib.xpu_ur_hook_get_hook_timing.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    lib.xpu_ur_hook_get_hook_timing.restype = ctypes.c_bool
+    lib.xpu_ur_hook_get_classify_timing.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+        ctypes.POINTER(ctypes.c_uint64),
+    ]
+    lib.xpu_ur_hook_get_classify_timing.restype = ctypes.c_bool
+    if not lib.xpu_ur_hook_get_hook_timing(
+        ctypes.byref(calls), ctypes.byref(nanoseconds)
+    ):
+        return {}
+    result = {"hook_calls": int(calls.value), "hook_ns": int(nanoseconds.value)}
+    if lib.xpu_ur_hook_get_classify_timing(
+        ctypes.byref(calls), ctypes.byref(nanoseconds), ctypes.byref(hits)
+    ):
+        result["classify_calls"] = int(calls.value)
+        result["classify_ns"] = int(nanoseconds.value)
+        result["classify_torch_hits"] = int(hits.value)
+    return result
+
+
 def empty_xpu_allocator_cache(wait=False):
     if lib is None or implementation != "xpu" or not _xpu_allocator_ready:
         return False

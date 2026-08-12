@@ -38,6 +38,7 @@
  */
 
 #include <windows.h>
+#include <psapi.h>
 #include <detours.h>
 
 #include <stdbool.h>
@@ -71,7 +72,6 @@ typedef ur_result_t(__cdecl *PFN_urPhysicalMemCreate)(ur_context_handle_t,
                                                       ur_device_handle_t, size_t,
                                                       const void *, void **);
 typedef void *(__cdecl *PFN_getPreloadedURLib)(void);
-typedef BOOL(WINAPI *PFN_EnumProcessModules)(HANDLE, HMODULE *, DWORD, LPDWORD);
 
 #if defined(__cplusplus)
 extern "C" {
@@ -123,6 +123,18 @@ enum RetryReason {
     kRetryBudgetDeficit,
     kRetryRuntimeOom
 };
+
+#ifdef AIMDO_XPU_TESTING
+/* Seams used by tests/ur_usm_detour_unit.c. They mirror the ones
+ * src-xpu/ur-usm-hook.cpp exposes for the Linux unit test, so both platforms
+ * verify the same state machine without a device or a Unified Runtime loader. */
+enum TestRequestKind {
+    kTestRequestAutomatic = 0,
+    kTestRequestDirect,
+    kTestRequestTorchNative
+};
+static volatile LONG g_test_request_kind;
+#endif
 
 static PFN_urUSMDeviceAlloc true_urUSMDeviceAlloc;
 static PFN_urUSMFree true_urUSMFree;
@@ -223,37 +235,148 @@ static const wchar_t *base_name(const wchar_t *path) {
     return slash ? slash + 1 : path;
 }
 
+typedef BOOL(WINAPI *PFN_EnumProcessModules)(HANDLE, HMODULE *, DWORD, LPDWORD);
+typedef BOOL(WINAPI *PFN_GetModuleInformation)(HANDLE, HMODULE, LPMODULEINFO,
+                                               DWORD);
+
 /* Caller classification.
  *
  * ur-usm-hook.cpp walks the stack with backtrace()/dladdr() looking for
- * libc10_xpu.so. RtlCaptureStackBackTrace with GetModuleHandleExW is the
- * documented Windows equivalent and uses the x64 unwind tables rather than
- * frame pointers, so it does not depend on how the intervening modules were
- * compiled. A PyTorch segment request reaches this hook as
- * c10_xpu.dll -> sycl8.dll -> ur_loader.dll. */
-static bool is_torch_native_segment_request(void) {
-    void *frames[48];
-    USHORT count;
-    USHORT index;
+ * libc10_xpu.so. The direct Windows transliteration - GetModuleHandleExW plus
+ * GetModuleFileNameW on every frame - resolves and formats a module path up to
+ * 48 times per allocation, and it runs precisely when the deficit is positive,
+ * which is the hot path under pressure. dladdr() is cheap enough for that
+ * shape; the Win32 pair is not.
+ *
+ * c10_xpu.dll occupies one contiguous image range that cannot move while it is
+ * loaded, so the range is resolved once and each frame becomes a pair of
+ * integer comparisons. See docs/WINDOWS_XPU_UR_ALLOCATOR_HOOK.md for the
+ * measured cost of both forms. */
+#define CLASSIFY_MAX_FRAMES 32
 
-    count = RtlCaptureStackBackTrace(1, ARRAYSIZE(frames), frames, NULL);
+static uintptr_t g_torch_module_base;
+static uintptr_t g_torch_module_end;
+static volatile LONG g_torch_module_state; /* 0 unknown, 1 resolved */
+
+static volatile LONG64 g_classify_calls;
+static volatile LONG64 g_classify_ticks;
+static volatile LONG64 g_classify_torch_hits;
+static volatile LONG64 g_hook_calls;
+static volatile LONG64 g_hook_ticks;
+
+static HMODULE find_module_by_name(const wchar_t *wanted) {
+    HMODULE kernel = GetModuleHandleA("kernel32.dll");
+    PFN_EnumProcessModules enumerate;
+    HMODULE modules[1024];
+    DWORD needed = 0;
+    DWORD count;
+    DWORD index;
+
+    if (!kernel) {
+        return NULL;
+    }
+    enumerate = (PFN_EnumProcessModules)(void *)GetProcAddress(
+        kernel, "K32EnumProcessModules");
+    if (!enumerate ||
+        !enumerate(GetCurrentProcess(), modules, sizeof(modules), &needed)) {
+        return NULL;
+    }
+    count = needed / (DWORD)sizeof(HMODULE);
+    if (count > ARRAYSIZE(modules)) {
+        count = ARRAYSIZE(modules);
+    }
     for (index = 0; index < count; ++index) {
-        HMODULE module = NULL;
         wchar_t path[MAX_PATH];
 
-        if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                (LPCWSTR)frames[index], &module)) {
+        if (!GetModuleFileNameW(modules[index], path, ARRAYSIZE(path))) {
             continue;
         }
-        if (!GetModuleFileNameW(module, path, ARRAYSIZE(path))) {
-            continue;
-        }
-        if (_wcsicmp(base_name(path), L"c10_xpu.dll") == 0) {
-            return true;
+        if (_wcsicmp(base_name(path), wanted) == 0) {
+            return modules[index];
         }
     }
-    return false;
+    return NULL;
+}
+
+/* Resolve a loaded module's image range. Returns false while the module is not
+ * loaded yet, which is normal before PyTorch initializes XPU, so the result is
+ * only cached once it succeeds. */
+static bool module_image_range(const wchar_t *name, uintptr_t *base,
+                               uintptr_t *end) {
+    HMODULE kernel = GetModuleHandleA("kernel32.dll");
+    PFN_GetModuleInformation get_information;
+    MODULEINFO information;
+    HMODULE module = GetModuleHandleW(name);
+
+    if (!module) {
+        module = find_module_by_name(name);
+    }
+    if (!module || !kernel) {
+        return false;
+    }
+    get_information = (PFN_GetModuleInformation)(void *)GetProcAddress(
+        kernel, "K32GetModuleInformation");
+    if (!get_information ||
+        !get_information(GetCurrentProcess(), module, &information,
+                         (DWORD)sizeof(information))) {
+        return false;
+    }
+    *base = (uintptr_t)information.lpBaseOfDll;
+    *end = *base + information.SizeOfImage;
+    return true;
+}
+
+static bool ensure_torch_module(void) {
+    uintptr_t base;
+    uintptr_t end;
+
+    if (InterlockedCompareExchange(&g_torch_module_state, 0, 0)) {
+        return true;
+    }
+    if (!module_image_range(L"c10_xpu.dll", &base, &end)) {
+        return false;
+    }
+    g_torch_module_base = base;
+    g_torch_module_end = end;
+    InterlockedExchange(&g_torch_module_state, 1);
+    return true;
+}
+
+static bool is_torch_native_segment_request(void) {
+    void *frames[CLASSIFY_MAX_FRAMES];
+    LARGE_INTEGER started;
+    LARGE_INTEGER finished;
+    USHORT count;
+    USHORT index;
+    bool found = false;
+
+#ifdef AIMDO_XPU_TESTING
+    if (g_test_request_kind != kTestRequestAutomatic) {
+        return g_test_request_kind == kTestRequestTorchNative;
+    }
+#endif
+    if (!ensure_torch_module()) {
+        return false;
+    }
+
+    QueryPerformanceCounter(&started);
+    count = RtlCaptureStackBackTrace(1, CLASSIFY_MAX_FRAMES, frames, NULL);
+    for (index = 0; index < count; ++index) {
+        const uintptr_t address = (uintptr_t)frames[index];
+
+        if (address >= g_torch_module_base && address < g_torch_module_end) {
+            found = true;
+            break;
+        }
+    }
+    QueryPerformanceCounter(&finished);
+
+    InterlockedAdd64(&g_classify_ticks, finished.QuadPart - started.QuadPart);
+    InterlockedIncrement64(&g_classify_calls);
+    if (found) {
+        InterlockedIncrement64(&g_classify_torch_hits);
+    }
+    return found;
 }
 
 static int resolve_device(ur_device_handle_t device) {
@@ -331,7 +454,7 @@ static ur_result_t allocate_and_account(
     return result;
 }
 
-static ur_result_t __cdecl aimdo_urUSMDeviceAlloc(
+static ur_result_t aimdo_urUSMDeviceAlloc_body(
     ur_context_handle_t context, ur_device_handle_t device,
     const ur_usm_desc_t *description, ur_usm_pool_handle_t pool, size_t size,
     void **pointer) {
@@ -345,7 +468,6 @@ static ur_result_t __cdecl aimdo_urUSMDeviceAlloc(
     if (!true_urUSMDeviceAlloc) {
         return UR_RESULT_ERROR_UNINITIALIZED;
     }
-    stat_add(kAllocCalls, 1);
     if (!InterlockedCompareExchange(&g_enabled, 0, 0)) {
         stat_add(kPassThroughAllocCalls, 1);
         return true_urUSMDeviceAlloc(context, device, description, pool, size,
@@ -451,6 +573,25 @@ static ur_result_t __cdecl aimdo_urUSMDeviceAlloc(
     return result;
 }
 
+/* Wrapper that times the whole hook, including the driver call it wraps. */
+static ur_result_t __cdecl aimdo_urUSMDeviceAlloc(
+    ur_context_handle_t context, ur_device_handle_t device,
+    const ur_usm_desc_t *description, ur_usm_pool_handle_t pool, size_t size,
+    void **pointer) {
+    LARGE_INTEGER started;
+    LARGE_INTEGER finished;
+    ur_result_t result;
+
+    QueryPerformanceCounter(&started);
+    result = aimdo_urUSMDeviceAlloc_body(context, device, description, pool,
+                                         size, pointer);
+    QueryPerformanceCounter(&finished);
+    stat_add(kAllocCalls, 1);
+    InterlockedAdd64(&g_hook_ticks, finished.QuadPart - started.QuadPart);
+    InterlockedIncrement64(&g_hook_calls);
+    return result;
+}
+
 static ur_result_t __cdecl aimdo_urUSMFree(ur_context_handle_t context,
                                            void *pointer) {
     ur_result_t result;
@@ -506,39 +647,7 @@ static ur_result_t __cdecl aimdo_urPhysicalMemCreate(
     return true_urPhysicalMemCreate(context, device, size, properties, handle);
 }
 
-static HMODULE find_proxy_loader(void) {
-    HMODULE kernel = GetModuleHandleA("kernel32.dll");
-    PFN_EnumProcessModules enumerate;
-    HMODULE modules[1024];
-    DWORD needed = 0;
-    DWORD count;
-    DWORD index;
 
-    if (!kernel) {
-        return NULL;
-    }
-    enumerate = (PFN_EnumProcessModules)(void *)GetProcAddress(
-        kernel, "K32EnumProcessModules");
-    if (!enumerate ||
-        !enumerate(GetCurrentProcess(), modules, sizeof(modules), &needed)) {
-        return NULL;
-    }
-    count = needed / (DWORD)sizeof(HMODULE);
-    if (count > ARRAYSIZE(modules)) {
-        count = ARRAYSIZE(modules);
-    }
-    for (index = 0; index < count; ++index) {
-        wchar_t path[MAX_PATH];
-
-        if (!GetModuleFileNameW(modules[index], path, ARRAYSIZE(path))) {
-            continue;
-        }
-        if (_wcsicmp(base_name(path), L"ur_win_proxy_loader.dll") == 0) {
-            return modules[index];
-        }
-    }
-    return NULL;
-}
 
 /* Resolve the loader SYCL itself uses.
  *
@@ -551,7 +660,7 @@ static HMODULE find_proxy_loader(void) {
  * Note that GetModuleHandleA cannot find the proxy itself in a live PyTorch
  * process even though it is loaded, hence the module walk. */
 static HMODULE resolve_ur_loader(void) {
-    HMODULE proxy = find_proxy_loader();
+    HMODULE proxy = find_module_by_name(L"ur_win_proxy_loader.dll");
     HMODULE by_name = GetModuleHandleA("ur_loader.dll");
     HMODULE from_proxy = NULL;
 
@@ -570,6 +679,32 @@ static HMODULE resolve_ur_loader(void) {
     }
     return from_proxy ? from_proxy : by_name;
 }
+
+#ifdef AIMDO_XPU_TESTING
+/* Bring the hook up without Detours or a Unified Runtime loader. The unit test
+ * installs its own entry points into the true_* pointers first. */
+static void test_force_enable(void) {
+    if (!InterlockedCompareExchange(&g_lock_ready, 0, 0)) {
+        InitializeCriticalSection(&g_hook_lock);
+        InterlockedExchange(&g_lock_ready, 1);
+    }
+    InterlockedExchange(&g_attached, 1);
+    InterlockedIncrement64(&g_generation);
+    clear_retry();
+    InterlockedExchange(&g_enabled, 1);
+}
+
+static void test_reset_state(void) {
+    size_t index;
+
+    for (index = 0; index < (size_t)kHookStatCount; ++index) {
+        InterlockedExchange64(&g_stats[index], 0);
+    }
+    InterlockedExchange64(&g_allocation_count, 0);
+    memset(g_allocations, 0, sizeof(g_allocations));
+    clear_retry();
+}
+#endif
 
 bool aimdo_xpu_ur_hook_install(void) {
     HMODULE loader;
@@ -740,6 +875,51 @@ __declspec(dllexport) bool xpu_ur_hook_get_stats(uint64_t *values,
         values[index] =
             (uint64_t)InterlockedCompareExchange64(&g_stats[index], 0, 0);
     }
+    return true;
+}
+
+/* Caller classification cost, reported separately from the shared statistics
+ * table so the Linux and Windows tables stay identical. Nanoseconds are
+ * derived here because QueryPerformanceFrequency is fixed for the process. */
+__declspec(dllexport) bool xpu_ur_hook_get_classify_timing(
+    uint64_t *calls, uint64_t *nanoseconds, uint64_t *torch_hits) {
+    LARGE_INTEGER frequency;
+    LONG64 ticks;
+
+    if (!calls || !nanoseconds || !torch_hits) {
+        return false;
+    }
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart == 0) {
+        return false;
+    }
+    ticks = InterlockedCompareExchange64(&g_classify_ticks, 0, 0);
+    *calls = (uint64_t)InterlockedCompareExchange64(&g_classify_calls, 0, 0);
+    *torch_hits =
+        (uint64_t)InterlockedCompareExchange64(&g_classify_torch_hits, 0, 0);
+    *nanoseconds =
+        (uint64_t)((double)ticks * 1e9 / (double)frequency.QuadPart);
+    return true;
+}
+
+/* Total wall time spent inside the allocation hook, including the real driver
+ * call it wraps. This is what decides whether a workload regression belongs to
+ * the hook itself or to the consequences of its decisions, such as PyTorch
+ * discarding its entire cache after a synthetic failure. */
+__declspec(dllexport) bool xpu_ur_hook_get_hook_timing(uint64_t *calls,
+                                                       uint64_t *nanoseconds) {
+    LARGE_INTEGER frequency;
+    LONG64 ticks;
+
+    if (!calls || !nanoseconds) {
+        return false;
+    }
+    if (!QueryPerformanceFrequency(&frequency) || frequency.QuadPart == 0) {
+        return false;
+    }
+    ticks = InterlockedCompareExchange64(&g_hook_ticks, 0, 0);
+    *calls = (uint64_t)InterlockedCompareExchange64(&g_hook_calls, 0, 0);
+    *nanoseconds =
+        (uint64_t)((double)ticks * 1e9 / (double)frequency.QuadPart);
     return true;
 }
 
