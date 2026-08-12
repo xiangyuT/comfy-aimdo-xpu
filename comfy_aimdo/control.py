@@ -5,8 +5,6 @@ import sys
 from pathlib import Path
 import logging
 import importlib.util
-import contextlib
-import threading
 
 lib = None
 devctxs = []
@@ -16,8 +14,6 @@ _torch_allocator = None
 _torch_allocator_library = None
 _xpu_allocator_ready = False
 _xpu_allocator_mode = None
-_torch_xpu_memory_pools = {}
-_torch_xpu_memory_pools_lock = threading.Lock()
 _torch_xpu_empty_cache_original = None
 _torch_xpu_memory_stats_original = None
 _torch_xpu_reset_peak_stats_original = None
@@ -35,7 +31,7 @@ _LOG_LEVELS = {
     7: logging.DEBUG,
 }
 
-_XPU_ALLOCATOR_MODES = frozenset(("global", "native_hook", "native_pool"))
+_XPU_ALLOCATOR_MODES = frozenset(("global", "native_hook"))
 
 
 def _normalize_xpu_allocator_mode(mode):
@@ -55,9 +51,7 @@ def _normalize_xpu_allocator_mode(mode):
 def _install_xpu_allocator_backend(torch_module, aimdo_torch_module, mode):
     if mode == "native_hook":
         return None
-    allocator = aimdo_torch_module.get_torch_allocator(
-        raw_segments=mode == "native_pool"
-    )
+    allocator = aimdo_torch_module.get_torch_allocator()
     if allocator is None:
         raise RuntimeError("AIMDO XPU allocator is unavailable")
     if mode == "global":
@@ -590,52 +584,6 @@ def _xpu_device_index(device=None):
     if parsed.type != "xpu":
         raise ValueError(f"expected an XPU device, got {parsed}")
     return int(torch.xpu.current_device() if parsed.index is None else parsed.index)
-
-
-def get_xpu_allocator_pool(device=None):
-    if (
-        lib is None
-        or implementation != "xpu"
-        or not _xpu_allocator_ready
-        or _xpu_allocator_mode != "native_pool"
-    ):
-        raise RuntimeError("AIMDO XPU native-pool mode is not initialized")
-
-    import torch
-
-    device_index = _xpu_device_index(device)
-    with _torch_xpu_memory_pools_lock:
-        pool = _torch_xpu_memory_pools.get(device_index)
-        if pool is None:
-            with torch.xpu.device(device_index):
-                pool = torch.xpu.MemPool(_torch_allocator.allocator())
-            _torch_xpu_memory_pools[device_index] = pool
-        return pool
-
-
-@contextlib.contextmanager
-def use_xpu_allocator_pool(device=None):
-    import torch
-
-    device_index = _xpu_device_index(device)
-    pool = get_xpu_allocator_pool(device_index)
-    with torch.xpu.use_mem_pool(pool, device=device_index):
-        yield pool
-
-
-def release_xpu_allocator_pool(device=None):
-    device_index = _xpu_device_index(device)
-    with _torch_xpu_memory_pools_lock:
-        pool = _torch_xpu_memory_pools.get(device_index)
-        if pool is None:
-            return False
-        if pool.use_count() != 1:
-            raise RuntimeError(
-                f"AIMDO XPU pool for device {device_index} is still active"
-            )
-        del _torch_xpu_memory_pools[device_index]
-    del pool
-    return True
 
 
 def get_xpu_allocator_memory_stats(device=None):

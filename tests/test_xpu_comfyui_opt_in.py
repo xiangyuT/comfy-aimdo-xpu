@@ -1,6 +1,5 @@
 import sys
 import types
-from contextlib import nullcontext
 
 import pytest
 
@@ -66,7 +65,6 @@ def test_comfyui_xpu_opt_out_precedes_native_library_load(monkeypatch):
         (None, "global"),
         ("global", "global"),
         ("native_hook", "native_hook"),
-        ("native_pool", "native_pool"),
     ],
 )
 def test_xpu_allocator_mode_contract(monkeypatch, value, expected):
@@ -85,16 +83,20 @@ def test_xpu_allocator_mode_rejects_unknown_value():
         control._normalize_xpu_allocator_mode("unknown")
 
 
+def test_xpu_allocator_mode_rejects_retired_native_pool():
+    with pytest.raises(ValueError, match="unsupported XPU allocator mode"):
+        control._normalize_xpu_allocator_mode("native_pool")
+
+
 @pytest.mark.parametrize(
-    ("mode", "raw_segments", "global_swaps", "has_allocator"),
+    ("mode", "global_swaps", "has_allocator"),
     [
-        ("global", False, 1, True),
-        ("native_hook", None, 0, False),
-        ("native_pool", True, 0, True),
+        ("global", 1, True),
+        ("native_hook", 0, False),
     ],
 )
 def test_xpu_allocator_backend_selection(
-    mode, raw_segments, global_swaps, has_allocator
+    mode, global_swaps, has_allocator
 ):
     allocator = object()
     requests = []
@@ -117,55 +119,5 @@ def test_xpu_allocator_backend_selection(
     )
 
     assert (result is allocator) is has_allocator
-    assert requests == (
-        [{"raw_segments": raw_segments}] if has_allocator else []
-    )
+    assert requests == ([{}] if has_allocator else [])
     assert swaps == ([allocator] if global_swaps else [])
-
-
-def test_native_pool_is_lazy_per_device_and_scoped(monkeypatch):
-    allocator_handle = object()
-
-    class FakeAllocator:
-        def allocator(self):
-            return allocator_handle
-
-    class FakePool:
-        def __init__(self, allocator):
-            assert allocator is allocator_handle
-            self.id = (0, 7)
-
-        def use_count(self):
-            return 1
-
-    pool_scopes = []
-    fake_xpu = types.SimpleNamespace(
-        current_device=lambda: 1,
-        device=lambda device: nullcontext(),
-        MemPool=FakePool,
-        use_mem_pool=lambda pool, device=None: (
-            pool_scopes.append((pool, device)) or nullcontext()
-        ),
-    )
-    monkeypatch.setitem(
-        sys.modules,
-        "torch",
-        types.SimpleNamespace(xpu=fake_xpu),
-    )
-    monkeypatch.setattr(control, "lib", object())
-    monkeypatch.setattr(control, "implementation", "xpu")
-    monkeypatch.setattr(control, "_xpu_allocator_ready", True)
-    monkeypatch.setattr(control, "_xpu_allocator_mode", "native_pool")
-    monkeypatch.setattr(control, "_torch_allocator", FakeAllocator())
-    monkeypatch.setattr(control, "_torch_xpu_memory_pools", {})
-
-    first = control.get_xpu_allocator_pool()
-    second = control.get_xpu_allocator_pool()
-    assert first is second
-
-    with control.use_xpu_allocator_pool() as active:
-        assert active is first
-
-    assert pool_scopes == [(first, 1)]
-    assert control.release_xpu_allocator_pool() is True
-    assert control.release_xpu_allocator_pool() is False
