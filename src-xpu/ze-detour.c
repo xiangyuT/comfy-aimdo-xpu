@@ -295,13 +295,17 @@ bool aimdo_setup_hooks(void) {
      * Zero memory management from inside its own allocation call. Failing to
      * attach is not fatal: the Level Zero detour above remains as the
      * post-allocation fallback. */
-    if (!env_flag_enabled("AIMDO_XPU_DISABLE_UR_HOOK")) {
-        g_ur_hook_owns_arbitration = aimdo_xpu_ur_hook_install();
-    }
-    if (!g_ur_hook_owns_arbitration) {
+    if (env_flag_enabled("AIMDO_XPU_DISABLE_UR_HOOK")) {
         aimdo_log(kAimdoDetourLogWarning, __FILE__, __LINE__,
-                  "%s: Unified Runtime arbitration unavailable; falling back to "
+                  "%s: Unified Runtime arbitration disabled by request; using "
                   "post-allocation Level Zero reclaim\n", __func__);
+    } else {
+        g_ur_hook_owns_arbitration = aimdo_xpu_ur_hook_install();
+        if (!g_ur_hook_owns_arbitration) {
+            aimdo_log(kAimdoDetourLogWarning, __FILE__, __LINE__,
+                      "%s: Unified Runtime arbitration unavailable; falling "
+                      "back to post-allocation Level Zero reclaim\n", __func__);
+        }
     }
 
     aimdo_log(kAimdoDetourLogInfo, __FILE__, __LINE__,

@@ -148,6 +148,9 @@ def _release_native_cache(device):
         stats = torch.xpu.memory_stats(device)
         cached = (int(stats.get("reserved_bytes.all.current", 0))
                   - int(stats.get("allocated_bytes.all.current", 0)))
+        # The allocation hook needs this figure too, and cannot derive it: a
+        # cached block never reaches the driver.
+        control.publish_torch_cached_bytes(device, cached)
         if cached < 32 * 1024 ** 2:
             return False
         torch.xpu.empty_cache()

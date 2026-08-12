@@ -198,6 +198,20 @@ def init(
 
     if (
         implementation == "xpu"
+        and requested_xpu_allocator_mode == "native_hook"
+        and os.environ.get("AIMDO_XPU_DISABLE_UR_HOOK") == "1"
+    ):
+        # The same switch the native side honours. Without this the hook would
+        # still be attached through xpu_ur_hook_is_interposed() below and both
+        # control loops would arbitrate the same pressure.
+        logging.warning(
+            "comfy-aimdo XPU native hook disabled by AIMDO_XPU_DISABLE_UR_HOOK; "
+            "falling back to post-allocation Level Zero reclaim"
+        )
+        requested_xpu_allocator_mode = "global"
+
+    if (
+        implementation == "xpu"
         and not _xpu_initialization_requested(implementation_was_explicit)
     ):
         logging.info(
@@ -613,7 +627,7 @@ def get_xpu_ur_hook_stats():
     if platform.system() == "Windows":
         # Windows also counts the entry point PyTorch uses instead of USM when
         # expandable segments are enabled, so a blind hook is observable.
-        names = names + ("physical_mem_create_calls",)
+        names = names + ("physical_mem_create_calls", "cache_lever_skipped_calls")
     values = (ctypes.c_uint64 * len(names))()
     if not lib.xpu_ur_hook_get_stats(values, len(names)):
         raise RuntimeError("failed to query AIMDO XPU UR hook statistics")
@@ -660,6 +674,44 @@ def get_xpu_ur_hook_timing():
         result["classify_ns"] = int(nanoseconds.value)
         result["classify_torch_hits"] = int(hits.value)
     return result
+
+
+def publish_torch_cached_bytes(device, cached_bytes=None):
+    """Tell the native hook how much PyTorch is holding in its own cache.
+
+    The hook refuses an over-budget PyTorch allocation so that PyTorch releases
+    its cache and retries, which is the only way AIMDO can reclaim those bytes.
+    That is expensive - PyTorch discards the whole cache - so it must not be
+    done when there is no cache to reclaim.
+
+    The hook cannot work this out for itself. A cached block is one PyTorch
+    freed without returning it to the driver, so it never reaches urUSMFree and
+    the cache growing is invisible from there.
+    """
+    if (
+        lib is None
+        or implementation != "xpu"
+        or not hasattr(lib, "xpu_ur_hook_set_torch_cached_bytes")
+    ):
+        return None
+    if cached_bytes is None:
+        try:
+            import torch
+
+            stats = torch.xpu.memory_stats(device)
+            cached_bytes = int(stats.get("reserved_bytes.all.current", 0)) - int(
+                stats.get("allocated_bytes.all.current", 0)
+            )
+        except Exception:
+            return None
+    cached_bytes = max(int(cached_bytes), 0)
+    lib.xpu_ur_hook_set_torch_cached_bytes.argtypes = [
+        ctypes.c_int,
+        ctypes.c_uint64,
+    ]
+    lib.xpu_ur_hook_set_torch_cached_bytes.restype = None
+    lib.xpu_ur_hook_set_torch_cached_bytes(int(device), cached_bytes)
+    return cached_bytes
 
 
 def empty_xpu_allocator_cache(wait=False):

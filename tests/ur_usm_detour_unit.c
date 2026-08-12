@@ -129,6 +129,9 @@ static void reset(void) {
     true_urUSMDeviceAlloc = fake_alloc;
     true_urUSMFree = fake_free;
     real_urDeviceGetNativeHandle = fake_native_handle;
+    /* Default to "PyTorch has a cache worth asking for", the precondition for
+     * the refusal path. Tests that care about the empty case publish zero. */
+    xpu_ur_hook_set_torch_cached_bytes(0, 1024 * 1024 * 1024);
     test_force_enable();
 }
 
@@ -417,6 +420,64 @@ static void benchmark_classification(void) {
     CHECK(deep_range * 2.0 < deep_path);
 }
 
+/* The refusal costs a full cache flush, so it must only happen when PyTorch
+ * has a cache to give up. With nothing published the hook must evict directly
+ * instead of refusing. */
+static void test_no_refusal_when_torch_has_no_cache(void) {
+    void *pointer = NULL;
+
+    reset();
+    InterlockedExchange(&g_test_request_kind, kTestRequestTorchNative);
+    xpu_ur_hook_set_torch_cached_bytes(0, 0);
+    g_script_deficit = 4096;
+
+    CHECK(aimdo_urUSMDeviceAlloc(NULL, NULL, NULL, NULL, 8192, &pointer) ==
+          UR_RESULT_SUCCESS);
+    CHECK(g_stats[kSyntheticOomCalls] == 0);
+    CHECK(g_stats[kCacheLeverSkippedCalls] == 1);
+    CHECK(g_evict_calls == 1);
+}
+
+/* A refusal that returns nothing proves the published figure was stale, and
+ * the hook must stop refusing until a new figure arrives. */
+static void test_stale_cache_estimate_is_corrected(void) {
+    void *pointer = NULL;
+
+    reset();
+    InterlockedExchange(&g_test_request_kind, kTestRequestTorchNative);
+    xpu_ur_hook_set_torch_cached_bytes(0, 64 * 1024 * 1024);
+    g_script_deficit = 4096;
+
+    CHECK(aimdo_urUSMDeviceAlloc(NULL, NULL, NULL, NULL, 8192, &pointer) ==
+          UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY);
+    CHECK(aimdo_urUSMDeviceAlloc(NULL, NULL, NULL, NULL, 8192, &pointer) ==
+          UR_RESULT_SUCCESS);
+    CHECK(torch_cached_bytes(0) == 0);
+    CHECK(aimdo_urUSMDeviceAlloc(NULL, NULL, NULL, NULL, 8192, &pointer) ==
+          UR_RESULT_SUCCESS);
+    CHECK(g_stats[kSyntheticOomCalls] == 1);
+}
+
+/* Publishing a new figure must re-arm the mechanism, or it would be lost for
+ * the rest of the process after its first empty flush. */
+static void test_publishing_rearms_the_mechanism(void) {
+    void *pointer = NULL;
+
+    reset();
+    InterlockedExchange(&g_test_request_kind, kTestRequestTorchNative);
+    xpu_ur_hook_set_torch_cached_bytes(0, 0);
+    g_script_deficit = 4096;
+
+    CHECK(aimdo_urUSMDeviceAlloc(NULL, NULL, NULL, NULL, 8192, &pointer) ==
+          UR_RESULT_SUCCESS);
+    CHECK(g_stats[kSyntheticOomCalls] == 0);
+
+    xpu_ur_hook_set_torch_cached_bytes(0, 128 * 1024 * 1024);
+    CHECK(aimdo_urUSMDeviceAlloc(NULL, NULL, NULL, NULL, 8192, &pointer) ==
+          UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY);
+    CHECK(g_stats[kSyntheticOomCalls] == 1);
+}
+
 int main(void) {
     test_within_budget_passes_through();
     test_torch_request_fails_then_retry_evicts();
@@ -425,6 +486,9 @@ int main(void) {
     test_disable_succeeds_with_live_segments();
     test_tracking_survives_deletion_churn();
     test_module_range_resolution();
+    test_no_refusal_when_torch_has_no_cache();
+    test_stale_cache_estimate_is_corrected();
+    test_publishing_rearms_the_mechanism();
     benchmark_classification();
 
     if (g_failures) {

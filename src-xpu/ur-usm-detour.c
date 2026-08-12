@@ -115,6 +115,7 @@ enum UrHookStat {
     kDirectPressureBytes,
     kDuplicatePointerCalls,
     kPhysicalMemCreateCalls,
+    kCacheLeverSkippedCalls,
     kHookStatCount
 };
 
@@ -154,6 +155,48 @@ static __declspec(thread) ur_usm_pool_handle_t t_retry_pool;
 static __declspec(thread) size_t t_retry_size;
 static __declspec(thread) int t_retry_reason;
 static __declspec(thread) LONG64 t_retry_generation;
+static __declspec(thread) LONG64 t_retry_returned_bytes;
+
+/* Bytes PyTorch is holding in its own cache, per device.
+ *
+ * The synthetic out-of-memory path is the only way AIMDO can reclaim those
+ * bytes, and it is expensive: PyTorch answers a refusal by discarding its
+ * whole cache, which was measured to double the number of real driver
+ * allocations. Firing it when the cache is already empty pays that cost for
+ * nothing: 71 of 71 refusals during a Torch ramp returned zero bytes.
+ *
+ * This value cannot be derived inside the hook. A cached block is one PyTorch
+ * freed but did not return to the driver, so it never reaches urUSMFree and
+ * the hook is structurally blind to the cache growing. The hook can only learn
+ * that the cache is empty, by observing that a refusal returned nothing.
+ * Learning only that direction would latch the mechanism off permanently, so
+ * comfy_aimdo publishes the live figure from PyTorch's own statistics. */
+#define MAX_TRACKED_DEVICES 16
+static volatile LONG64 g_torch_cached_bytes[MAX_TRACKED_DEVICES];
+
+static LONG64 torch_cached_bytes(int device) {
+    if (device < 0 || device >= MAX_TRACKED_DEVICES) {
+        return 0;
+    }
+    return InterlockedCompareExchange64(&g_torch_cached_bytes[device], 0, 0);
+}
+
+static void torch_cached_bytes_consume(int device, LONG64 returned) {
+    LONG64 current;
+
+    if (device < 0 || device >= MAX_TRACKED_DEVICES) {
+        return;
+    }
+    if (returned <= 0) {
+        /* The refusal produced nothing, so the estimate was stale and the
+         * cache is empty. Believe the observation over the estimate. */
+        InterlockedExchange64(&g_torch_cached_bytes[device], 0);
+        return;
+    }
+    current = InterlockedCompareExchange64(&g_torch_cached_bytes[device], 0, 0);
+    InterlockedExchange64(&g_torch_cached_bytes[device],
+                          current > returned ? current - returned : 0);
+}
 
 /* Live tracked allocations. Open addressed with tombstones: USM device
  * allocations are highly aligned and collide heavily, and clearing a slot on
@@ -398,6 +441,7 @@ static void clear_retry(void) {
     t_retry_size = 0;
     t_retry_reason = kRetryNone;
     t_retry_generation = 0;
+    t_retry_returned_bytes = 0;
 }
 
 static bool retry_matches(ur_context_handle_t context, ur_device_handle_t device,
@@ -417,6 +461,7 @@ static void arm_retry(ur_context_handle_t context, ur_device_handle_t device,
     t_retry_size = size;
     t_retry_reason = reason;
     t_retry_generation = generation;
+    t_retry_returned_bytes = 0;
 }
 
 static bool is_oom(ur_result_t result) {
@@ -512,8 +557,12 @@ static ur_result_t aimdo_urUSMDeviceAlloc_body(
          * allocation through. */
         int reason = t_retry_reason;
         int64_t eviction = deficit > 0 ? deficit : 0;
+        LONG64 returned = t_retry_returned_bytes;
 
         clear_retry();
+        /* Believe what the refusal actually produced, not what was estimated
+         * before it. This is the half of the signal the hook can observe. */
+        torch_cached_bytes_consume(aimdo_device, returned);
         if (reason == kRetryRuntimeOom && eviction < (int64_t)size) {
             eviction = (int64_t)size;
         }
@@ -530,13 +579,19 @@ static ur_result_t aimdo_urUSMDeviceAlloc_body(
 
     clear_retry();
     if (deficit > 0) {
-        if (torch_native_request) {
+        if (torch_native_request && torch_cached_bytes(aimdo_device) > 0) {
             /* Fail the request instead of evicting immediately. PyTorch
              * responds by releasing its cached blocks, which no hook below
              * this one can see because they never reach the driver, and then
              * retries the identical request. That converts Torch's own cache
              * into the first source of reclaim and keeps AIMDO's VBAR pages
-             * as the second. */
+             * as the second, which is the right order: rebuilding the cache
+             * costs a driver allocation, while refaulting a VBAR page costs a
+             * host-to-device stream of the weight.
+             *
+             * Only worth doing when PyTorch actually has a cache to give up.
+             * Refusing a request it cannot answer costs a full cache flush and
+             * a retry for nothing. */
             arm_retry(context, device, pool, size, kRetryBudgetDeficit,
                       generation);
             if (pointer) {
@@ -546,8 +601,11 @@ static ur_result_t aimdo_urUSMDeviceAlloc_body(
             LeaveCriticalSection(&g_hook_lock);
             return UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
         }
-        /* Not a PyTorch segment request, so there is no cache to ask for and
-         * no retry to expect. Evict directly; this never waits on Windows. */
+        if (torch_native_request) {
+            stat_add(kCacheLeverSkippedCalls, 1);
+        }
+        /* Either not a PyTorch segment request, or PyTorch has no cache to
+         * surrender. Evict directly; this never waits on Windows. */
         if (!aimdo_xpu_evict_for_allocation(aimdo_device, deficit)) {
             if (pointer) {
                 *pointer = NULL;
@@ -626,6 +684,7 @@ static ur_result_t __cdecl aimdo_urUSMFree(ur_context_handle_t context,
         t_retry_generation == InterlockedCompareExchange64(&g_generation, 0, 0)) {
         /* Released while a synthetic failure is outstanding, so this is
          * PyTorch returning its cache in response to it. */
+        t_retry_returned_bytes += (LONG64)size;
         stat_add(kNativeReclaimFreeCalls, 1);
         stat_add(kNativeReclaimFreeBytes, (LONG64)size);
     }
@@ -659,6 +718,15 @@ static ur_result_t __cdecl aimdo_urPhysicalMemCreate(
  *
  * Note that GetModuleHandleA cannot find the proxy itself in a live PyTorch
  * process even though it is loaded, hence the module walk. */
+static bool ur_hook_disabled_by_request(void) {
+    char value[8];
+    DWORD length =
+        GetEnvironmentVariableA("AIMDO_XPU_DISABLE_UR_HOOK", value,
+                                (DWORD)sizeof(value));
+
+    return length > 0 && length < sizeof(value) && value[0] == '1';
+}
+
 static HMODULE resolve_ur_loader(void) {
     HMODULE proxy = find_module_by_name(L"ur_win_proxy_loader.dll");
     HMODULE by_name = GetModuleHandleA("ur_loader.dll");
@@ -712,6 +780,13 @@ bool aimdo_xpu_ur_hook_install(void) {
 
     if (InterlockedCompareExchange(&g_attached, 0, 0)) {
         return true;
+    }
+    /* Checked here rather than only at the ze-detour call site: control.py
+     * also reaches this through xpu_ur_hook_is_interposed(), so testing the
+     * flag in one place only left the detours attached and both control loops
+     * arbitrating the same pressure. */
+    if (ur_hook_disabled_by_request()) {
+        return false;
     }
     if (!InterlockedCompareExchange(&g_lock_ready, 0, 0)) {
         InitializeCriticalSection(&g_hook_lock);
@@ -862,6 +937,21 @@ __declspec(dllexport) bool xpu_ur_hook_disable(void) {
                   (long long)live);
     }
     return true;
+}
+
+/* Publish PyTorch's freed-but-cached bytes for a device.
+ *
+ * comfy_aimdo calls this from Python, where torch.xpu.memory_stats() is
+ * available. The hook cannot derive it: a cached block never reaches the
+ * driver, so the growth of the cache is invisible from here. Without this the
+ * hook could only ever learn that the cache is empty, and would latch its one
+ * reclaim mechanism off for the rest of the process. */
+__declspec(dllexport) void xpu_ur_hook_set_torch_cached_bytes(
+    int device, uint64_t bytes) {
+    if (device < 0 || device >= MAX_TRACKED_DEVICES) {
+        return;
+    }
+    InterlockedExchange64(&g_torch_cached_bytes[device], (LONG64)bytes);
 }
 
 __declspec(dllexport) bool xpu_ur_hook_get_stats(uint64_t *values,

@@ -1,16 +1,21 @@
 # Windows XPU Unified Runtime allocator hook
 
-Status: **implemented, component-verified, and blocked by a performance
-regression** on branch `dev/windows-xpu-native-allocator-hook`, which is based
-on the Linux `dev/xpu-native-allocator-hook` work with the Windows platform
-series replayed on top. The interception mechanism, the PyTorch retry contract
-and the production control loop are each verified on the recorded Windows
-environment. The gradient ladder is **suspended**: step 1 completes 47 % slower
-than the recorded baseline and step 2 regressed and was stopped. The cause is
-now measured rather than suspected - the synthetic out-of-memory design doubles
-the number of real driver allocations, because PyTorch discards its entire
-cache in response to each refusal; see section 10. This branch is not a
-candidate for delivery in its current state. Per the maintenance rule in
+Status: **implemented and component-verified; not validated end to end.** The
+branch is `dev/windows-xpu-native-allocator-hook`, based on the Linux
+`dev/xpu-native-allocator-hook` work with the Windows platform series replayed
+on top. The interception mechanism, the PyTorch retry contract and the
+production control loop are each verified on the recorded Windows environment.
+
+Two things block acceptance, and neither is a property of this design:
+
+* Wall-clock measurement on this machine is not usable. See section 10: the
+  same build spans 167-282 s on the same workload, and a background driver
+  component holds 40-47 % of the first GPU's 3D engine.
+* The second GPU cannot run the workload at all with DynamicVRAM enabled, for
+  reasons unrelated to allocation arbitration. See
+  [the second-GPU copy failure](WINDOWS_XPU_SECOND_GPU_COPY_FAILURE.md).
+
+Per the maintenance rule in
 [the liveness analysis](WINDOWS_XPU_VBAR_LIVENESS_ANALYSIS.md), that document's
 unresolved 720p/10s failure is *not* erased by anything recorded here.
 
@@ -402,103 +407,59 @@ legitimately retains across `empty_cache()`. The result was that
 `control.deinit()` raised in any process that had ever allocated. Windows now
 drops the tracking table and reports the count instead.
 
-## 10. Performance regression across the gradient ladder
+## 10. Performance measurements are invalid on this environment
 
-Recorded as an open defect that blocks delivery, not explained.
+An earlier revision of this section attributed a gradient-ladder regression to
+the synthetic OOM and to the caller classification, on the strength of single
+wall-clock runs. **Those attributions are withdrawn.** Repeating the identical
+configuration on the identical build produced:
 
-Gate C2 step 1 (`--width 864 --height 480 --frames 124 --steps 20 --runs 1`)
-passed and produced a valid 124 frame video, but it is materially slower than
-the recorded baseline for the same configuration. Step 2
-(`--width 1280 --height 736 --frames 124 --steps 20 --runs 1`) showed the same
-regression on observation and was stopped before completion, so it has no
-recorded time.
+```text
+167.5  181.0  188.1  239.4  243.0  247.3  248.1  254.1  259.5  271.5  277.8  281.6
+```
 
-| Build | Gate C2 step 1 | Gate C2 step 2 | Source |
-| --- | ---: | ---: | --- |
-| `1e14a29`, Level Zero arbitration | 169 s | 706 s | liveness analysis, "Why the earlier gradient steps passed" |
-| `0.4.15.dev1`, UR arbitration | 264 s | stopped, regressed | `build/ur-integration/ladder1.log` |
-| `0.4.15.dev2`, classification fixed | 248 s | not re-run | `build/ur-integration/ladder1-dev2.log` |
+The spread is 114 s on a run that takes about four minutes, and it is bimodal
+rather than noisy, with nothing between 190 s and 240 s. Every figure used for
+the original attribution falls inside that spread, so none of the comparisons
+were valid.
 
-Step 1 remains roughly +47 % on a configuration that does not even reach the
-pressure point. Both runs used `--reserve-vram 4` on the same device, driver and
-model, so the configuration matches; the whole stack differs by more than one
-change, however, so the comparison bounds the regression rather than
-attributing it.
+Two environment facts were then measured and explain why this machine cannot
+resolve an allocator change by wall clock:
 
-The ladder was abandoned at step 2. Continuing it would only produce more
-slow passes, and a slow pass at step 3 could not be distinguished from the
-stall this branch is supposed to address.
+* A background driver component holds **40-47 % of the 3D engine** on the first
+  GPU continuously, including while idle. What was read as "the workload only
+  reaches 42 % GPU utilisation" was largely that component.
+* Pinning the server to the 8 performance cores and raising its priority does
+  not converge the spread (247.6 / 169.1 / 249.4, cv 20.7 %). The efficiency
+  classes were read from `GetSystemCpuSetInformation`; an earlier reading based
+  on an idle frequency snapshot had them backwards.
 
-Two candidate causes were recorded, and both have now been measured.
+`tests/run_windows_h3_acceptance.py` also returns in about 4 s when ComfyUI
+serves a cached execution, which silently produces invalid samples unless the
+seed is varied.
 
-### Candidate 2, the caller classification: real but minor, and fixed
+### What was measured directly, and is therefore still valid
 
-`is_torch_native_segment_request()` originally resolved and formatted a module
-path with `GetModuleHandleExW` and `GetModuleFileNameW` for every stack frame,
-up to 48 of them, and it runs whenever the deficit is positive - the hot path
-under pressure. `c10_xpu.dll` occupies one contiguous image range that cannot
-move while loaded, so the range is now resolved once and each frame is two
-integer comparisons.
+Sampling AIMDO's own counters from inside the server over a complete 294 s
+prompt, rather than differencing wall-clock times:
 
-`tests/ur_usm_detour_unit.c` measures both forms. Stack depth is what matters,
-and the first attempt at this benchmark was wrong: at a shallow depth the
-per-frame form barely calls `GetModuleFileNameW` at all and looked only 1.6x
-worse. The PyTorch allocation stack measured by the probe is 42 frames deep.
-
-| Stack depth | per-frame module path | image range | ratio |
-| ---: | ---: | ---: | ---: |
-| 4 | 521 ns | 277 ns | 1.9x |
-| 38 | 2636 ns | 834 ns | 3.2x |
-
-End to end this recovered 16 s of a 95 s regression:
-
-| Build | Gate C2 step 1 |
+| Counter | Value over one prompt |
 | --- | ---: |
-| baseline `1e14a29` | 169 s |
-| `0.4.15.dev1`, per-frame classification | 264 s |
-| `0.4.15.dev2`, image-range classification | 248 s |
+| time inside the allocation hook | 973 ms, **0.331 %** of wall time |
+| hook calls | 50 |
+| synthetic OOM | 0 |
+| retry evictions | 0 |
+| host-to-device bytes | 37,143 MiB for a 19,995 MiB model, **1.86x** |
+| map / unmap | 39,040 / 13,568 MiB |
 
-So the classification was a genuine cost and is now three times cheaper, but it
-was never the main one. It accounts for about a sixth of the regression.
+The hook cannot account for a per-iteration difference of seconds. The traffic
+that can is the weight streaming, which moves 1.86 times the model size per
+prompt.
 
-### Candidate 1, the synthetic OOM: confirmed as the dominant cost
-
-`tests/benchmark_windows_ur_hook.py` runs the same sampler-like allocation
-cycle twice, once with headroom and once with a budget short enough that every
-PyTorch request is refused. Sizes are shifted each round on purpose, because a
-fixed size is served entirely from PyTorch's cache after the first round and
-measures nothing.
-
-| Budget | wall time | driver allocations | synthetic OOM | cache returned |
-| --- | ---: | ---: | ---: | ---: |
-| relaxed | 0.079 s | 28 | 0 | - |
-| short | 0.083 s | 54 | 24 | 6 frees, 204 MiB |
-
-The decisive number is the middle column. Refusing requests **doubled the
-number of real driver allocations**, 28 to 54, because each synthetic failure
-makes PyTorch discard its entire cache and re-allocate from the driver
-afterwards. The hook's own time barely moved: of the 4 ms difference, 2 ms was
-inside the hook, and classification contributed nothing measurable.
-
-That is the shape of the regression. The hook is not slow; its decisions are
-expensive, because `release_cached_blocks()` has no notion of releasing only
-the shortfall. A 256 MiB device allocation costs roughly 14 ms on this platform,
-so doubling the count of them across a real workload is easily tens of seconds.
-
-The microbenchmark shows only a 1.05x slowdown because its working set is small
-and cheap to rebuild. It is included for the allocation count, not the timing.
-
-### What this means for the design
-
-The synthetic OOM is not free and cannot be applied to every over-budget
-request. It buys reclaim of PyTorch's cache at the price of discarding all of
-it, so it is worth doing only when the deficit is large enough to justify a
-full rebuild of the cache. A threshold, hysteresis, or a policy that prefers
-evicting VBAR pages until the deficit exceeds some fraction of the cache are
-all plausible; none has been tried.
-
-Until that exists, this branch trades throughput for residency control on every
-allocation, which is why the ladder is suspended.
+The classification change in this branch is still justified on its own
+measurement - 2665 ns to 814 ns at the 38-frame stack depth a real PyTorch
+allocation has, from `tests/ur_usm_detour_unit.c` - but its end-to-end effect
+was never established and should not be claimed.
 
 ## 11. Remaining plan
 
@@ -509,36 +470,39 @@ mechanisms cover opposite directions and both are required: the synthetic OOM
 when PyTorch allocates, the fault-boundary trim when AIMDO faults. What remains
 is to check they do not oscillate against each other under sustained pressure.
 
-Phase C - **done.** The two candidates are separated and measured in
-section 10. Classification is fixed and accounts for a sixth of the regression;
-the rest belongs to the synthetic OOM doubling the number of driver
-allocations.
+Phase C - **obtain a measurable environment.** This is now the first blocker,
+not the last. Either quiesce the background component holding 40-47 % of the
+first GPU, or fix the second-GPU copy failure so a clean adapter can be used.
+Until then no wall-clock comparison on this machine means anything; use the
+in-process counters instead.
 
-Phase D - bound the cost of the synthetic OOM. It must not be applied to every
-over-budget request, because PyTorch discards its whole cache in response.
-Options not yet tried: a deficit threshold below which AIMDO evicts VBAR pages
-instead, hysteresis so the same allocation site is not refused repeatedly, or a
-budget for how often the cache may be flushed.
+Phase D - the synthetic OOM already skips requests PyTorch cannot answer, which
+removed 71 of 71 wasted refusals in the VBAR pressure reproducer and cut the
+extra driver allocations in the allocation benchmark from 1.93x to 1.25x. What
+is still unmeasured is its cost when the cache *is* present, because that
+requires Phase C.
 
 Phase E - investigate whether the fault path needs its own way to demand memory
 from PyTorch, since the trim is rate limited and best effort. The measured
 32 MiB against 30 GiB of cache suggests the current trim is far too weak at
 that boundary.
 
-Phase F - the gradient ladder, in full. Step 1 passes but is 47 % slower than
-baseline, step 2 regressed and was stopped, and the ladder stays suspended
-until Phase D lands. Only step 3 or above may be reported as a fix.
+Phase F - the gradient ladder, in full, once Phase C makes its timings
+interpretable. Only step 3 or above may be reported as a fix.
 
 ## 12. What this does not establish
 
-1. **Gate C2 is incomplete and step 1 remains 47 % slower than baseline**
-   (section 10). The 720p/10s livelock recorded in the liveness analysis is an
-   admission and watermark policy problem, and section 9 shows the map/unmap
-   thrash is still present on this branch. Presenting any of this as a fix for
-   that failure would be the third occurrence of the method failure that
-   document records - and section 9 is itself a fourth occurrence caught early,
-   because this document did claim the cache trim was subsumed before it was
-   measured.
+1. **No interpretable end-to-end timing exists on this machine** (section 10),
+   and the second GPU cannot run the workload at all with DynamicVRAM enabled
+   ([second-GPU copy failure](WINDOWS_XPU_SECOND_GPU_COPY_FAILURE.md)). The
+   720p/10s livelock in the liveness analysis is an admission and watermark
+   policy problem, and section 9 shows the map/unmap thrash is still present.
+   Presenting any of this as a fix for that failure would be the third
+   occurrence of the method failure that document records - and section 9 is
+   itself a fourth occurrence caught early, because this document did claim the
+   cache trim was subsumed before it was measured, while section 10 is a fifth,
+   caught only after single-run timings had already been written down as
+   attributions.
 2. `native_reclaim_free_calls` has never been observed nonzero outside the
    standalone probe. The mechanism is proven to exist; its usefulness in a real
    allocation pattern is not.
@@ -555,7 +519,7 @@ until Phase D lands. Only step 3 or above may be reported as a fix.
    `aimdo_xpu_evict_for_allocation()` is guarded so Linux keeps `vbars_free()`,
    but that has not been verified by a Linux build.
 
-## 12. Reproducing
+## 13. Reproducing
 
 ```powershell
 scripts\build-windows-xpu.cmd
