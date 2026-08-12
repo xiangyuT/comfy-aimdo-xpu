@@ -1,13 +1,14 @@
 # Windows XPU Unified Runtime allocator hook
 
-Status: **implemented, component-verified, and carrying an unexplained
-performance regression** on branch `dev/windows-xpu-native-allocator-hook`,
-which is based on the Linux `dev/xpu-native-allocator-hook` work with the
-Windows platform series replayed on top. The interception mechanism, the
-PyTorch retry contract, and the production control loop are each verified on
-the recorded Windows environment, and Gate C2 step 1 completes. It completes
-**56 % slower than the recorded baseline**, which is not explained; see
-section 10. Per the maintenance rule in
+Status: **implemented, component-verified, and blocked by a performance
+regression** on branch `dev/windows-xpu-native-allocator-hook`, which is based
+on the Linux `dev/xpu-native-allocator-hook` work with the Windows platform
+series replayed on top. The interception mechanism, the PyTorch retry contract
+and the production control loop are each verified on the recorded Windows
+environment. The gradient ladder is **suspended**: step 1 completes 56 % slower
+than the recorded baseline and step 2 regressed and was stopped, for reasons
+that are not yet explained; see section 10. This branch is not a candidate for
+delivery in its current state. Per the maintenance rule in
 [the liveness analysis](WINDOWS_XPU_VBAR_LIVENESS_ANALYSIS.md), that document's
 unresolved 720p/10s failure is *not* erased by anything recorded here.
 
@@ -399,23 +400,31 @@ legitimately retains across `empty_cache()`. The result was that
 `control.deinit()` raised in any process that had ever allocated. Windows now
 drops the tracking table and reports the count instead.
 
-## 10. Performance regression at gradient step 1
+## 10. Performance regression across the gradient ladder
 
-Recorded as an open defect, not explained.
+Recorded as an open defect that blocks delivery, not explained.
 
 Gate C2 step 1 (`--width 864 --height 480 --frames 124 --steps 20 --runs 1`)
 passed and produced a valid 124 frame video, but it is materially slower than
-the recorded baseline for the same configuration:
+the recorded baseline for the same configuration. Step 2
+(`--width 1280 --height 736 --frames 124 --steps 20 --runs 1`) showed the same
+regression on observation and was stopped before completion, so it has no
+recorded time.
 
-| Build | Gate C2 step 1 | Source |
-| --- | ---: | --- |
-| `1e14a29`, Level Zero arbitration | 169 s | liveness analysis, "Why the earlier gradient steps passed" |
-| this branch, UR arbitration, `0.4.15.dev1` | 264 s | `build/ur-integration/ladder1.log` |
+| Build | Gate C2 step 1 | Gate C2 step 2 | Source |
+| --- | ---: | ---: | --- |
+| `1e14a29`, Level Zero arbitration | 169 s | 706 s | liveness analysis, "Why the earlier gradient steps passed" |
+| this branch, UR arbitration, `0.4.15.dev1` | 264 s | stopped, regressed | `build/ur-integration/ladder1.log` |
 
-That is roughly +56 % on a step that does not even reach the pressure point.
-Both runs used `--reserve-vram 4` on the same device, driver and model, so the
-configuration matches; the whole stack differs by more than one change,
-however, so the comparison bounds the regression rather than attributing it.
+Step 1 is roughly +56 % on a configuration that does not even reach the
+pressure point. Both runs used `--reserve-vram 4` on the same device, driver and
+model, so the configuration matches; the whole stack differs by more than one
+change, however, so the comparison bounds the regression rather than
+attributing it.
+
+The ladder was abandoned at step 2. Continuing it would only produce more
+slow passes, and a slow pass at step 3 could not be distinguished from the
+stall this branch is supposed to address.
 
 Two candidate causes, neither yet confirmed:
 
@@ -466,8 +475,8 @@ from PyTorch, since the trim is rate limited and best effort. The measured
 that boundary.
 
 Phase E - the gradient ladder, in full. Step 1 passes but is 56 % slower than
-baseline; step 2 onwards is not yet recorded. Only step 3 or above may be
-reported as a fix, and only if the regression in section 10 is resolved.
+baseline, step 2 regressed and was stopped, and the ladder is suspended until
+Phase C explains the regression. Only step 3 or above may be reported as a fix.
 
 ## 12. What this does not establish
 
