@@ -91,6 +91,9 @@ if errorlevel 1 exit /b 1
 cl.exe %COMMON_FLAGS% /I"%LEVEL_ZERO_INCLUDE%" /I"%DETOURS_INCLUDE%" ^
     "%ROOT_DIR%\src-xpu\ze-detour.c" /Fo"%BUILD_DIR%\xpu-ze-detour.obj"
 if errorlevel 1 exit /b 1
+cl.exe %COMMON_FLAGS% /I"%DETOURS_INCLUDE%" ^
+    "%ROOT_DIR%\src-xpu\ur-usm-detour.c" /Fo"%BUILD_DIR%\xpu-ur-usm-detour.obj"
+if errorlevel 1 exit /b 1
 cl.exe %COMMON_FLAGS% /EHsc /I"%LEVEL_ZERO_INCLUDE%" ^
     "%ROOT_DIR%\src-xpu\ze-tracer.cpp" /Fo"%BUILD_DIR%\xpu-ze-tracer.obj"
 if errorlevel 1 exit /b 1
@@ -117,6 +120,7 @@ icx-cl.exe /nologo -fsycl /LD /Fe:"%OUTPUT_PATH%" ^
     "%BUILD_DIR%\win-shmem-detect.obj" ^
     "%BUILD_DIR%\xpu-stubs.obj" ^
     "%BUILD_DIR%\xpu-ze-detour.obj" ^
+    "%BUILD_DIR%\xpu-ur-usm-detour.obj" ^
     "%BUILD_DIR%\xpu-ze-tracer.obj" ^
     "%BUILD_DIR%\xpu-dispatch.obj" ^
     /link /LIBPATH:"%BUILD_DIR%" /LIBPATH:"%DETOURS_LIB_DIR%" ^

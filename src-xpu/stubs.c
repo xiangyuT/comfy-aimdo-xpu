@@ -96,7 +96,17 @@ bool aimdo_xpu_evict_for_allocation(int device, int64_t deficit) {
         return false;
     }
     if (deficit > 0) {
+#if defined(_WIN32) || defined(_WIN64)
+        /* Called from the Unified Runtime allocation hook. Nothing on this
+         * path may wait on the compute queue: that queue can be blocked behind
+         * work which itself needs the residency being requested.
+         * vbars_free_retired() releases only pages that are provably idle and
+         * returns immediately otherwise. Linux keeps the exact reclaim because
+         * its allocator-time arbitration must satisfy the request. */
+        vbars_free_retired((ssize_t)deficit);
+#else
         vbars_free((ssize_t)deficit);
+#endif
     }
     return true;
 }

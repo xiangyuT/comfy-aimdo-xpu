@@ -52,6 +52,8 @@ extern bool aimdo_xpu_native_accounting_init(void);
 extern void aimdo_xpu_native_accounting_cleanup(void);
 extern bool aimdo_xpu_tracer_install(void);
 extern void aimdo_xpu_tracer_remove(void);
+extern bool aimdo_xpu_ur_hook_install(void);
+extern void aimdo_xpu_ur_hook_remove(void);
 
 typedef ze_result_t (ZE_APICALL *PFN_zeMemAllocDevice)(
     ze_context_handle_t, const ze_device_mem_alloc_desc_t *, size_t, size_t,
@@ -66,6 +68,7 @@ static PFN_zeMemFreeExt true_zeMemFreeExt;
 
 static bool g_hooks_installed;
 static bool g_tracer_owns_hooks;
+static bool g_ur_hook_owns_arbitration;
 
 static bool env_flag_enabled(const char *name) {
     char value[8];
@@ -90,6 +93,19 @@ static ze_result_t ZE_APICALL aimdo_zeMemAllocDevice(
         /* Not a device AIMDO manages: stay completely out of the way. */
         return true_zeMemAllocDevice(context, descriptor, size, alignment,
                                      device_handle, pointer);
+    }
+
+    if (g_ur_hook_owns_arbitration) {
+        /* The Unified Runtime hook already applied the AIMDO budget to this
+         * request one layer above, before the driver was entered. Running a
+         * second control loop here would sample and reclaim against pressure
+         * that has just been arbitrated, so this path only accounts. */
+        result = true_zeMemAllocDevice(context, descriptor, size, alignment,
+                                       device_handle, pointer);
+        if (result == ZE_RESULT_SUCCESS && pointer && *pointer) {
+            aimdo_xpu_note_native_allocation(*pointer, size, device);
+        }
+        return result;
     }
 
     /* Sampling pressure before the allocation is read-only and safe. Reclaim
@@ -274,9 +290,25 @@ bool aimdo_setup_hooks(void) {
         return false;
     }
 
+    /* Preferred arbitration point. It sits above the Level Zero driver, so it
+     * can decide before the allocation is placed without re-entering Level
+     * Zero memory management from inside its own allocation call. Failing to
+     * attach is not fatal: the Level Zero detour above remains as the
+     * post-allocation fallback. */
+    if (!env_flag_enabled("AIMDO_XPU_DISABLE_UR_HOOK")) {
+        g_ur_hook_owns_arbitration = aimdo_xpu_ur_hook_install();
+    }
+    if (!g_ur_hook_owns_arbitration) {
+        aimdo_log(kAimdoDetourLogWarning, __FILE__, __LINE__,
+                  "%s: Unified Runtime arbitration unavailable; falling back to "
+                  "post-allocation Level Zero reclaim\n", __func__);
+    }
+
     aimdo_log(kAimdoDetourLogInfo, __FILE__, __LINE__,
-              "%s: native Torch XPU allocator retained; arbitrating Level Zero "
-              "physical allocations through detours\n", __func__);
+              "%s: native Torch XPU allocator retained; arbitrating %s\n",
+              __func__,
+              g_ur_hook_owns_arbitration ? "Unified Runtime USM allocations"
+                                         : "Level Zero physical allocations");
     g_hooks_installed = true;
     return true;
 }
@@ -294,6 +326,10 @@ void aimdo_teardown_hooks(void) {
     if (true_zeMemAllocDevice) {
         remove_detours();
         aimdo_xpu_native_accounting_cleanup();
+    }
+    if (g_ur_hook_owns_arbitration) {
+        aimdo_xpu_ur_hook_remove();
+        g_ur_hook_owns_arbitration = false;
     }
     g_hooks_installed = false;
 }
