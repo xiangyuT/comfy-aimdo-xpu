@@ -22,7 +22,13 @@ if not exist "%ONEAPI_ROOT%\setvars.bat" (
     exit /b 1
 )
 call "%ONEAPI_ROOT%\setvars.bat" --force
-if errorlevel 1 exit /b 1
+where icx-cl >nul 2>&1
+if errorlevel 1 (
+    rem Some oneAPI installations fail to run their component vars.bat files
+    rem from setvars.bat, which leaves the compiler off PATH entirely.
+    call "%~dp0setup-oneapi-env.cmd"
+    if errorlevel 1 exit /b 1
+)
 
 if not defined WINDOWS_SDK_NUGET set "WINDOWS_SDK_NUGET=%ROOT_DIR%\build\windows-sdk-nuget"
 if not defined WINDOWS_SDK_VERSION set "WINDOWS_SDK_VERSION=10.0.26100.0"
@@ -39,6 +45,15 @@ if not defined LEVEL_ZERO_INCLUDE set "LEVEL_ZERO_INCLUDE=%ROOT_DIR%\build\level
 if not exist "%LEVEL_ZERO_INCLUDE%\ze_api.h" if not exist "%LEVEL_ZERO_INCLUDE%\level_zero\ze_api.h" (
     echo Level Zero headers were not found below LEVEL_ZERO_INCLUDE. 1>&2
     echo Clone https://github.com/oneapi-src/level-zero into build\level-zero-src or set LEVEL_ZERO_INCLUDE. 1>&2
+    exit /b 1
+)
+
+if not defined DETOURS_ROOT set "DETOURS_ROOT=%ROOT_DIR%\build\detours-src"
+if not defined DETOURS_INCLUDE set "DETOURS_INCLUDE=%DETOURS_ROOT%\include"
+if not defined DETOURS_LIB_DIR set "DETOURS_LIB_DIR=%DETOURS_ROOT%\lib.X64"
+if not exist "%DETOURS_LIB_DIR%\detours.lib" (
+    echo Detours was not found at %DETOURS_LIB_DIR%\detours.lib 1>&2
+    echo Run scripts\build-windows-detours.cmd, or set DETOURS_LIB_DIR. 1>&2
     exit /b 1
 )
 
@@ -73,6 +88,9 @@ for %%S in (hostbuf-plat.c model-mmap.c thread-plat.c xfer-file-plat.c shmem-det
 
 cl.exe %COMMON_FLAGS% "%ROOT_DIR%\src-xpu\stubs.c" /Fo"%BUILD_DIR%\xpu-stubs.obj"
 if errorlevel 1 exit /b 1
+cl.exe %COMMON_FLAGS% /I"%LEVEL_ZERO_INCLUDE%" /I"%DETOURS_INCLUDE%" ^
+    "%ROOT_DIR%\src-xpu\ze-detour.c" /Fo"%BUILD_DIR%\xpu-ze-detour.obj"
+if errorlevel 1 exit /b 1
 cl.exe %COMMON_FLAGS% /EHsc /I"%LEVEL_ZERO_INCLUDE%" ^
     "%ROOT_DIR%\src-xpu\ze-tracer.cpp" /Fo"%BUILD_DIR%\xpu-ze-tracer.obj"
 if errorlevel 1 exit /b 1
@@ -98,9 +116,11 @@ icx-cl.exe /nologo -fsycl /LD /Fe:"%OUTPUT_PATH%" ^
     "%BUILD_DIR%\win-xfer-file-plat.obj" ^
     "%BUILD_DIR%\win-shmem-detect.obj" ^
     "%BUILD_DIR%\xpu-stubs.obj" ^
+    "%BUILD_DIR%\xpu-ze-detour.obj" ^
     "%BUILD_DIR%\xpu-ze-tracer.obj" ^
     "%BUILD_DIR%\xpu-dispatch.obj" ^
-    /link /LIBPATH:"%BUILD_DIR%" ze_loader.lib dxgi.lib dxguid.lib onecore.lib
+    /link /LIBPATH:"%BUILD_DIR%" /LIBPATH:"%DETOURS_LIB_DIR%" ^
+    ze_loader.lib detours.lib dxgi.lib dxguid.lib onecore.lib
 if errorlevel 1 exit /b 1
 
 echo built %OUTPUT_PATH%
