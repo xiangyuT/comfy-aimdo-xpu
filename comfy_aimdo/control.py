@@ -526,6 +526,7 @@ def get_xpu_vmm_stats():
         "event_sync_completions",
         "synchronous_host_to_device_calls",
         "synchronous_host_to_device_completions",
+        "host_to_device_split_retries",
         "torch_allocator_alloc_calls",
         "torch_allocator_free_calls",
         "torch_allocator_cache_hits",

@@ -28,6 +28,7 @@ extern "C" {
 extern "C" bool aimdo_xpu_prepare_allocation(int device, size_t size);
 extern "C" bool aimdo_xpu_retry_allocation(int device, size_t size);
 extern "C" bool aimdo_xpu_account_allocation(int device, int64_t delta);
+extern "C" int aimdo_vbar_describe_range(uint64_t address, uint64_t size, int *mapped, unsigned *pin, uint64_t *page_index, uint64_t *unmapped_page, uint64_t *pages_spanned);
 
 #if defined(_WIN32) || defined(_WIN64)
 #define AIMDO_XPU_EXPORT __declspec(dllexport)
@@ -72,6 +73,7 @@ enum XpuStat : size_t {
     kEventSyncCompletions,
     kSynchronousHostToDeviceCalls,
     kSynchronousHostToDeviceCompletions,
+    kHostToDeviceSplitRetries,
     kTorchAllocatorAllocCalls,
     kTorchAllocatorFreeCalls,
     kTorchAllocatorCacheHits,
@@ -108,6 +110,51 @@ std::unordered_map<int, uint64_t> g_torch_active_bytes;
 std::unordered_map<int, uint64_t> g_torch_reserved_bytes;
 std::unordered_map<int, uint64_t> g_torch_peak_active_bytes;
 std::unordered_map<int, uint64_t> g_torch_peak_reserved_bytes;
+
+// Retirement epochs.
+//
+// Torch's XPU queues are in-order, so a barrier submitted at reclaim time
+// waits for everything already queued.  That is precisely the whole-queue wait
+// that must never happen inside an allocation path.  A VBAR page is therefore
+// tagged with the current epoch when it is unpinned, which costs one atomic
+// read and submits nothing.  One bounded fence per completion interval then
+// publishes how far retirement has progressed, so reclaim only has to compare
+// two integers and never blocks.
+std::mutex g_retire_mutex;
+std::atomic<uint64_t> g_retire_epoch{1};
+std::atomic<uint64_t> g_retired_epoch{0};
+std::atomic<bool> g_retire_pending{false};
+
+// A single outstanding fence is too coarse. On an in-order queue a fence only
+// completes after everything submitted before it, so one submitted late is
+// pessimistic: pages whose real last use finished long ago stay unprovable
+// because the fence is stuck behind unrelated work queued since. A small ring
+// keeps several finer-grained fences in flight, which bounds how far the
+// published retirement can lag without submitting one barrier per unpin.
+constexpr size_t kRetireFenceSlots = 8;
+
+// Torch hands out 32 round-robin queues per device pool, and a VBAR page can
+// be consumed on any of them. A barrier submitted to one queue orders nothing
+// on the others, so proving retirement from a single queue can release a page
+// whose real consumer is still running - observed as
+// UR_RESULT_ERROR_DEVICE_LOST. Every queue AIMDO has seen is therefore
+// fenced, and an epoch only retires once all of them have passed it.
+constexpr size_t kMaxTrackedQueues = 64;
+
+sycl::queue *g_tracked_queues[kMaxTrackedQueues];
+size_t g_tracked_queue_count = 0;
+// Set if more distinct queues appear than can be tracked. Retirement then
+// stops advancing, because an untracked queue cannot be proven idle.
+std::atomic<bool> g_retire_tracking_overflow{false};
+
+struct RetireFence {
+    sycl::event event;
+    uint64_t epoch = 0;
+    bool valid = false;
+};
+
+// One fence ring per tracked queue.
+RetireFence g_retire_fences[kMaxTrackedQueues][kRetireFenceSlots];
 
 void increase_torch_bytes(std::unordered_map<int, uint64_t> &current,
                           std::unordered_map<int, uint64_t> &peak,
@@ -155,6 +202,7 @@ void trace_sync(const char *operation, const char *phase, uint64_t call,
 }
 
 extern "C" int aimdo_xpu_current_device(void);
+void aimdo_xpu_note_queue(sycl::queue *queue);
 
 XpuDeviceState *find_device(int id) {
     auto found = std::find_if(
@@ -177,6 +225,39 @@ int device_from_native_handle(uintptr_t native_handle) {
     return found == g_devices.end() ? -1 : found->id;
 }
 
+/* Register a queue AIMDO has seen so its work is covered by retirement fences.
+ * Called from resolve_queue(), so any queue that faults, copies into or
+ * consumes a VBAR page is tracked before that page can be reclaimed. */
+void aimdo_xpu_note_queue(sycl::queue *queue) {
+    if (!queue) {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(g_retire_mutex);
+    for (size_t index = 0; index < g_tracked_queue_count; ++index) {
+        if (g_tracked_queues[index] == queue) {
+            return;
+        }
+    }
+    if (g_tracked_queue_count >= kMaxTrackedQueues) {
+        // Cannot prove retirement on an untracked queue, so stop advancing
+        // retirement rather than release a page that may be in use. This is
+        // recoverable: aimdo_xpu_retire_reset() clears it, and the table is
+        // only ever this large if Torch really used that many queues.
+        if (!g_retire_tracking_overflow.exchange(true, std::memory_order_relaxed)) {
+            std::fprintf(stderr,
+                         "[AIMDO XPU] tracked queue table full (%zu); VBAR "
+                         "reclaim is disabled until reinitialization\n",
+                         kMaxTrackedQueues);
+            std::fflush(stderr);
+        }
+        return;
+    }
+    g_tracked_queues[g_tracked_queue_count++] = queue;
+    // A page tagged before this queue existed has no fence covering the work
+    // this queue may already hold, so ask for one immediately.
+    g_retire_pending.store(true, std::memory_order_relaxed);
+}
+
 sycl::queue *resolve_queue(CUstream stream) {
     if (stream) {
         auto *queue = reinterpret_cast<sycl::queue *>(stream);
@@ -189,9 +270,13 @@ sycl::queue *resolve_queue(CUstream stream) {
             state->queue = queue;
             g_stats[kQueueRebindCalls].fetch_add(1, std::memory_order_relaxed);
         }
+        aimdo_xpu_note_queue(queue);
         return queue;
     }
     auto *state = current_device();
+    if (state && state->queue) {
+        aimdo_xpu_note_queue(state->queue);
+    }
     return state ? state->queue : nullptr;
 }
 
@@ -245,7 +330,19 @@ CUresult xpu_context_synchronize() {
         g_stats[kContextSyncCalls].fetch_add(1, std::memory_order_relaxed) + 1;
     trace_sync("context", "begin", call, state->queue);
     try {
+        // Callers use this as "all device work has completed" before unmapping
+        // VBAR pages. Torch hands out many queues per device, so waiting only
+        // the current one can release a page still running elsewhere. Wait
+        // every queue AIMDO has seen.
         state->queue->wait_and_throw();
+        {
+            std::lock_guard<std::mutex> guard(g_retire_mutex);
+            for (size_t index = 0; index < g_tracked_queue_count; ++index) {
+                if (g_tracked_queues[index] != state->queue) {
+                    g_tracked_queues[index]->wait_and_throw();
+                }
+            }
+        }
         g_stats[kContextSyncCompletions].fetch_add(
             1, std::memory_order_relaxed);
         trace_sync("context", "end", call, state->queue);
@@ -398,6 +495,10 @@ CUresult xpu_host_alloc(void **pointer, size_t size) {
     if (!pointer) {
         return kCudaErrorUnknown;
     }
+    /* Reverted: backing this with sycl::malloc_host made the failure worse,
+     * turning a 64 MiB copy's OUT_OF_DEVICE_MEMORY into DEVICE_LOST and
+     * moving it 56 seconds earlier. Keep pageable staging until the copy
+     * failure itself is understood. */
     *pointer = std::malloc(size);
     return *pointer ? CUDA_SUCCESS : CUDA_ERROR_OUT_OF_MEMORY;
 }
@@ -555,12 +656,87 @@ CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
         return CUDA_SUCCESS;
     } catch (const sycl::exception &error) {
         const std::error_code code = error.code();
+        /* A large copy from pageable host memory makes the runtime stage the
+         * transfer itself, and that internal work is not covered by the WDDM
+         * budget: 64 MiB copies failed with OUT_OF_DEVICE_MEMORY while both
+         * DXGI and the driver still reported ~4 GiB free. Splitting the
+         * transfer shrinks the staging requirement, so retry once in smaller
+         * pieces before giving up. */
+        constexpr size_t kSplitChunk = 8ULL * 1024 * 1024;
+
+        if (size > kSplitChunk) {
+            try {
+                const auto *bytes = static_cast<const unsigned char *>(source);
+                for (size_t done = 0; done < size; done += kSplitChunk) {
+                    const size_t piece = std::min(kSplitChunk, size - done);
+                    queue->memcpy(
+                        reinterpret_cast<void *>(destination + done),
+                        bytes + done, piece).wait_and_throw();
+                }
+                g_stats[kHostToDeviceBytes].fetch_add(
+                    size, std::memory_order_relaxed);
+                g_stats[kSynchronousHostToDeviceCompletions].fetch_add(
+                    1, std::memory_order_relaxed);
+                g_stats[kHostToDeviceSplitRetries].fetch_add(
+                    1, std::memory_order_relaxed);
+                trace_sync("h2d", "end_split", call, queue, size);
+                return CUDA_SUCCESS;
+            } catch (...) {
+                // Fall through and report the original failure.
+            }
+        }
+        /* Report what the driver itself believes at the moment of failure.
+         * DXGI Budget said roughly 4 GiB was still available when a 64 MiB
+         * copy reported OUT_OF_DEVICE_MEMORY, so the two accountings disagree
+         * and only the driver's own view can settle it. The pointer type
+         * distinguishes a VBAR VMM mapping (not USM, reported as unknown)
+         * from a Torch USM device allocation. */
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        const char *destination_kind = "unavailable";
+        int vbar_hit = 0;
+        int vbar_mapped = 0;
+        unsigned vbar_pin = 0;
+        uint64_t vbar_page = 0;
+        uint64_t vbar_unmapped = 0;
+        uint64_t vbar_span = 0;
+
+        vbar_hit = aimdo_vbar_describe_range(
+            static_cast<uint64_t>(destination), size, &vbar_mapped, &vbar_pin,
+            &vbar_page, &vbar_unmapped, &vbar_span);
+        try {
+            const sycl::device device = queue->get_device();
+            if (device.has(sycl::aspect::ext_intel_free_memory)) {
+                free_bytes = static_cast<size_t>(
+                    device.get_info<
+                        sycl::ext::intel::info::device::free_memory>());
+            }
+            total_bytes =
+                device.get_info<sycl::info::device::global_mem_size>();
+            switch (sycl::get_pointer_type(
+                        reinterpret_cast<void *>(destination),
+                        queue->get_context())) {
+            case sycl::usm::alloc::device: destination_kind = "usm_device"; break;
+            case sycl::usm::alloc::host:   destination_kind = "usm_host"; break;
+            case sycl::usm::alloc::shared: destination_kind = "usm_shared"; break;
+            default:                       destination_kind = "not_usm_vmm"; break;
+            }
+        } catch (...) {
+        }
         std::fprintf(
             stderr,
             "[AIMDO XPU ERROR] op=h2d queue=%p destination=%p size=%zu "
-            "sycl_code=%d category=%s message=%s\n",
+            "sycl_code=%d category=%s driver_free=%zu driver_total=%zu "
+            "dest_kind=%s vbar=%d all_mapped=%d min_pin=%u first_page=%llu "
+            "span=%llu first_unmapped=%lld message=%s\n",
             static_cast<void *>(queue), reinterpret_cast<void *>(destination),
-            size, code.value(), code.category().name(), error.what());
+            size, code.value(), code.category().name(),
+            free_bytes, total_bytes, destination_kind, vbar_hit, vbar_mapped,
+            vbar_pin, static_cast<unsigned long long>(vbar_page),
+            static_cast<unsigned long long>(vbar_span),
+            vbar_unmapped == UINT64_MAX ? -1LL
+                                        : static_cast<long long>(vbar_unmapped),
+            error.what());
         std::fflush(stderr);
         trace_sync("h2d", "error", call, queue, size);
         return kCudaErrorUnknown;
@@ -947,6 +1123,151 @@ void aimdo_xpu_record_native_release(size_t size) {
         size, std::memory_order_relaxed);
 }
 
+/* Tag a page that has just stopped being used.  This must stay cheap: it is
+ * called once per weight per model pass and deliberately submits nothing.
+ *
+ * It also registers the caller's current queue. VBAR map/unmap go through the
+ * Level Zero virtual-memory calls, which carry no stream argument, so this is
+ * the only point where the queue that actually consumed the page is visible.
+ * ComfyUI can fault and consume weights on a non-default stream, and a fence
+ * on the default queue alone does not order that work. */
+uint64_t aimdo_xpu_retire_epoch_current(void) {
+    auto *state = current_device();
+    if (state && state->queue) {
+        aimdo_xpu_note_queue(state->queue);
+    }
+    g_retire_pending.store(true, std::memory_order_relaxed);
+    return g_retire_epoch.load(std::memory_order_relaxed);
+}
+
+/* Register the queue that consumed a VBAR page, named by the caller. */
+void aimdo_xpu_register_queue(void *queue) {
+    aimdo_xpu_note_queue(reinterpret_cast<sycl::queue *>(queue));
+}
+
+/* Publish how far retirement has progressed, without ever blocking.
+ *
+ * Publish how far retirement has progressed, without ever blocking.
+ *
+ * One fence per tracked queue is outstanding at a time, so a busy model pass
+ * costs one barrier per queue per completion interval rather than one per
+ * unpin.  A page whose epoch is at or below the returned value had its last
+ * use submitted before a fence that has already completed on every queue
+ * AIMDO has seen, so it can be unmapped immediately. */
+uint64_t aimdo_xpu_retired_epoch(void) {
+    std::lock_guard<std::mutex> guard(g_retire_mutex);
+    const uint64_t published = g_retired_epoch.load(std::memory_order_relaxed);
+    const bool wanted =
+        g_retire_pending.exchange(false, std::memory_order_relaxed);
+    // An epoch is retired only once every tracked queue has passed it, so the
+    // result is the minimum across queues. A queue with no completed fence
+    // holds the published value back, which is the safe direction.
+    uint64_t retired = UINT64_MAX;
+    bool missed_a_fence = false;
+    uint64_t fence_epoch = 0;
+
+    if (g_tracked_queue_count == 0 ||
+        g_retire_tracking_overflow.load(std::memory_order_relaxed)) {
+        return published;
+    }
+
+    if (wanted) {
+        // Close the current epoch *before* submitting any barrier. A page is
+        // tagged in unpin after its operator was submitted, so a barrier
+        // queued after the epoch is closed is guaranteed to sit behind the
+        // work of every page carrying that epoch.
+        //
+        // Incrementing afterwards, as this did, left a window where a page
+        // could be tagged with an epoch whose barrier had already been
+        // submitted. Its work was then queued behind that barrier, yet the
+        // barrier completing marked it retired, and reclaim unmapped a page
+        // that was still in flight: the H2D copy into it failed with
+        // result=999 and the device was lost shortly after.
+        fence_epoch = g_retire_epoch.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    for (size_t index = 0; index < g_tracked_queue_count; ++index) {
+        RetireFence *ring = g_retire_fences[index];
+        uint64_t queue_retired = published;
+        size_t free_slot = kRetireFenceSlots;
+
+        for (size_t slot = 0; slot < kRetireFenceSlots; ++slot) {
+            RetireFence &fence = ring[slot];
+            if (!fence.valid) {
+                if (free_slot == kRetireFenceSlots) {
+                    free_slot = slot;
+                }
+                continue;
+            }
+            if (event_is_complete(fence.event)) {
+                // Each queue is in order, so a completed fence also proves
+                // every earlier fence on that same queue completed.
+                if (fence.epoch > queue_retired) {
+                    queue_retired = fence.epoch;
+                }
+                fence.valid = false;
+                fence.event = sycl::event();
+                if (free_slot == kRetireFenceSlots) {
+                    free_slot = slot;
+                }
+            }
+        }
+
+        if (wanted) {
+            if (free_slot >= kRetireFenceSlots) {
+                // Ring full: this queue gets no fence for the current epoch,
+                // so the request must survive to the next poll. Dropping it
+                // would leave the last pages of a pass unprovable forever.
+                missed_a_fence = true;
+            } else {
+                try {
+                    ring[free_slot].epoch = fence_epoch;
+                    ring[free_slot].event =
+                        g_tracked_queues[index]->ext_oneapi_submit_barrier();
+                    ring[free_slot].valid = true;
+                } catch (...) {
+                    missed_a_fence = true;
+                }
+            }
+        }
+
+        if (queue_retired < retired) {
+            retired = queue_retired;
+        }
+    }
+
+    if (missed_a_fence) {
+        // A queue carries no barrier for the closed epoch, so ask again. The
+        // epoch itself stays closed: reusing it would reintroduce the window
+        // this ordering exists to remove.
+        g_retire_pending.store(true, std::memory_order_relaxed);
+    }
+    if (retired == UINT64_MAX) {
+        retired = published;
+    }
+    if (retired > published) {
+        g_retired_epoch.store(retired, std::memory_order_relaxed);
+    }
+    return retired;
+}
+
+/* Drop every outstanding fence. Called before the SYCL context is torn down so
+ * no event outlives the queue it was submitted to. */
+void aimdo_xpu_retire_reset(void) {
+    std::lock_guard<std::mutex> guard(g_retire_mutex);
+    for (size_t index = 0; index < kMaxTrackedQueues; ++index) {
+        for (size_t slot = 0; slot < kRetireFenceSlots; ++slot) {
+            g_retire_fences[index][slot].valid = false;
+            g_retire_fences[index][slot].event = sycl::event();
+            g_retire_fences[index][slot].epoch = 0;
+        }
+        g_tracked_queues[index] = nullptr;
+    }
+    g_tracked_queue_count = 0;
+    g_retire_tracking_overflow.store(false, std::memory_order_relaxed);
+    g_retire_pending.store(false, std::memory_order_relaxed);
+}
+
 AIMDO_XPU_EXPORT void *xpu_alloc_fn(
     size_t size, int device, sycl::queue *queue) {
     return allocate_torch_block(size, device, queue);
@@ -1104,6 +1425,7 @@ bool aimdo_cuda_runtime_init(void) {
 }
 
 void aimdo_cuda_runtime_cleanup(void) {
+    aimdo_xpu_retire_reset();
     std::memset(&g_cuda, 0, sizeof(g_cuda));
 }
 
