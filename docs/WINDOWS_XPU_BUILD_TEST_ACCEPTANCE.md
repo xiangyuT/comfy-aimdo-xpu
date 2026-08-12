@@ -12,7 +12,7 @@ does not imply that the formal acceptance workload passes.
 
 | Component | Revision or version used |
 | --- | --- |
-| `comfy-aimdo-xpu` runtime code | branch `dev/windows-xpu-usm-free-hang`, code commit `323c0e0` |
+| `comfy-aimdo-xpu` runtime code | branch `dev/windows-xpu-usm-free-hang`, code commit `323c0e0`, plus the uncommitted allocation-time interception described in the liveness analysis (installed as `0.4.14.dev3`) |
 | Analysis-only follow-up | `ce1120f` and later documentation commits; no runtime-code change |
 | `llm-scaler` / `ComfyUI-OmniXPU` source | branch `feature/omni-0.1.0b9-preview`, commit `9da0b75a9472bde58db2f9238b61619c76126690` |
 | ComfyUI | detached commit `b1693ecba9f5b65f8c80ab36b195ab963ec92413`, reports version `0.30.0` |
@@ -61,14 +61,62 @@ The native build is driven by `scripts/build-windows-xpu.cmd`. The script:
 3. activates Intel oneAPI;
 4. uses the NuGet Windows SDK stored below `build/windows-sdk-nuget`;
 5. uses Level Zero headers below `build/level-zero-src/include`;
-6. compiles C sources with `/O2 /MD /DAIMDO_XPU`;
-7. compiles the SYCL dispatcher with `icx-cl`, C++17, `/O2`, `/MD`, and
+6. uses Detours below `build/detours-src`;
+7. compiles C sources with `/O2 /MD /DAIMDO_XPU`;
+8. compiles the SYCL dispatcher with `icx-cl`, C++17, `/O2`, `/MD`, and
    `-fsycl`;
-8. links against `ze_loader`, `dxgi`, `dxguid`, and `onecore`.
+9. links against `ze_loader`, `detours`, `dxgi`, `dxguid`, and `onecore`.
 
 The resulting `aimdo_xpu.dll` imports at least `ze_loader.dll`, `sycl8.dll`,
 `libmmd.dll`, the MSVC runtime, DXGI, and Windows system APIs. The build does
 not bundle the Level Zero loader.
+
+### Two environment defects that must be worked around
+
+Both are properties of this recorded installation, not of the project. The
+scripts handle them so a build does not depend on repairing the machine.
+
+oneAPI's `setvars.bat` reports `'vars.bat' is not recognized` for every
+component and leaves `icx-cl` off PATH, so the SYCL step fails with
+`'icx-cl.exe' is not recognized`. `scripts/setup-oneapi-env.cmd` sets the
+compiler PATH/INCLUDE/LIB directly from the installation layout, and
+`build-windows-xpu.cmd` falls back to it automatically.
+
+The Visual Studio Build Tools installation contains no Windows SDK, so Detours'
+own `nmake` fails on `windows.h`. `scripts/build-windows-detours.cmd` applies
+the same NuGet SDK environment used for AIMDO and builds only `src`, because
+the sample tree additionally requires the .NET strong-name tool `sn`.
+
+### Provisioning Detours
+
+```powershell
+git clone --depth 1 https://github.com/microsoft/Detours.git build\detours-src
+cmd /d /c scripts\build-windows-detours.cmd
+```
+
+This produces `build\detours-src\lib.X64\detours.lib`. Set `DETOURS_LIB_DIR`
+and `DETOURS_INCLUDE` to use an existing installation instead.
+
+### Validating a locally built DLL
+
+The Portable interpreter is an embeddable build whose `._pth` file disables
+`PYTHONPATH`. Setting `PYTHONPATH` to the repository therefore does **not**
+load a local build; the installed wheel is used instead, silently. A test
+script must call `sys.path.insert()` itself, and a run whose conclusion depends
+on which build was loaded should print the resolved DLL first:
+
+```powershell
+<portable>\python_embeded\python.exe -s -c ^
+  "import comfy_aimdo.control as c, pathlib; print(pathlib.Path(c.__file__).parent)"
+```
+
+The alternative, used for the recorded result, is to install the wheel over the
+previous one:
+
+```powershell
+<portable>\python_embeded\python.exe -s -m pip install ^
+    --force-reinstall --no-deps build\wheel-detour-dev3\comfy_aimdo-*.whl
+```
 
 ### Reproducible build commands
 
@@ -122,7 +170,7 @@ capacity value. Use Torch device properties and WDDM/DXGI Budget instead.
 | Torch | `2.12.0+xpu` |
 | TorchVision | `0.27.0+xpu` |
 | TorchAudio | `2.11.0+xpu` |
-| `comfy-aimdo` | `0.4.14.dev1`, rebuilt from the source baseline above |
+| `comfy-aimdo` | `0.4.14.dev3`, rebuilt from the source baseline above and installed over `0.4.14.dev1` |
 | `comfy-kitchen` | `0.2.26`, XPU-managed installation |
 | `omni_xpu_kernel` | `0.1.0b9.dev1+torch212.bmg` |
 | `intel-sycl-rt` | `2025.3.2` |
@@ -216,10 +264,54 @@ not passed.
 
 Run `tests/repro_xpu_platform_memory_policy.py` with the Portable Python. This
 is a component check for the retained pressure policy, not proof of swap
-liveness. Any future residency implementation also needs a native test that
-performs real H2D, XPU consumption, retirement, eviction, refault, and data
-verification under competing Torch allocations. That complete reproducer is
-not present in the retained source baseline.
+liveness.
+
+Two further reproducers cover the Windows allocation path. They run in seconds
+and need no ComfyUI, workflow, or H3 model:
+
+```powershell
+<portable>\python_embeded\python.exe -s `
+    tests\repro_windows_xpu_malloc_pressure.py --mode budget --max-gib 40
+<portable>\python_embeded\python.exe -s `
+    tests\repro_windows_xpu_malloc_pressure.py --mode thrash --working-set-gib 36
+<portable>\python_embeded\python.exe -s `
+    tests\repro_windows_xpu_malloc_pressure.py --mode cache --working-set-gib 12
+<portable>\python_embeded\python.exe -s `
+    tests\repro_windows_xpu_vbar_vs_torch.py --vbar-gib 6 --torch-gib 30
+```
+
+The first characterises the platform: a Torch USM allocation spills instead of
+failing, an over-budget working set costs about nine times its bandwidth, and a
+freed-but-cached Torch block keeps holding WDDM local memory.
+
+The second is the regression gate for allocation-time arbitration. It must show
+VBAR residency falling *during* the Torch ramp while the watermark stays at its
+full value, with zero Torch allocation failures. A run where `unmap_calls`
+stays 0 for the whole ramp means the hook is not intercepting; check which DLL
+was loaded before drawing any other conclusion.
+
+Neither reproducer replaces Gate C or Gate D, and neither exercises repeated
+model activation, tiled VAE decode, or sustained multi-prompt residency. A
+native test that performs real H2D, XPU consumption, retirement, eviction,
+refault, and data verification under competing Torch allocations is still
+missing.
+
+**Component reproducers must not gate delivery on their own.** Three builds
+passed every reproducer here and then failed the real workload within four
+minutes, because none of these scripts exercise the file-streaming path that
+loads a missed weight. A memory-policy change is validated only by a workload
+that demonstrably reaches pressure, evidenced by a non-zero reclaim count and a
+peak local usage that approaches the configured target in the same log.
+
+The 2-step profile does not reach pressure on this hardware; the 20-step
+profile does. Use `--steps 20` when validating anything that touches pressure,
+reclaim, or residency:
+
+```powershell
+<portable>\python_embeded\python.exe -s `
+    tests\run_windows_h3_acceptance.py --server http://127.0.0.1:8189 `
+    --output-root <portable>\ComfyUI\output --runs 3 --steps 20
+```
 
 ### Gate C: development workload
 
@@ -228,6 +320,39 @@ sampler steps, and three sequential prompts with distinct seeds in one ComfyUI
 process. Do not restart ComfyUI or clear caches between runs.
 
 This gate is fast feedback only. It cannot replace the formal workload.
+
+### Gate C2: pressure gradient, mandatory before any root-cause claim
+
+Gate C at two sampler steps never reaches memory pressure, and neither do the
+smaller resolutions at twenty steps. A memory-policy change that is validated
+only there has not been validated at all. Three separate builds in this project
+were declared fixed on the strength of a passing component reproducer and a
+passing small prompt, and each then failed the real workload.
+
+Run the ladder in order, at `--steps 20`, one run per step, and stop at the
+first failure:
+
+| Step | Command arguments |
+| --- | --- |
+| 1 | `--width 864 --height 480 --frames 124 --steps 20 --runs 1` |
+| 2 | `--width 1280 --height 736 --frames 124 --steps 20 --runs 1` |
+| 3 | `--width 1280 --height 736 --frames 243 --steps 20 --runs 1` |
+| 4 | `--width 1280 --height 736 --frames 362 --steps 20 --runs 3` |
+
+Step 3 is the lowest configuration observed to reach real pressure on this
+device with this model, so it is the earliest point at which a result carries
+any weight. Steps 1 and 2 are regression guards; passing them proves only that
+nothing obvious broke.
+
+MiniMax H3 requires frame counts of the form 17k+5, which gives 124 frames for
+five seconds, 243 for ten, and 362 for fifteen. Other values are rejected.
+
+Two failure modes must both be treated as failures. An error is obvious. A
+stall is not: check that the sampler progress bar advances, and confirm that
+`host_to_device_bytes` grows while `map_bytes` and `unmap_bytes` do not grow at
+the same rate as each other. Equal map and unmap rates mean pages are being
+mapped and immediately released, which presents as a hang at step 0 with the
+process at full CPU.
 
 ### Gate D: formal workload
 
