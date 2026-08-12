@@ -33,6 +33,24 @@ bool aimdo_xpu_retry_allocation(int device, size_t size) {
     return true;
 }
 
+bool aimdo_xpu_allocation_deficit(int device, size_t size, int64_t *deficit) {
+    if (!deficit || !set_devctx_for_device(device)) {
+        return false;
+    }
+    *deficit = (int64_t)budget_deficit(size);
+    return true;
+}
+
+bool aimdo_xpu_evict_for_allocation(int device, int64_t deficit) {
+    if (!set_devctx_for_device(device)) {
+        return false;
+    }
+    if (deficit > 0) {
+        vbars_free((ssize_t)deficit);
+    }
+    return true;
+}
+
 bool aimdo_xpu_account_allocation(int device, int64_t delta) {
     if (!set_devctx_for_device(device)) {
         return false;

@@ -7,6 +7,16 @@ BUILD_DIR="$ROOT_DIR/build/xpu"
 OUTPUT_PATH="$ROOT_DIR/comfy_aimdo/aimdo_xpu.so"
 CC=${CC:-gcc}
 CXX=${CXX:-icpx}
+UR_INCLUDE_DIR=${UR_INCLUDE_DIR:-}
+
+if [ -z "$UR_INCLUDE_DIR" ]; then
+    CXX_PATH=$(command -v "$CXX")
+    UR_INCLUDE_DIR=$(CDPATH= cd -- "$(dirname -- "$CXX_PATH")/../include" && pwd)
+fi
+if [ ! -f "$UR_INCLUDE_DIR/ur_api.h" ]; then
+    echo "Unified Runtime headers were not found in $UR_INCLUDE_DIR" >&2
+    exit 1
+fi
 
 mkdir -p "$BUILD_DIR"
 
@@ -57,7 +67,13 @@ OBJECTS+=("$BUILD_DIR/xpu-stubs.o")
     "$ROOT_DIR/src-xpu/dispatch.cpp" -I"$ROOT_DIR/src"
 OBJECTS+=("$BUILD_DIR/xpu-dispatch.o")
 
+"$CXX" -c -o "$BUILD_DIR/xpu-ur-usm-hook.o" -fPIC -O2 -g -std=c++17 \
+    ${AIMDO_EXTRA_CXXFLAGS:-} \
+    "$ROOT_DIR/src-xpu/ur-usm-hook.cpp" -I"$UR_INCLUDE_DIR"
+OBJECTS+=("$BUILD_DIR/xpu-ur-usm-hook.o")
+
 "$CXX" -shared -o "$OUTPUT_PATH" -fsycl -pthread \
-    "${OBJECTS[@]}" -lze_loader -ldl
+    "${OBJECTS[@]}" -lze_loader -ldl \
+    -Wl,--version-script="$ROOT_DIR/src-xpu/ur-usm-hook.map"
 
 echo "built $OUTPUT_PATH"

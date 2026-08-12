@@ -60,23 +60,25 @@ class CUDAPluggableAllocator(torch.cuda.memory.CUDAPluggableAllocator):
 class XPUPluggableAllocator(torch.xpu.memory.XPUPluggableAllocator):
     """Construct the XPU allocator from AIMDO's already-loaded library."""
 
-    def __init__(self):
+    def __init__(self, raw_segments=False):
+        alloc_name = "xpu_raw_alloc_fn" if raw_segments else "xpu_alloc_fn"
+        free_name = "xpu_raw_free_fn" if raw_segments else "xpu_free_fn"
         alloc_fn = ctypes.cast(
-            getattr(control.lib, "xpu_alloc_fn"), ctypes.c_void_p).value
+            getattr(control.lib, alloc_name), ctypes.c_void_p).value
         free_fn = ctypes.cast(
-            getattr(control.lib, "xpu_free_fn"), ctypes.c_void_p).value
+            getattr(control.lib, free_name), ctypes.c_void_p).value
         assert alloc_fn is not None
         assert free_fn is not None
         self._allocator = torch._C._xpu_customAllocator(alloc_fn, free_fn)
 
-def get_torch_allocator():
-    #As of this writing (pytorch 2.10), pytorch MemPools + CUDAPluggableAllocator
-    #considers the Mempool and pool usage context each as a hard reference to the
-    #tensors completely preventing reasonable garbage collection. A read of the code
-    #suggests that the assumptions of cudaGraphs completely prohibits pool cleanup
-    #on VRAM pressure which ultimately makes this un-usable for our high pressure
-    #allocator.
+def get_torch_allocator(raw_segments=False):
+    # In native-pool mode the callbacks own only raw native segments. Pool
+    # routing and pressure-lifecycle validation remain the caller's job.
     if control.implementation == "xpu":
-        return None if control.lib is None else XPUPluggableAllocator()
+        return (
+            None
+            if control.lib is None
+            else XPUPluggableAllocator(raw_segments=raw_segments)
+        )
     logging.warning(f"WARNING: Aimdo+CUDAPluggableAllocator is experimental and unsupported.")
     return None if control.lib is None else CUDAPluggableAllocator()

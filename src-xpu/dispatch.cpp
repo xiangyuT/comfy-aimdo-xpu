@@ -155,6 +155,16 @@ XpuDeviceState *current_device() {
     return find_device(aimdo_xpu_current_device());
 }
 
+int device_from_native_handle(uintptr_t native_handle) {
+    std::lock_guard<std::mutex> guard(g_devices_mutex);
+    auto found = std::find_if(
+        g_devices.begin(), g_devices.end(),
+        [native_handle](const XpuDeviceState &state) {
+            return reinterpret_cast<uintptr_t>(state.device) == native_handle;
+        });
+    return found == g_devices.end() ? -1 : found->id;
+}
+
 sycl::queue *resolve_queue(CUstream stream) {
     if (stream) {
         auto *queue = reinterpret_cast<sycl::queue *>(stream);
@@ -767,6 +777,81 @@ void free_torch_block(void *pointer, sycl::queue *queue) {
     }
 }
 
+void *allocate_raw_torch_segment(
+    size_t size, int device, sycl::queue *queue) {
+    if (!queue || size == 0) {
+        return nullptr;
+    }
+    resolve_queue(reinterpret_cast<CUstream>(queue));
+    g_stats[kTorchAllocatorAllocCalls].fetch_add(
+        1, std::memory_order_relaxed);
+
+    // The native XPU caching allocator owns block reuse, stream events,
+    // splitting, and coalescing in this mode. AIMDO serializes only physical
+    // segment growth and VBAR pressure; it must not retain a second cache.
+    std::lock_guard<std::mutex> guard(g_torch_allocator_mutex);
+    if (!aimdo_xpu_prepare_allocation(device, size)) {
+        return nullptr;
+    }
+
+    void *pointer = nullptr;
+    try {
+        pointer = sycl::malloc_device(size, *queue);
+    } catch (...) {
+        pointer = nullptr;
+    }
+    if (!pointer) {
+        if (!aimdo_xpu_retry_allocation(device, size)) {
+            return nullptr;
+        }
+        try {
+            pointer = sycl::malloc_device(size, *queue);
+        } catch (...) {
+            pointer = nullptr;
+        }
+    }
+    if (!pointer) {
+        return nullptr;
+    }
+
+    aimdo_xpu_account_allocation(device, static_cast<int64_t>(size));
+    increase_torch_bytes(
+        g_torch_active_bytes, g_torch_peak_active_bytes, device, size);
+    increase_torch_bytes(
+        g_torch_reserved_bytes, g_torch_peak_reserved_bytes, device, size);
+    g_stats[kTorchAllocatorPhysicalAllocCalls].fetch_add(
+        1, std::memory_order_relaxed);
+    g_stats[kTorchAllocatorPhysicalAllocBytes].fetch_add(
+        size, std::memory_order_relaxed);
+    return pointer;
+}
+
+void free_raw_torch_segment(
+    void *pointer, size_t size, int device, sycl::queue *queue) {
+    if (!pointer || !queue) {
+        return;
+    }
+    g_stats[kTorchAllocatorFreeCalls].fetch_add(
+        1, std::memory_order_relaxed);
+
+    // XPUCachingAllocator calls raw_delete only after the segment is no longer
+    // active and all recorded stream uses are safe. Free the physical segment
+    // directly instead of moving it into AIMDO's legacy exact-size cache.
+    std::lock_guard<std::mutex> guard(g_torch_allocator_mutex);
+    try {
+        sycl::free(pointer, queue->get_context());
+    } catch (...) {
+        return;
+    }
+    aimdo_xpu_account_allocation(device, -static_cast<int64_t>(size));
+    decrease_torch_bytes(g_torch_active_bytes, device, size);
+    decrease_torch_bytes(g_torch_reserved_bytes, device, size);
+    g_stats[kTorchAllocatorPhysicalReleaseCalls].fetch_add(
+        1, std::memory_order_relaxed);
+    g_stats[kTorchAllocatorPhysicalReleaseBytes].fetch_add(
+        size, std::memory_order_relaxed);
+}
+
 CUresult xpu_device_get_luid(char *luid, unsigned int *node_mask,
                              CUdevice device) {
 #if defined(_WIN32) || defined(_WIN64)
@@ -820,6 +905,16 @@ AIMDO_XPU_EXPORT void *xpu_alloc_fn(
 AIMDO_XPU_EXPORT void xpu_free_fn(
     void *pointer, size_t, int, sycl::queue *queue) {
     free_torch_block(pointer, queue);
+}
+
+AIMDO_XPU_EXPORT void *xpu_raw_alloc_fn(
+    size_t size, int device, sycl::queue *queue) {
+    return allocate_raw_torch_segment(size, device, queue);
+}
+
+AIMDO_XPU_EXPORT void xpu_raw_free_fn(
+    void *pointer, size_t size, int device, sycl::queue *queue) {
+    free_raw_torch_segment(pointer, size, device, queue);
 }
 
 AIMDO_XPU_EXPORT bool xpu_allocator_empty_cache(
@@ -899,6 +994,11 @@ AIMDO_XPU_EXPORT bool xpu_set_queues(
         g_devices.clear();
         return false;
     }
+}
+
+AIMDO_XPU_EXPORT int xpu_device_from_native_handle(
+    uintptr_t native_handle) {
+    return device_from_native_handle(native_handle);
 }
 
 AIMDO_XPU_EXPORT bool xpu_get_vmm_stats(

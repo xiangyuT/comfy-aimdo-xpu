@@ -5,6 +5,8 @@ import sys
 from pathlib import Path
 import logging
 import importlib.util
+import contextlib
+import threading
 
 lib = None
 devctxs = []
@@ -13,6 +15,9 @@ implementation = None
 _torch_allocator = None
 _torch_allocator_library = None
 _xpu_allocator_ready = False
+_xpu_allocator_mode = None
+_torch_xpu_memory_pools = {}
+_torch_xpu_memory_pools_lock = threading.Lock()
 _torch_xpu_empty_cache_original = None
 _torch_xpu_memory_stats_original = None
 _torch_xpu_reset_peak_stats_original = None
@@ -29,6 +34,35 @@ _LOG_LEVELS = {
     6: logging.DEBUG,
     7: logging.DEBUG,
 }
+
+_XPU_ALLOCATOR_MODES = frozenset(("global", "native_hook", "native_pool"))
+
+
+def _normalize_xpu_allocator_mode(mode):
+    mode = (
+        os.environ.get("AIMDO_XPU_ALLOCATOR_MODE", "global")
+        if mode is None
+        else str(mode)
+    )
+    if mode not in _XPU_ALLOCATOR_MODES:
+        choices = ", ".join(sorted(_XPU_ALLOCATOR_MODES))
+        raise ValueError(
+            f"unsupported XPU allocator mode {mode!r}; expected one of {choices}"
+        )
+    return mode
+
+
+def _install_xpu_allocator_backend(torch_module, aimdo_torch_module, mode):
+    if mode == "native_hook":
+        return None
+    allocator = aimdo_torch_module.get_torch_allocator(
+        raw_segments=mode == "native_pool"
+    )
+    if allocator is None:
+        raise RuntimeError("AIMDO XPU allocator is unavailable")
+    if mode == "global":
+        torch_module.xpu.memory.change_current_allocator(allocator)
+    return allocator
 
 
 def _native_log(level, message):
@@ -91,14 +125,31 @@ def _add_xpu_runtime_dll_directories():
             _windows_dll_directory_paths.add(str(candidate))
 
 
-def init(implementation: str | None = None, simple_vram_headroom: int | None = None, nvml_pressure: bool = False):
+def init(
+    implementation: str | None = None,
+    simple_vram_headroom: int | None = None,
+    nvml_pressure: bool = False,
+    xpu_allocator_mode: str | None = None,
+):
     global lib, _log_callback, _torch_allocator
     global _torch_allocator_library, _xpu_allocator_ready
+    global _xpu_allocator_mode
     global _torch_xpu_empty_cache_original
     global _torch_xpu_memory_stats_original
     global _torch_xpu_reset_peak_stats_original
 
     if lib is not None:
+        if xpu_allocator_mode is not None:
+            requested_mode = _normalize_xpu_allocator_mode(xpu_allocator_mode)
+            if implementation == "xpu" or globals()["implementation"] == "xpu":
+                if requested_mode != _xpu_allocator_mode:
+                    raise RuntimeError(
+                        "AIMDO XPU allocator mode cannot change after initialization"
+                    )
+            else:
+                raise ValueError(
+                    "xpu_allocator_mode is valid only for the XPU implementation"
+                )
         if simple_vram_headroom is not None:
             lib.set_simple_vram_headroom(int(simple_vram_headroom))
         lib.set_nvml_pressure(bool(nvml_pressure))
@@ -111,6 +162,17 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
     if implementation is None:
         logging.warning("Could not autodetect AIMDO implementation, assuming Nvidia")
         implementation = "cuda"
+
+    if implementation == "xpu":
+        requested_xpu_allocator_mode = _normalize_xpu_allocator_mode(
+            xpu_allocator_mode
+        )
+    elif xpu_allocator_mode is not None:
+        raise ValueError(
+            "xpu_allocator_mode is valid only for the XPU implementation"
+        )
+    else:
+        requested_xpu_allocator_mode = None
 
     if (
         implementation == "xpu"
@@ -191,67 +253,112 @@ def init(implementation: str | None = None, simple_vram_headroom: int | None = N
         lib.xpu_allocator_get_memory_stats.restype = ctypes.c_bool
         lib.xpu_allocator_reset_peak_stats.argtypes = [ctypes.c_int]
         lib.xpu_allocator_reset_peak_stats.restype = None
+        native_hook_symbols = (
+            "xpu_ur_hook_is_interposed",
+            "xpu_ur_hook_enable",
+            "xpu_ur_hook_disable",
+            "xpu_ur_hook_get_stats",
+        )
+        native_hook_available = (
+            platform.system() == "Linux"
+            and all(hasattr(lib, name) for name in native_hook_symbols)
+        )
+        if native_hook_available:
+            lib.xpu_ur_hook_is_interposed.argtypes = []
+            lib.xpu_ur_hook_is_interposed.restype = ctypes.c_bool
+            lib.xpu_ur_hook_enable.argtypes = []
+            lib.xpu_ur_hook_enable.restype = ctypes.c_bool
+            lib.xpu_ur_hook_disable.argtypes = []
+            lib.xpu_ur_hook_disable.restype = ctypes.c_bool
+            lib.xpu_ur_hook_get_stats.argtypes = [
+                ctypes.POINTER(ctypes.c_uint64),
+                ctypes.c_size_t,
+            ]
+            lib.xpu_ur_hook_get_stats.restype = ctypes.c_bool
+
+        if (
+            requested_xpu_allocator_mode == "native_hook"
+            and (
+                not native_hook_available
+                or not lib.xpu_ur_hook_is_interposed()
+            )
+        ):
+            logging.error(
+                "comfy-aimdo XPU native hook requires Linux and must be "
+                "loaded through LD_PRELOAD before Python starts"
+            )
+            lib.set_log_callback(ctypes.cast(None, _LOG_CALLBACK))
+            _log_callback = None
+            lib = None
+            globals()["implementation"] = None
+            return False
 
         try:
             if _torch_allocator is None:
                 import torch
                 from . import torch as aimdo_torch
 
-                allocator = aimdo_torch.get_torch_allocator()
-                if allocator is None:
-                    raise RuntimeError("AIMDO XPU allocator is unavailable")
-                torch.xpu.memory.change_current_allocator(allocator)
+                allocator = _install_xpu_allocator_backend(
+                    torch, aimdo_torch, requested_xpu_allocator_mode
+                )
                 _torch_allocator = allocator
                 # The allocator owns function pointers into this CDLL. Keep a
                 # process-lifetime reference even if control.deinit() is used
                 # by a focused test and AIMDO is initialized again later.
                 _torch_allocator_library = lib
-                _torch_xpu_empty_cache_original = torch.xpu.empty_cache
-                _torch_xpu_memory_stats_original = torch.xpu.memory_stats
-                _torch_xpu_reset_peak_stats_original = (
-                    torch.xpu.reset_peak_memory_stats
-                )
+                _xpu_allocator_mode = requested_xpu_allocator_mode
 
-                def aimdo_xpu_empty_cache():
-                    empty_xpu_allocator_cache(wait=False)
-                    try:
-                        return _torch_xpu_empty_cache_original()
-                    except RuntimeError as error:
-                        if "does not yet support emptyCache" not in str(error):
-                            raise
-                        return None
-
-                torch.xpu.empty_cache = aimdo_xpu_empty_cache
-
-                def aimdo_xpu_memory_stats(device=None):
-                    active, reserved, peak_active, peak_reserved = (
-                        get_xpu_allocator_memory_stats(device)
+                if requested_xpu_allocator_mode == "global":
+                    _torch_xpu_empty_cache_original = torch.xpu.empty_cache
+                    _torch_xpu_memory_stats_original = torch.xpu.memory_stats
+                    _torch_xpu_reset_peak_stats_original = (
+                        torch.xpu.reset_peak_memory_stats
                     )
-                    return {
-                        "active_bytes.all.current": active,
-                        "active_bytes.all.peak": peak_active,
-                        "allocated_bytes.all.current": active,
-                        "allocated_bytes.all.peak": peak_active,
-                        "reserved_bytes.all.current": reserved,
-                        "reserved_bytes.all.peak": peak_reserved,
-                    }
 
-                def aimdo_xpu_reset_peak_memory_stats(device=None):
-                    reset_xpu_allocator_peak_stats(device)
-                    try:
-                        return _torch_xpu_reset_peak_stats_original(device)
-                    except RuntimeError as error:
-                        if "does not yet support resetPeakStats" not in str(error):
-                            raise
-                        return None
+                    def aimdo_xpu_empty_cache():
+                        empty_xpu_allocator_cache(wait=False)
+                        try:
+                            return _torch_xpu_empty_cache_original()
+                        except RuntimeError as error:
+                            if "does not yet support emptyCache" not in str(error):
+                                raise
+                            return None
 
-                torch.xpu.memory.memory_stats = aimdo_xpu_memory_stats
-                torch.xpu.memory_stats = aimdo_xpu_memory_stats
-                torch.xpu.memory.reset_peak_memory_stats = (
-                    aimdo_xpu_reset_peak_memory_stats
-                )
-                torch.xpu.reset_peak_memory_stats = (
-                    aimdo_xpu_reset_peak_memory_stats
+                    torch.xpu.empty_cache = aimdo_xpu_empty_cache
+
+                    def aimdo_xpu_memory_stats(device=None):
+                        active, reserved, peak_active, peak_reserved = (
+                            get_xpu_allocator_memory_stats(device)
+                        )
+                        return {
+                            "active_bytes.all.current": active,
+                            "active_bytes.all.peak": peak_active,
+                            "allocated_bytes.all.current": active,
+                            "allocated_bytes.all.peak": peak_active,
+                            "reserved_bytes.all.current": reserved,
+                            "reserved_bytes.all.peak": peak_reserved,
+                        }
+
+                    def aimdo_xpu_reset_peak_memory_stats(device=None):
+                        reset_xpu_allocator_peak_stats(device)
+                        try:
+                            return _torch_xpu_reset_peak_stats_original(device)
+                        except RuntimeError as error:
+                            if "does not yet support resetPeakStats" not in str(error):
+                                raise
+                            return None
+
+                    torch.xpu.memory.memory_stats = aimdo_xpu_memory_stats
+                    torch.xpu.memory_stats = aimdo_xpu_memory_stats
+                    torch.xpu.memory.reset_peak_memory_stats = (
+                        aimdo_xpu_reset_peak_memory_stats
+                    )
+                    torch.xpu.reset_peak_memory_stats = (
+                        aimdo_xpu_reset_peak_memory_stats
+                    )
+            elif requested_xpu_allocator_mode != _xpu_allocator_mode:
+                raise RuntimeError(
+                    "AIMDO XPU allocator mode cannot change after installation"
                 )
             _xpu_allocator_ready = True
         except Exception as error:
@@ -315,6 +422,20 @@ def init_devices(device_ids):
     headroom_array = (ctypes.c_uint64 * len(headrooms))(*headrooms)
     if lib.init(device_array, headroom_array, len(requested)):
         devctxs = [get_devctx(device_id) for device_id in requested]
+        if (
+            implementation == "xpu"
+            and _xpu_allocator_mode == "native_hook"
+            and not lib.xpu_ur_hook_enable()
+        ):
+            lib.cleanup()
+            devctxs = []
+            lib.plat_cleanup()
+            return False
+        if implementation == "xpu" and _xpu_allocator_mode == "native_hook":
+            logging.info(
+                "comfy-aimdo XPU native allocator hook enabled; "
+                "PyTorch caching allocator retained"
+            )
         return True
 
     devctxs = []
@@ -336,7 +457,18 @@ def deinit():
     global lib, devctxs, _log_callback, _xpu_allocator_ready
     if lib is not None:
         if implementation == "xpu" and _xpu_allocator_ready:
-            lib.xpu_allocator_empty_cache(True)
+            if _xpu_allocator_mode == "native_hook":
+                import torch
+
+                torch.xpu.empty_cache()
+                torch.xpu.synchronize()
+                if not lib.xpu_ur_hook_disable():
+                    raise RuntimeError(
+                        "cannot disable AIMDO XPU native hook while "
+                        "tracked native segments remain live"
+                    )
+            else:
+                lib.xpu_allocator_empty_cache(True)
         lib.cleanup()
         devctxs = []
         lib.plat_cleanup()
@@ -403,10 +535,45 @@ def get_xpu_vmm_stats():
     return dict(zip(names, map(int, values)))
 
 
+def get_xpu_ur_hook_stats():
+    if (
+        lib is None
+        or implementation != "xpu"
+        or not hasattr(lib, "xpu_ur_hook_get_stats")
+    ):
+        return {}
+    names = (
+        "alloc_calls",
+        "free_calls",
+        "pass_through_alloc_calls",
+        "tracked_alloc_calls",
+        "tracked_alloc_bytes",
+        "tracked_free_calls",
+        "tracked_free_bytes",
+        "synthetic_oom_calls",
+        "runtime_oom_calls",
+        "native_reclaim_free_calls",
+        "native_reclaim_free_bytes",
+        "retry_eviction_calls",
+        "retry_eviction_bytes",
+        "unknown_device_calls",
+        "unknown_free_calls",
+        "dropped_metadata_calls",
+    )
+    values = (ctypes.c_uint64 * len(names))()
+    if not lib.xpu_ur_hook_get_stats(values, len(names)):
+        raise RuntimeError("failed to query AIMDO XPU UR hook statistics")
+    return dict(zip(names, map(int, values)))
+
+
 def empty_xpu_allocator_cache(wait=False):
     if lib is None or implementation != "xpu" or not _xpu_allocator_ready:
         return False
     return bool(lib.xpu_allocator_empty_cache(bool(wait)))
+
+
+def get_xpu_allocator_mode():
+    return _xpu_allocator_mode
 
 
 def _xpu_device_index(device=None):
@@ -414,10 +581,58 @@ def _xpu_device_index(device=None):
 
     if device is None:
         return int(torch.xpu.current_device())
+    if isinstance(device, int):
+        return device
     parsed = torch.device(device)
     if parsed.type != "xpu":
         raise ValueError(f"expected an XPU device, got {parsed}")
     return int(torch.xpu.current_device() if parsed.index is None else parsed.index)
+
+
+def get_xpu_allocator_pool(device=None):
+    if (
+        lib is None
+        or implementation != "xpu"
+        or not _xpu_allocator_ready
+        or _xpu_allocator_mode != "native_pool"
+    ):
+        raise RuntimeError("AIMDO XPU native-pool mode is not initialized")
+
+    import torch
+
+    device_index = _xpu_device_index(device)
+    with _torch_xpu_memory_pools_lock:
+        pool = _torch_xpu_memory_pools.get(device_index)
+        if pool is None:
+            with torch.xpu.device(device_index):
+                pool = torch.xpu.MemPool(_torch_allocator.allocator())
+            _torch_xpu_memory_pools[device_index] = pool
+        return pool
+
+
+@contextlib.contextmanager
+def use_xpu_allocator_pool(device=None):
+    import torch
+
+    device_index = _xpu_device_index(device)
+    pool = get_xpu_allocator_pool(device_index)
+    with torch.xpu.use_mem_pool(pool, device=device_index):
+        yield pool
+
+
+def release_xpu_allocator_pool(device=None):
+    device_index = _xpu_device_index(device)
+    with _torch_xpu_memory_pools_lock:
+        pool = _torch_xpu_memory_pools.get(device_index)
+        if pool is None:
+            return False
+        if pool.use_count() != 1:
+            raise RuntimeError(
+                f"AIMDO XPU pool for device {device_index} is still active"
+            )
+        del _torch_xpu_memory_pools[device_index]
+    del pool
+    return True
 
 
 def get_xpu_allocator_memory_stats(device=None):
