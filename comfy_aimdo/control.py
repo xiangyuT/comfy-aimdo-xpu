@@ -39,8 +39,12 @@ _XPU_ALLOCATOR_MODES = frozenset(("global", "native_hook", "native_pool"))
 
 
 def _normalize_xpu_allocator_mode(mode):
+    # Windows keeps PyTorch's native XPU caching allocator and arbitrates at
+    # the Unified Runtime allocation site instead of replacing the allocator,
+    # so the native hook is the default there.
+    default = "native_hook" if platform.system() == "Windows" else "global"
     mode = (
-        os.environ.get("AIMDO_XPU_ALLOCATOR_MODE", "global")
+        os.environ.get("AIMDO_XPU_ALLOCATOR_MODE", default)
         if mode is None
         else str(mode)
     )
@@ -50,6 +54,24 @@ def _normalize_xpu_allocator_mode(mode):
             f"unsupported XPU allocator mode {mode!r}; expected one of {choices}"
         )
     return mode
+
+
+def _expandable_segments_enabled():
+    """Report whether PyTorch will bypass USM allocation entirely.
+
+    With expandable segments PyTorch reserves virtual address space and backs
+    it with physical memory objects instead of allocating USM, so
+    urUSMDeviceAlloc is never called and the native hook observes nothing. That
+    is silent blindness rather than degraded arbitration, so it is refused.
+    """
+    configuration = os.environ.get("PYTORCH_ALLOC_CONF") or os.environ.get(
+        "PYTORCH_XPU_ALLOC_CONF", ""
+    )
+    for entry in configuration.split(","):
+        key, separator, value = entry.partition(":")
+        if separator and key.strip() == "expandable_segments":
+            return value.strip().lower() in ("true", "1")
+    return False
 
 
 def _install_xpu_allocator_backend(torch_module, aimdo_torch_module, mode):
@@ -260,7 +282,7 @@ def init(
             "xpu_ur_hook_get_stats",
         )
         native_hook_available = (
-            platform.system() == "Linux"
+            platform.system() in ("Linux", "Windows")
             and all(hasattr(lib, name) for name in native_hook_symbols)
         )
         if native_hook_available:
@@ -276,25 +298,44 @@ def init(
             ]
             lib.xpu_ur_hook_get_stats.restype = ctypes.c_bool
 
-        if (
-            requested_xpu_allocator_mode == "native_hook"
-            and (
-                not native_hook_available
-                or not lib.xpu_ur_hook_is_interposed()
-            )
-        ):
-            logging.error(
-                "comfy-aimdo XPU native hook requires Linux and must be "
-                "loaded through LD_PRELOAD before Python starts"
-            )
-            lib.set_log_callback(ctypes.cast(None, _LOG_CALLBACK))
-            _log_callback = None
-            lib = None
-            globals()["implementation"] = None
-            return False
+        if requested_xpu_allocator_mode == "native_hook":
+            if _expandable_segments_enabled():
+                logging.error(
+                    "comfy-aimdo XPU native hook cannot arbitrate while "
+                    "expandable_segments is enabled: PyTorch then allocates "
+                    "physical memory directly and never calls "
+                    "urUSMDeviceAlloc. Unset expandable_segments in "
+                    "PYTORCH_ALLOC_CONF or select another allocator mode."
+                )
+                lib.set_log_callback(ctypes.cast(None, _LOG_CALLBACK))
+                _log_callback = None
+                lib = None
+                globals()["implementation"] = None
+                return False
+            if not native_hook_available or not lib.xpu_ur_hook_is_interposed():
+                if platform.system() == "Windows":
+                    logging.error(
+                        "comfy-aimdo XPU native hook could not attach to "
+                        "ur_loader.dll; import torch before initializing AIMDO"
+                    )
+                else:
+                    logging.error(
+                        "comfy-aimdo XPU native hook requires Linux and must be "
+                        "loaded through LD_PRELOAD before Python starts"
+                    )
+                lib.set_log_callback(ctypes.cast(None, _LOG_CALLBACK))
+                _log_callback = None
+                lib = None
+                globals()["implementation"] = None
+                return False
 
         try:
-            if system != "Windows" and _torch_allocator is None:
+            if system == "Windows":
+                # Windows never replaces PyTorch's allocator. Record the mode so
+                # init_devices() enables the native hook and deinit() tears it
+                # down through the same path as Linux.
+                _xpu_allocator_mode = requested_xpu_allocator_mode
+            elif _torch_allocator is None:
                 import torch
                 from . import torch as aimdo_torch
 
@@ -569,6 +610,10 @@ def get_xpu_ur_hook_stats():
         "direct_pressure_bytes",
         "duplicate_pointer_calls",
     )
+    if platform.system() == "Windows":
+        # Windows also counts the entry point PyTorch uses instead of USM when
+        # expandable segments are enabled, so a blind hook is observable.
+        names = names + ("physical_mem_create_calls",)
     values = (ctypes.c_uint64 * len(names))()
     if not lib.xpu_ur_hook_get_stats(values, len(names)):
         raise RuntimeError("failed to query AIMDO XPU UR hook statistics")
