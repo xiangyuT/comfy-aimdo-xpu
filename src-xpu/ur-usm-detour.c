@@ -696,21 +696,37 @@ __declspec(dllexport) bool xpu_ur_hook_enable(void) {
     return true;
 }
 
+/* Stop arbitrating.
+ *
+ * The Linux hook refuses while tracked segments are live, because there AIMDO
+ * *is* Torch's allocator and a live segment means its own accounting would be
+ * dropped. Windows is not symmetric: the hook only observes allocations that
+ * PyTorch owns, and PyTorch legitimately retains some of them across
+ * empty_cache(). Refusing here made control.deinit() raise in any process that
+ * had ever allocated, so the table is dropped instead and the count reported.
+ * The memory itself is unaffected: PyTorch frees it through the unhooked entry
+ * point, and AIMDO's accounting is torn down immediately afterwards. */
 __declspec(dllexport) bool xpu_ur_hook_disable(void) {
-    bool ok;
+    LONG64 live;
 
     if (!InterlockedCompareExchange(&g_lock_ready, 0, 0)) {
         return true;
     }
     EnterCriticalSection(&g_hook_lock);
-    ok = InterlockedCompareExchange64(&g_allocation_count, 0, 0) == 0;
-    if (ok) {
-        InterlockedExchange(&g_enabled, 0);
-        InterlockedIncrement64(&g_generation);
-        clear_retry();
-    }
+    InterlockedExchange(&g_enabled, 0);
+    InterlockedIncrement64(&g_generation);
+    clear_retry();
+    live = InterlockedExchange64(&g_allocation_count, 0);
+    memset(g_allocations, 0, sizeof(g_allocations));
     LeaveCriticalSection(&g_hook_lock);
-    return ok;
+
+    if (live > 0) {
+        aimdo_log(kAimdoUrLogInfo, __FILE__, __LINE__,
+                  "%s: stopped arbitrating with %lld PyTorch segments still "
+                  "live; they remain owned by PyTorch\n", __func__,
+                  (long long)live);
+    }
+    return true;
 }
 
 __declspec(dllexport) bool xpu_ur_hook_get_stats(uint64_t *values,

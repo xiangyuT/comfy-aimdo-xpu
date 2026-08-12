@@ -115,6 +115,10 @@ def main():
         torch.xpu.synchronize(args.device)
         stats = torch.xpu.memory_stats(args.device)
         vmm = control.get_xpu_vmm_stats()
+        # The UR hook only runs inside urUSMDeviceAlloc, so these counters show
+        # whether a VBAR fault can ask PyTorch for its cache back. A fault does
+        # not allocate USM, so it cannot.
+        hook = control.get_xpu_ur_hook_stats()
         emit(
             event="fault_pass", phase=phase, pages=len(allocations),
             faulted=faulted, missed=missed, errors=errors,
@@ -122,6 +126,9 @@ def main():
             watermark=vbar.get_watermark(),
             unmap_calls=vmm.get("unmap_calls", 0),
             physical_release_calls=vmm.get("physical_release_calls", 0),
+            hook_synthetic_oom=hook.get("synthetic_oom_calls", 0),
+            hook_retry_eviction=hook.get("retry_eviction_calls", 0),
+            hook_native_reclaim_free=hook.get("native_reclaim_free_calls", 0),
             torch_reserved_mib=int(
                 stats.get("reserved_bytes.all.current", 0)) // MIB,
         )

@@ -159,11 +159,14 @@ boundary, never from the hook, because Torch holds its allocator lock across
 the driver call; it is rate limited and skipped unless Torch is actually
 holding cached blocks. `AIMDO_XPU_NATIVE_CACHE_TRIM=0` disables it.
 
-A Unified Runtime interception point removes the need for that workaround
-entirely, because a synthetic allocation failure makes Torch release the cache
-itself. That mechanism is verified on Windows in
-[the UR allocator hook record](WINDOWS_XPU_UR_ALLOCATOR_HOOK.md); it is not yet
-implemented in production and has not been run against a workload.
+A Unified Runtime interception point lets AIMDO apply this budget before the
+allocation is placed, and a synthetic allocation failure makes Torch release
+its cache when *Torch* is the allocator. It does **not** replace this fault
+boundary call: a VBAR fault allocates no USM, so the hook never runs on that
+path and cannot ask Torch for anything. Measured on this branch, a VBAR
+working set stayed at 32 MiB against 30,720 MiB of Torch cache until
+`empty_cache()` was called. See
+[the UR allocator hook record](WINDOWS_XPU_UR_ALLOCATOR_HOOK.md).
 
 Sampler latency changes must not be attributed to VBAR churn without checking
 the VMM counters. A sampler interval with unchanged `map_bytes`, `unmap_bytes`,

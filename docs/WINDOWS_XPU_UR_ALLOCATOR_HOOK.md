@@ -153,14 +153,14 @@ confirms every step on Windows: one synthetic failure, six real `urUSMFree`
 calls totalling 384 MiB in between, one retry of the identical size, success,
 and usable memory.
 
-This is significant beyond porting. `XPU_PLATFORM_MEMORY_POLICY.md` records
-that PyTorch's freed-but-cached blocks "never reach `zeMemFree`, so the
-allocation hook cannot see them", which is why the current Windows design needs
-`AIMDO_XPU_NATIVE_CACHE_TRIM` to call `empty_cache()` from the fault boundary,
-rate limited, and never from the hook, because Torch holds its allocator lock
-across the driver call. The synthetic OOM removes that entire workaround:
-PyTorch releases the cache itself, from inside its own lock, at the exact
-moment of pressure.
+This is significant beyond porting, but its scope is narrower than it first
+appears, and section 9 records the measurement that establishes the limit.
+`XPU_PLATFORM_MEMORY_POLICY.md` records that PyTorch's freed-but-cached blocks
+"never reach `zeMemFree`, so the allocation hook cannot see them", which is why
+Windows needs `AIMDO_XPU_NATIVE_CACHE_TRIM` to call `empty_cache()` from the
+fault boundary. The synthetic OOM addresses that **only while PyTorch is the
+allocator**. It does not help when AIMDO's own VBAR fault needs memory, because
+a fault allocates no USM and the hook never runs.
 
 ## 4. Newly discovered hard constraint: expandable segments
 
@@ -326,46 +326,120 @@ accounting. That is the full path - deficit detection, caller classification,
 synthetic failure, PyTorch retry, eviction, allocation - running in production
 code.
 
-## 9. Remaining plan
+## 9. Real pressure test, and the claim it refuted
 
-Phase A - reproducers. Run `tests/repro_windows_xpu_malloc_pressure.py` and
-`tests/repro_windows_xpu_vbar_vs_torch.py` against this branch and confirm
-`native_reclaim_free_calls` is nonzero, which the smoke test cannot show
-because PyTorch holds no cache when the pressure is created by the very first
-allocations.
+The verification above creates pressure with an inflated reserve on a device
+holding no VBAR working set, so it proves the control loop executes and nothing
+more. `tests/repro_windows_xpu_vbar_vs_torch.py` is the real test: a 6 GiB VBAR
+working set of 192 pages competing with a 30 GiB native Torch ramp on a 31 GiB
+device.
 
-Phase B - decide the fate of `AIMDO_XPU_NATIVE_CACHE_TRIM`. The synthetic OOM
-replaces its purpose. Do not ship both control loops enabled by default.
+```powershell
+<portable>\python_embeded\python.exe -s `
+    tests\repro_windows_xpu_vbar_vs_torch.py --vbar-gib 6 --torch-gib 30
+```
 
-Phase C - the gradient ladder, in full: 480p/5s, 720p/5s, then 720p/10s with
+| Phase | VBAR resident | Torch cached | unmaps | synthetic OOM | retry evictions |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| idle device | 6144 MiB | 0 | 0 | 0 | 0 |
+| Torch ramp applied | 0 MiB | 30720 MiB | - | 71 | 71 |
+| VBAR faults while Torch holds memory | 32 MiB | 30720 MiB | 383 | 71 | 71 |
+| after `del blocks`, no `empty_cache()` | 32 MiB | 30720 MiB | 575 | 71 | 71 |
+| after `torch.xpu.empty_cache()` | 6144 MiB | 256 MiB | 575 | 71 | 71 |
+
+### What passed
+
+Allocation-time arbitration works under real competition. The hook fired 71
+times during the Torch ramp and evicted on every retry, releasing the whole
+6 GiB VBAR ahead of Torch's growth. Torch recorded **zero** allocation
+failures, and there was no `DEVICE_LOST` and no driver instability - which is
+the specific failure that the `zeMemAllocDevice` arbitration could not avoid.
+
+### What failed: the synthetic OOM does not subsume the cache trim
+
+Section 3 of an earlier revision of this document claimed the synthetic OOM
+"removes that entire workaround" and that `AIMDO_XPU_NATIVE_CACHE_TRIM` could
+therefore be retired. **That claim is false, and this measurement refutes it.**
+
+In the fourth phase Torch holds 30,720 MiB in its own cache and AIMDO's VBAR
+faults recover only 32 MiB. The synthetic OOM counter does not move at all
+between the third and fourth phases: it stays at 71. `empty_cache()` then
+recovers the full 6144 MiB immediately.
+
+The reason is structural rather than a tuning problem. The hook lives inside
+`urUSMDeviceAlloc`, so it only runs when **PyTorch** is allocating. A VBAR
+fault allocates no USM at all - it creates Level Zero physical memory and maps
+it - so when AIMDO is the party that needs memory and Torch is the party
+holding it, the hook is never entered and Torch is never asked to release
+anything. `AIMDO_XPU_NATIVE_CACHE_TRIM` must therefore be **retained**; it
+covers the exact direction the hook cannot.
+
+`native_reclaim_free_calls` also stayed at 0 for the whole run. During the ramp
+PyTorch was allocating fresh blocks and had no cache to release, so every
+synthetic failure was answered by AIMDO evicting VBAR pages rather than by
+Torch returning memory. The cache-return benefit demonstrated by the standalone
+probe did not occur even once in this workload.
+
+### What is unchanged: the map/unmap thrash
+
+The third phase issues 383 unmaps for 192 pages in a single pass and settles at
+32 MiB resident. That is the same signature as the livelock recorded in the
+liveness analysis, and this branch does not change it. Moving the interception
+point does not address admission or watermark policy, exactly as predicted.
+
+### A defect this test found
+
+`xpu_ur_hook_disable()` originally refused while tracked segments were live,
+copying the Linux invariant. That invariant does not transfer: on Linux AIMDO
+*is* Torch's allocator, so a live segment means its own accounting would be
+lost, while on Windows the hook merely observes allocations PyTorch owns and
+legitimately retains across `empty_cache()`. The result was that
+`control.deinit()` raised in any process that had ever allocated. Windows now
+drops the tracking table and reports the count instead.
+
+## 10. Remaining plan
+
+Phase A - **done, and it changed the design.** See section 9.
+
+Phase B - `AIMDO_XPU_NATIVE_CACHE_TRIM` is **retained**, not retired. The two
+mechanisms cover opposite directions and both are required: the synthetic OOM
+when PyTorch allocates, the fault-boundary trim when AIMDO faults. What remains
+is to check they do not oscillate against each other under sustained pressure.
+
+Phase C - investigate whether the fault path needs its own way to demand
+memory from PyTorch, since the trim is rate limited and best effort. The
+measured 32 MiB against 30 GiB of cache suggests the current trim is far too
+weak at that boundary.
+
+Phase D - the gradient ladder, in full: 480p/5s, 720p/5s, then 720p/10s with
 243 frames. Only the last step may be reported as a fix.
 
-## 10. What this does not establish
+## 11. What this does not establish
 
-1. No workload has been run. The 720p/10s livelock recorded in the liveness
-   analysis, in which `map_bytes` and `unmap_bytes` advance together at roughly
-   8.5 MiB/s, is an admission and watermark policy problem. Moving the
-   interception point improves *when* AIMDO can act; it is not evidence that the
-   oscillation stops. Presenting this component pass as a fix for that failure
-   would be the third occurrence of the method failure that document records.
-2. Eviction was exercised, but against a device with no VBAR working set. The
-   reclaim path returned without releasing model pages because there were none.
-3. `native_reclaim_free_calls` has not been observed nonzero in production. The
-   standalone probe proved PyTorch returns its cache, but the smoke test
-   creates pressure with the first allocations, when there is no cache to
-   return.
+1. No ComfyUI workload has been run. The 720p/10s livelock recorded in the
+   liveness analysis is an admission and watermark policy problem, and section 9
+   shows the map/unmap thrash is still present on this branch. Presenting any of
+   this as a fix for that failure would be the third occurrence of the method
+   failure that document records - and section 9 is itself a fourth occurrence
+   caught early, because this document did claim the cache trim was subsumed
+   before it was measured.
+2. `native_reclaim_free_calls` has never been observed nonzero outside the
+   standalone probe. The mechanism is proven to exist; its usefulness in a real
+   allocation pattern is not.
+3. Eviction was exercised against a synthetic VBAR working set of uniform
+   32 MiB pages, not a real model with real access order.
 4. Multi-threaded attach was not exercised. `DetourUpdateThread` was called for
-   the installing thread only, which is safe when hooks are installed before
-   the worker threads allocate but is not a validated policy for attaching to a
-   busy process.
-5. Only the default allocator configuration and a single device were measured.
+   the installing thread only, which is safe when hooks are installed before the
+   worker threads allocate but is not a validated policy for attaching to a busy
+   process.
+5. Only one device was measured, and only the default allocator configuration.
 6. Interaction with other software that hooks the same UR or Level Zero entry
    points was not tested.
 7. The Linux build was not compiled on this machine. The change to
    `aimdo_xpu_evict_for_allocation()` is guarded so Linux keeps `vbars_free()`,
    but that has not been verified by a Linux build.
 
-## 11. Reproducing
+## 12. Reproducing
 
 ```powershell
 scripts\build-windows-xpu.cmd
@@ -379,16 +453,21 @@ rem production control loop
 <portable>\python_embeded\python.exe -s tests\run_windows_ur_hook_smoke.py `
     --reserve-mib 28000 --alloc-mib 2048
 
+rem real competition between a VBAR working set and a native Torch ramp
+<portable>\python_embeded\python.exe -s `
+    tests\repro_windows_xpu_vbar_vs_torch.py --vbar-gib 6 --torch-gib 30
+
 rem the expandable segments constraint, which must fail
 $env:PYTORCH_ALLOC_CONF = "expandable_segments:True"
 <portable>\python_embeded\python.exe -s tests\run_windows_ur_hook_probe.py
 ```
 
-The first three must print `RESULT: PASS`. The last must fail checks 2, 3, 3c
+The first three must print `RESULT: PASS`. The reproducer must complete without
+a fault error and reproduce the table in section 9, including the fourth phase
+in which VBAR residency does *not* recover. The last must fail checks 2, 3, 3c
 and 4b-4d while reporting nonzero `physical_mem_create_calls`; that failure is
-the expected, documented behaviour and is the regression test for the
-expandable segments constraint. `control.init()` refuses that configuration
-outright.
+the expected, documented behaviour, and `control.init()` refuses the
+configuration outright.
 
 ## Maintenance rule
 
