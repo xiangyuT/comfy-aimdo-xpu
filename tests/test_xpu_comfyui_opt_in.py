@@ -1,3 +1,4 @@
+import platform
 import sys
 import types
 
@@ -62,7 +63,10 @@ def test_comfyui_xpu_opt_out_precedes_native_library_load(monkeypatch):
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
-        (None, "global"),
+        (
+            None,
+            "native_hook" if platform.system() == "Windows" else "global",
+        ),
         ("global", "global"),
         ("native_hook", "native_hook"),
     ],
