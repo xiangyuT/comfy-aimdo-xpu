@@ -68,7 +68,7 @@ resolves a scheme named in `pyproject.toml` through installed entry points and
 cannot import a module from an unbuilt source tree.
 
 Deriving the base requires the upstream release tags, which a fork is created
-without. Fetch them once, otherwise the base degrades to `0.1`:
+without. Fetch them once, otherwise the base degrades to `0.0`:
 
 ```powershell
 git fetch https://github.com/Comfy-Org/comfy-aimdo.git "refs/tags/*:refs/tags/*"
