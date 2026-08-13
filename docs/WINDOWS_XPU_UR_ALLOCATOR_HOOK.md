@@ -124,10 +124,3 @@ runtime:
 Verify the loaded package/DLL identity before interpreting the counters. A
 real workload is still required for any end-to-end performance or liveness
 claim.
-
-## Development history
-
-The prototype sequence, rejected designs, measured counter tables, invalidated
-performance attributions, and remaining hypotheses are preserved in
-`omni-xpu-kernel-tuning/docs/results/bmg/2026-08-12/`. This file is only the
-current implementation contract.

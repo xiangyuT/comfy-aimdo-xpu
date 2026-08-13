@@ -1,8 +1,8 @@
 # Windows XPU build and validation
 
 This document defines the current reproducible build and validation entry
-points. Machine-specific package snapshots, artifact hashes, individual
-performance runs, and investigation history live in the tuning repository.
+points. It is a contract, not a record: machine-specific package snapshots,
+artifact hashes, and individual performance runs do not belong here.
 
 ## Build prerequisites
 
@@ -121,10 +121,3 @@ workload, and require all of the following in the same window:
 Do not promote a cached execution as a sample. Change the seed or another
 sampler input for every prompt while allowing static loader nodes to remain
 cached.
-
-## Evidence ownership
-
-The dated Windows build environment and acceptance investigation were moved to
-`omni-xpu-kernel-tuning/docs/results/bmg/2026-08-12/`. New environment
-snapshots and measured results must be appended there rather than added to this
-maintained build contract.

@@ -119,6 +119,25 @@ reports physical allocation OOM, Windows performs one final 512 MiB reclaim
 and retries once. This is an error-recovery margin, not the primary pressure
 control loop.
 
+## Small VBAR copy fallback
+
+Some Windows multi-adapter configurations reject small host-to-VBAR copies on a
+non-primary Level Zero node. `comfy_aimdo.torch.copy_to_vbar()` is the
+supported way to write host data into AIMDO VBAR storage; integrations must use
+it instead of calling `Tensor.copy_` directly.
+
+The helper takes the fallback route only when the request is Windows XPU,
+CPU source to XPU destination, contiguous with identical shape and dtype,
+1 byte through 2 MiB, inside a fully mapped and pinned VBAR range, and on an
+adapter whose Level Zero node mask is not `0x1`. It then stages through private
+device memory padded past the affected size and writes exactly the requested
+range with a kernel, so padding never touches VBAR. Every other request uses
+the normal copy path.
+
+`AIMDO_XPU_SMALL_VBAR_COPY_FALLBACK` forces the route on with `1` or off with
+`0`. `control.get_xpu_vmm_stats()` reports `small_vbar_copy_fallback_calls`,
+`small_vbar_copy_fallback_bytes`, and `small_vbar_copy_fallback_failures`.
+
 ## Minimal regression check
 
 Run from an environment with the XPU backend built and Torch XPU available:
@@ -135,6 +154,3 @@ behavior under native Torch growth, also run:
 <portable>\python_embeded\python.exe -s `
     tests\repro_windows_xpu_vbar_vs_torch.py --vbar-gib 6 --torch-gib 30
 ```
-
-Dated design evolution, rejected alternatives, and workload evidence are kept
-in `omni-xpu-kernel-tuning/docs/results/bmg/2026-08-12/`.
