@@ -60,13 +60,6 @@ build\python-venv\Scripts\python.exe -m pytest `
     tests\test_xpu_comfyui_opt_in.py -q
 ```
 
-The second-adapter diagnostics have separate build entry points:
-
-```powershell
-cmd /d /c scripts\build-windows-xpu-device-diagnostic.cmd
-cmd /d /c scripts\build-windows-xpu-vmm-copy-diagnostic.cmd
-```
-
 Real-XPU checks must use the same Python, Torch, driver, and native DLL that
 will run ComfyUI. Useful focused entry points include:
 
@@ -74,9 +67,6 @@ will run ComfyUI. Useful focused entry points include:
 <portable>\python_embeded\python.exe -s tests\run_windows_ur_hook_smoke.py
 <portable>\python_embeded\python.exe -s `
     tests\repro_windows_xpu_vbar_vs_torch.py --vbar-gib 6 --torch-gib 30
-<portable>\python_embeded\python.exe -s `
-    tests\repro_windows_xpu_vbar_copy.py --device 1 --pages 5 `
-    --copy-bytes 607744 --workaround
 ```
 
 A component reproducer proves only the path it exercises. A memory-policy
@@ -102,13 +92,11 @@ identically to the DLL packaged in the wheel.
 
 Launch ComfyUI with `--enable-dynamic-vram` and record the selected physical
 adapter, `ZE_AFFINITY_MASK`, reserve, package revisions, and server log window.
-The automated MiniMax H3 media gate is defined in
-[`tests/WINDOWS_H3_ACCEPTANCE.md`](../tests/WINDOWS_H3_ACCEPTANCE.md).
 
 For changes to pressure, reclaim, cache interaction, or residency, a short
 two-step workflow is only a regression smoke test. Run a configuration that
-actually reaches pressure, normally with 20 sampler steps on the recorded H3
-workload, and require all of the following in the same window:
+actually reaches pressure, normally a long video generation at full sampler
+step count, and require all of the following in the same window:
 
 1. output/media correctness;
 2. forward progress without a long unchanged interval;

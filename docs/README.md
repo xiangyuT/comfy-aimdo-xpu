@@ -12,9 +12,6 @@ failed hypotheses, machine-specific timing, or session history.
 | [Windows Unified Runtime allocator hook](WINDOWS_XPU_UR_ALLOCATOR_HOOK.md) | Current Windows hook architecture, lifecycle, configuration, counters, and focused tests |
 | [Windows build and validation](WINDOWS_XPU_BUILD_TEST_ACCEPTANCE.md) | Reproducible native build, runtime identity checks, and validation hierarchy |
 
-The automated MiniMax H3 prompt/media contract is maintained next to its
-runner in [`tests/WINDOWS_H3_ACCEPTANCE.md`](../tests/WINDOWS_H3_ACCEPTANCE.md).
-
 ## Scope
 
 Each document states the behavior the code guarantees today and the checks that
