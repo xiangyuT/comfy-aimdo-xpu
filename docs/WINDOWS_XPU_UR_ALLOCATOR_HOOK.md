@@ -1,578 +1,133 @@
 # Windows XPU Unified Runtime allocator hook
 
-Status: **implemented and component-verified; not validated end to end.** The
-branch is `dev/windows-xpu-native-allocator-hook`, based on the Linux
-`dev/xpu-native-allocator-hook` work with the Windows platform series replayed
-on top. The interception mechanism, the PyTorch retry contract and the
-production control loop are each verified on the recorded Windows environment.
+Windows uses AIMDO's `native_hook` mode by default. PyTorch retains its native
+XPU caching allocator; AIMDO attaches Detours to the Unified Runtime loader
+used by SYCL and arbitrates physical USM growth at `urUSMDeviceAlloc` while
+accounting releases at `urUSMFree`.
 
-Two things block acceptance, and neither is a property of this design:
+Linux and Windows expose the same control interface, but attach differently:
 
-* Wall-clock measurement on this machine is not usable. See section 10: the
-  same build spans 167-282 s on the same workload, and a background driver
-  component holds 40-47 % of the first GPU's 3D engine.
-* The second GPU cannot run the workload at all with DynamicVRAM enabled, for
-  reasons unrelated to allocation arbitration. See
-  [the second-GPU copy failure](WINDOWS_XPU_SECOND_GPU_COPY_FAILURE.md).
+- Linux `native_hook` is an explicit mode and must be interposed before Python
+  starts;
+- Windows resolves the `ur_loader.dll` selected by
+  `ur_win_proxy_loader.dll` and attaches Detours during AIMDO initialization;
+- Linux `global` remains the default Linux mode and replaces PyTorch's XPU
+  allocator with AIMDO's pluggable allocator;
+- Windows never replaces PyTorch's allocator, including when the hook is
+  disabled for diagnosis.
 
-Per the maintenance rule in
-[the liveness analysis](WINDOWS_XPU_VBAR_LIVENESS_ANALYSIS.md), that document's
-unresolved 720p/10s failure is *not* erased by anything recorded here.
+## Initialization contract
 
-This record answers one question: can the Linux
-`dev/xpu-native-allocator-hook` design, which interposes Unified Runtime USM
-allocation entry points, be applied to Windows?
-
-The answer is yes, with one mechanism substitution, one newly discovered hard
-constraint, and one structural advantage over the Windows design currently in
-tree.
-
-## 1. What the Linux branch does
-
-`src-xpu/ur-usm-hook.cpp` on `dev/xpu-native-allocator-hook` builds a shared
-object that exports `urUSMDeviceAlloc` and `urUSMFree` in the
-`LIBUR_LOADER_0.12` version namespace, is injected with `LD_PRELOAD`, and
-recovers the real entry points with `dlvsym(RTLD_NEXT, ...)`. PyTorch keeps its
-native caching allocator. The hook:
-
-1. classifies the caller by walking the stack for `libc10_xpu.so`, so it can
-   tell a PyTorch caching-allocator segment request from a direct SYCL
-   allocation;
-2. asks AIMDO for a budget deficit before the allocation is placed;
-3. when a PyTorch request is over budget, returns a **synthetic**
-   `UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` without calling the real allocator;
-4. lets PyTorch respond by releasing its cached blocks and retrying, then
-   performs the eviction and allows the retry through.
-
-Step 3 and 4 are the whole point. They convert PyTorch's own cache into
-reclaimable memory at the exact moment of pressure.
-
-## 2. The Windows call path is the same, the injection method is not
-
-Windows has no `LD_PRELOAD`, and PE has no symbol versioning. What matters is
-whether the *same function* is still the one PyTorch's allocations flow
-through. It is.
-
-Evidence, taken from the binaries in the recorded Portable environment:
-
-| Fact | Method | Result |
-| --- | --- | --- |
-| `ur_loader.dll` exports flat `urUSMDeviceAlloc`, `urUSMFree` | PE export table | present, among 627 exports |
-| `sycl8.dll` statically imports any `ur*` symbol | PE import table | **no** |
-| `sycl8.dll` imports from `ur_win_proxy_loader.dll` | PE import table | exactly one symbol, `?getPreloadedURLib@@YAPEAXXZ` |
-| `sycl8.dll` contains the string `urUSMDeviceAlloc` | binary scan | yes, 1 occurrence |
-| `sycl8.dll` contains the string `urGetUSMProcAddrTable` | binary scan | **no**, 0 occurrences |
-
-So on Windows the SYCL runtime obtains the `ur_loader.dll` module handle from
-`ur_win_proxy_loader.dll!getPreloadedURLib()` and then resolves the **flat
-exported symbol by name with `GetProcAddress`**. It does not consume the DDI
-proc-address tables. The pointer it holds points directly into
-`ur_loader.dll`'s code section.
-
-This rules out the failure mode that would have killed the port: if SYCL had
-consumed a DDI table populated with the loader's internal functions, patching
-the exported symbol would have intercepted nothing.
-
-### Injection: Detours, and it is strictly easier than LD_PRELOAD
-
-The correct substitution is Microsoft Detours, patching the prologue of
-`ur_loader.dll!urUSMDeviceAlloc` in the loaded image. `src-xpu/ze-detour.c`
-already does exactly this for `ze_loader.dll`, so no new tooling is required.
-
-Detours is not merely an adequate replacement, it is a better one here:
-
-* Inline patching rewrites the function body, so a pointer SYCL captured
-  *before* the patch still lands in the hook. The Linux prototype must be
-  loaded before the process starts and `control.py` currently rejects the
-  configuration otherwise; on Windows the hook can be installed from
-  `control.init()` at any point before the allocations that matter.
-* Nothing has to be exported from `aimdo_xpu.dll`, so `src-xpu/ur-usm-hook.map`
-  needs no Windows equivalent and there is no risk of AIMDO's exports colliding
-  with the loader's.
-
-### Resolving the right module
-
-`GetModuleHandleA("ur_win_proxy_loader.dll")` returns NULL in a live PyTorch
-XPU process even though the module *is* loaded; the proxy must be found by
-walking the module list. `GetModuleHandleA("ur_loader.dll")` does resolve.
-
-The probe therefore does both and compares them. Measured result:
-`getPreloadedURLib()` returns `0x7ffc1a760000`, and `GetModuleHandleA(
-"ur_loader.dll")` returns the same value. The by-name lookup is correct here,
-and the proxy call is retained as the authoritative cross-check because a
-process may in principle hold more than one `ur_loader.dll`.
-
-## 3. The experiment
-
-Built by `scripts/build-windows-ur-probe.cmd` from
-`tests/ur_usm_detour_probe.c`; driven by `tests/run_windows_ur_hook_probe.py`.
-The probe only counts, classifies and can inject one synthetic failure. It
-never evicts and never calls into AIMDO, so a pass says nothing about memory
-policy - only about mechanism.
-
-```powershell
-scripts\build-windows-ur-probe.cmd
-<portable>\python_embeded\python.exe -s tests\run_windows_ur_hook_probe.py
-```
-
-Environment: Intel Arc Pro B70, driver `32.0.101.8515`, ComfyUI Portable with
-`torch 2.12.0+xpu`, Python 3.13, `ur_loader.dll` and `sycl8.dll` from
-`python_embeded\Library\bin`, `ze_loader.dll` from the driver.
-
-### Result: 12/12 checks pass, reproduced on two consecutive runs
-
-| Check | Result | Evidence |
-| --- | --- | --- |
-| 1. Detours attaches in a live process | PASS | hooked `python_embeded\Library\bin\ur_loader.dll` after `import torch` |
-| 1b. hooked module is the one SYCL uses | PASS | `resolved_via_proxy=1`, `proxy_agrees_with_byname=1` |
-| 2. torch allocations reach the entry point | PASS | `alloc_calls` advanced |
-| 3. caller classified via `c10_xpu.dll` | PASS | stack below |
-| 3b. request size matches the tensor | PASS | `last_alloc_size=536870912` |
-| 3c. a non-torch caller is not misread | PASS | replayed allocation counted as `other`, not `torch_native` |
-| 4a. torch holds cached blocks | PASS | 384 MiB cached |
-| 4b. synthetic OOM delivered | PASS | `synthetic_oom_calls=1` |
-| 4c. torch released its cache in response | PASS | `frees_between_oom_and_retry=6`, 384 MiB |
-| 4d. torch retried the same request | PASS | `retry_alloc_calls=1` |
-| 4e. the allocation succeeded | PASS | no exception raised |
-| 4f. the memory is usable | PASS | write/read back verified |
-
-The intercepted stack, which is the direct Windows analogue of the Linux
-`libc10_xpu.so` check:
+Import Torch before initializing AIMDO so the Unified Runtime loader exists.
+ComfyUI must explicitly enable DynamicVRAM on XPU:
 
 ```text
-ur_usm_detour_probe.dll <- sycl8.dll <- sycl8.dll <- sycl8.dll
-  <- c10_xpu.dll <- c10_xpu.dll <- c10_xpu.dll <- c10_xpu.dll
-  <- c10.dll <- torch_cpu.dll <- ... <- torch_python.dll <- python313.dll
+--enable-dynamic-vram --reserve-vram <GiB>
 ```
 
-`RtlCaptureStackBackTrace` plus `GetModuleHandleExW(
-GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, ...)` is the working equivalent of
-`backtrace()`/`dladdr()`. It uses x64 unwind tables, not frame pointers, so it
-does not depend on how the intervening modules were optimised.
+Standalone callers may select the mode explicitly:
 
-The negative control matters: the probe replays a device allocation through the
-public entry point from its own module, using the context and device handles
-captured from a real PyTorch request. That call is classified `other`, so check
-3 is discriminating rather than vacuous.
+```python
+from comfy_aimdo import control
 
-### Claim 4 is the load-bearing result
+control.init(
+    implementation="xpu",
+    simple_vram_headroom=4 << 30,
+    xpu_allocator_mode="native_hook",
+)
+control.init_devices([0])
+```
 
-`XPUCachingAllocator::malloc` reacts to a failed `alloc_block` by calling
-`release_cached_blocks()` and retrying once before raising. The measurement
-confirms every step on Windows: one synthetic failure, six real `urUSMFree`
-calls totalling 384 MiB in between, one retry of the identical size, success,
-and usable memory.
+`init()` attaches or verifies the hook. `init_devices()` publishes the active
+SYCL queues and enables arbitration only after the device contexts are ready.
+`deinit()` drains Torch's cache, synchronizes, disables arbitration, and then
+tears down AIMDO state. PyTorch remains the owner of its allocations for the
+whole process.
 
-This is significant beyond porting, but its scope is narrower than it first
-appears, and section 9 records the measurement that establishes the limit.
-`XPU_PLATFORM_MEMORY_POLICY.md` records that PyTorch's freed-but-cached blocks
-"never reach `zeMemFree`, so the allocation hook cannot see them", which is why
-Windows needs `AIMDO_XPU_NATIVE_CACHE_TRIM` to call `empty_cache()` from the
-fault boundary. The synthetic OOM addresses that **only while PyTorch is the
-allocator**. It does not help when AIMDO's own VBAR fault needs memory, because
-a fault allocates no USM and the hook never runs.
+`expandable_segments` is rejected in `native_hook` mode. That PyTorch path
+backs virtual reservations with `urPhysicalMemCreate` and bypasses
+`urUSMDeviceAlloc`, so accepting it would silently disable arbitration.
 
-## 4. Newly discovered hard constraint: expandable segments
+## Allocation policy
 
-`PYTORCH_ALLOC_CONF=expandable_segments:True` was tested because it was
-identified as a risk to the retry contract. The measured result is more severe
-than a broken retry.
+The hook distinguishes PyTorch cache growth from direct SYCL callers.
 
-| Configuration | `urUSMDeviceAlloc` | `urPhysicalMemCreate` | `urVirtualMemMap` |
-| --- | ---: | ---: | ---: |
-| default | 11 calls, 10 of them PyTorch | 0 | 0 |
-| `expandable_segments:True` | **0 calls** | 53 calls, 1.02 GiB | 53 calls |
-
-With expandable segments enabled, PyTorch does not allocate USM at all. It
-reserves virtual address space and backs it with physical memory objects, the
-same primitive family AIMDO's own VBAR uses. A USM hook is not merely degraded,
-it is **completely blind**, and every check that depends on seeing an
-allocation fails.
-
-Consequences for the port:
-
-* The design is valid for the default configuration, which is expandable
-  segments off.
-* AIMDO must detect the setting and refuse to claim arbitration rather than
-  silently observing nothing. Silent blindness is the failure mode this
-  investigation has already been burned by twice.
-* If expandable segments must ever be supported, `urPhysicalMemCreate` is the
-  equivalent interception point and it carries the size argument.
-
-## 5. Why this addresses the two recorded Windows root causes
-
-### Re-entrant reclaim, the cause of `DEVICE_LOST`
-
-`ze-detour.c` documents that releasing a VBAR page from inside
-`zeMemAllocDevice` re-enters Level Zero's own memory management and corrupts
-driver state, which is why reclaim was moved to *after* the driver call
-returns. That ordering compromise is the reason arbitration is late.
-
-A UR hook sits above the driver:
+For a PyTorch allocation that would exceed the current budget:
 
 ```text
-ur_loader.dll!urUSMDeviceAlloc      <- AIMDO decides here
-  -> ur_adapter_level_zero.dll
-    -> ze_loader.dll!zeMemAllocDevice   <- driver allocation happens here
+urUSMDeviceAlloc request
+  -> sample deficit without waiting
+  -> if Torch has reclaimable cached bytes, return one synthetic OOM
+  -> PyTorch releases its cache and retries
+  -> reclaim only the residual deficit from unpinned VBAR pages
+  -> call the real Unified Runtime allocation
+  -> account the physical segment
 ```
 
-When the hook returns a synthetic failure it has not called the adapter at all,
-and when it evicts on the retry it does so between two separate UR calls with
-no driver allocation in flight on that thread. `zeVirtualMemUnmap` and
-`zePhysicalMemDestroy` are then ordinary calls, not re-entrant ones. The
-ordering gap closes without reintroducing the corruption.
+For a direct non-PyTorch SYCL allocation, AIMDO may reclaim eligible VBAR
+pages but does not inject a synthetic failure into an unknown caller.
 
-### Blocking reclaim, the cause of the removed allocator experiment's failure
+The hook body must never wait on a SYCL queue and must not perform re-entrant
+driver memory management. Reclaim is best effort and limited to pages whose
+retirement is already proven by previously submitted queue barriers. Windows
+USM can spill to WDDM non-local memory; explicit VBAR physical pages cannot,
+so VBAR yields first when pressure requires it.
 
-The earlier "removed allocation-time allocator experiment" fixed the ordering
-and then failed because it reclaimed by synchronising the whole queue
-(`cuCtxSynchronize` -> `sycl::queue::wait_and_throw`), which cannot complete a
-formal prompt.
+The hook covers the direction where PyTorch requests memory. It does not run
+when an AIMDO VBAR fault needs memory while Torch holds freed blocks in its
+cache. The rate-limited fault-boundary native-cache trim remains necessary for
+that reverse direction.
 
-That is already solved in tree, separately: `vbars_free_retired()` releases only
-epoch-retired pages and returns immediately. The two halves have never been
-combined, because they live on different branches. This is the first design in
-which allocation-time ordering and non-blocking reclaim can both hold.
+## Configuration
 
-## 6. Branch strategy
-
-The two lines of work did not share history:
-
-| Work | Where it was |
+| Setting | Meaning |
 | --- | --- |
-| UR USM hook, synthetic OOM, retry contract | `origin/dev/xpu-native-allocator-hook`, based on `origin/master`, containing **no** Windows code |
-| Windows Detours, epoch retirement, WDDM reserve, VBAR reopen | `dev/windows-xpu-usm-free-hang`, 13 commits on the same base |
+| `AIMDO_XPU_ALLOCATOR_MODE=native_hook` | Select the retained-native-allocator path explicitly |
+| `AIMDO_XPU_DISABLE_UR_HOOK=1` | Disable the Windows UR hook and use the diagnostic fallback path |
+| `AIMDO_XPU_NATIVE_CACHE_TRIM=0` | Disable fault-boundary `torch.xpu.empty_cache()` recovery |
+| `AIMDO_XPU_ENABLE_ALLOCATION_TRACING=1` | Enable the heavier Level Zero tracing path for diagnosis only |
+| `AIMDO_XPU_ALLOCATION_TRACE=1` | Log native allocation activity |
 
-`origin/master` is exactly the merge base of both, so the fork is clean. The
-chosen strategy is to treat the Linux branch as the new base and replay the
-Windows platform series onto it:
+Do not enable allocation tracing for performance measurements.
 
-```text
-origin/dev/xpu-native-allocator-hook   (Linux UR hook, new base)
-  + 13 replayed Windows commits        (platform support, unchanged intent)
-  + Windows UR arbitration             (this design)
-= dev/windows-xpu-native-allocator-hook
-```
+## Counters and timing
 
-Only four files needed conflict resolution: `README.md`,
-`comfy_aimdo/control.py`, `src-xpu/dispatch.cpp` and `src-xpu/stubs.c`. The
-two real conflicts were both additive - the native-hook teardown next to the
-Windows `torch.xpu.empty_cache()` teardown, and `device_from_native_handle()`
-next to `aimdo_xpu_note_queue()` - and both sides were kept.
+`control.get_xpu_ur_hook_stats()` reports allocation/free calls, tracked and
+pass-through bytes, synthetic/runtime OOMs, native-cache reclaim, residual
+VBAR eviction, unknown devices/frees, direct pressure, and metadata failures.
+Windows additionally reports physical-memory-create calls and cache-lever
+skips.
 
-The old `dev/windows-xpu-usm-free-hang` branch is reference material only. It
-is not merged and should not be.
+`control.get_xpu_ur_hook_timing()` reports total time inside the hook and
+caller-classification time separately. Hook time includes the real driver call
+being wrapped; use the decision counters to distinguish hook overhead from the
+downstream cost of cache release or VBAR eviction.
 
-## 7. What was implemented
+## Validation
 
-`src-xpu/ur-usm-detour.c` is the Windows counterpart of
-`src-xpu/ur-usm-hook.cpp`. It exports the same four control symbols, so
-`comfy_aimdo/control.py` drives both platforms through one interface:
-
-| Symbol | Linux meaning | Windows meaning |
-| --- | --- | --- |
-| `xpu_ur_hook_is_interposed` | the dynamic linker bound the symbol to AIMDO | Detours patched the entry point, attaching on demand |
-| `xpu_ur_hook_enable` | begin arbitrating | begin arbitrating |
-| `xpu_ur_hook_disable` | stop, refusing while tracked segments are live | same |
-| `xpu_ur_hook_get_stats` | 19 counters | the same 19, plus `physical_mem_create_calls` |
-
-The hook body mirrors the Linux logic: pass through when disabled, resolve the
-AIMDO device through `urDeviceGetNativeHandle`, ask
-`aimdo_xpu_allocation_deficit()`, classify the caller, return a synthetic
-`UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` for an over-budget PyTorch request, and
-evict on the matching retry. The shared C ABI
-(`aimdo_xpu_allocation_deficit`, `aimdo_xpu_evict_for_allocation`,
-`aimdo_xpu_account_allocation`, `xpu_device_from_native_handle`) is used
-unchanged.
-
-Three Windows-specific decisions:
-
-* `aimdo_xpu_evict_for_allocation()` routes to `vbars_free_retired()` on
-  Windows. Nothing on an allocation path may wait on the compute queue, and
-  that queue may be blocked behind work needing the residency being requested.
-  Linux keeps its exact `vbars_free()` because its arbitration must satisfy the
-  request.
-* `ze-detour.c` hands arbitration over. When the UR hook attaches, the
-  `zeMemAllocDevice` detour stops sampling and reclaiming and only accounts, so
-  two control loops never run against the same pressure. If the UR hook fails
-  to attach, the old post-allocation behaviour remains as the fallback, and
-  `AIMDO_XPU_DISABLE_UR_HOOK=1` forces it.
-* `control.py` defaults Windows to `native_hook` mode and **refuses to start**
-  when `expandable_segments` is enabled, rather than attaching a hook that
-  would observe nothing.
-
-## 8. Production verification
-
-`tests/run_windows_ur_hook_smoke.py` exercises the real
-`comfy_aimdo.control` path rather than a standalone probe.
-
-Without pressure, with a 512 MiB reserve and three 512 MiB tensors:
-
-| Check | Result |
-| --- | --- |
-| Windows selects `native_hook` | PASS |
-| torch allocations reach AIMDO's hook | PASS, 3 calls |
-| tracked and accounted, not passed through | PASS, 1536 MiB, `pass_through_alloc_calls=0` |
-| device resolved for every request | PASS, `unknown_device_calls=0` |
-| releases observed and credited | PASS, 1536 MiB |
-| accounting balances after `empty_cache()` | PASS, alloc bytes == free bytes exactly |
-| clean detach | PASS |
-
-Under real budget pressure, with a 28 GiB reserve on a 31 GiB device and three
-2 GiB tensors, the complete arbitration loop runs:
-
-| Counter | Value |
-| --- | ---: |
-| `alloc_calls` | 5 |
-| `synthetic_oom_calls` | 2 |
-| `retry_eviction_calls` | 2 |
-| `retry_eviction_bytes` | 8.91 GiB |
-| `tracked_alloc_calls` | 3 |
-| `pass_through_alloc_calls` | 0 |
-
-Two over-budget requests were refused, PyTorch retried both, eviction ran on
-the retry, and all three allocations ultimately succeeded with balanced
-accounting. That is the full path - deficit detection, caller classification,
-synthetic failure, PyTorch retry, eviction, allocation - running in production
-code.
-
-## 9. Real pressure test, and the claim it refuted
-
-The verification above creates pressure with an inflated reserve on a device
-holding no VBAR working set, so it proves the control loop executes and nothing
-more. `tests/repro_windows_xpu_vbar_vs_torch.py` is the real test: a 6 GiB VBAR
-working set of 192 pages competing with a 30 GiB native Torch ramp on a 31 GiB
-device.
+The no-device unit test covers attach lifecycle, caller classification,
+synthetic retry, accounting, multi-thread interception, and timing:
 
 ```powershell
-<portable>\python_embeded\python.exe -s `
-    tests\repro_windows_xpu_vbar_vs_torch.py --vbar-gib 6 --torch-gib 30
+cmd /d /c scripts\test-windows-xpu-hook.cmd
 ```
 
-| Phase | VBAR resident | Torch cached | unmaps | synthetic OOM | retry evictions |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| idle device | 6144 MiB | 0 | 0 | 0 | 0 |
-| Torch ramp applied | 0 MiB | 30720 MiB | - | 71 | 71 |
-| VBAR faults while Torch holds memory | 32 MiB | 30720 MiB | 383 | 71 | 71 |
-| after `del blocks`, no `empty_cache()` | 32 MiB | 30720 MiB | 575 | 71 | 71 |
-| after `torch.xpu.empty_cache()` | 6144 MiB | 256 MiB | 575 | 71 | 71 |
-
-### What passed
-
-Allocation-time arbitration works under real competition. The hook fired 71
-times during the Torch ramp and evicted on every retry, releasing the whole
-6 GiB VBAR ahead of Torch's growth. Torch recorded **zero** allocation
-failures, and there was no `DEVICE_LOST` and no driver instability - which is
-the specific failure that the `zeMemAllocDevice` arbitration could not avoid.
-
-### What failed: the synthetic OOM does not subsume the cache trim
-
-Section 3 of an earlier revision of this document claimed the synthetic OOM
-"removes that entire workaround" and that `AIMDO_XPU_NATIVE_CACHE_TRIM` could
-therefore be retired. **That claim is false, and this measurement refutes it.**
-
-In the fourth phase Torch holds 30,720 MiB in its own cache and AIMDO's VBAR
-faults recover only 32 MiB. The synthetic OOM counter does not move at all
-between the third and fourth phases: it stays at 71. `empty_cache()` then
-recovers the full 6144 MiB immediately.
-
-The reason is structural rather than a tuning problem. The hook lives inside
-`urUSMDeviceAlloc`, so it only runs when **PyTorch** is allocating. A VBAR
-fault allocates no USM at all - it creates Level Zero physical memory and maps
-it - so when AIMDO is the party that needs memory and Torch is the party
-holding it, the hook is never entered and Torch is never asked to release
-anything. `AIMDO_XPU_NATIVE_CACHE_TRIM` must therefore be **retained**; it
-covers the exact direction the hook cannot.
-
-`native_reclaim_free_calls` also stayed at 0 for the whole run. During the ramp
-PyTorch was allocating fresh blocks and had no cache to release, so every
-synthetic failure was answered by AIMDO evicting VBAR pages rather than by
-Torch returning memory. The cache-return benefit demonstrated by the standalone
-probe did not occur even once in this workload.
-
-### What is unchanged: the map/unmap thrash
-
-The third phase issues 383 unmaps for 192 pages in a single pass and settles at
-32 MiB resident. That is the same signature as the livelock recorded in the
-liveness analysis, and this branch does not change it. Moving the interception
-point does not address admission or watermark policy, exactly as predicted.
-
-### A defect this test found
-
-`xpu_ur_hook_disable()` originally refused while tracked segments were live,
-copying the Linux invariant. That invariant does not transfer: on Linux AIMDO
-*is* Torch's allocator, so a live segment means its own accounting would be
-lost, while on Windows the hook merely observes allocations PyTorch owns and
-legitimately retains across `empty_cache()`. The result was that
-`control.deinit()` raised in any process that had ever allocated. Windows now
-drops the tracking table and reports the count instead.
-
-## 10. Performance measurements are invalid on this environment
-
-An earlier revision of this section attributed a gradient-ladder regression to
-the synthetic OOM and to the caller classification, on the strength of single
-wall-clock runs. **Those attributions are withdrawn.** Repeating the identical
-configuration on the identical build produced:
-
-```text
-167.5  181.0  188.1  239.4  243.0  247.3  248.1  254.1  259.5  271.5  277.8  281.6
-```
-
-The spread is 114 s on a run that takes about four minutes, and it is bimodal
-rather than noisy, with nothing between 190 s and 240 s. Every figure used for
-the original attribution falls inside that spread, so none of the comparisons
-were valid.
-
-Two environment facts were then measured and explain why this machine cannot
-resolve an allocator change by wall clock:
-
-* A background driver component holds **40-47 % of the 3D engine** on the first
-  GPU continuously, including while idle. What was read as "the workload only
-  reaches 42 % GPU utilisation" was largely that component.
-* Pinning the server to the 8 performance cores and raising its priority does
-  not converge the spread (247.6 / 169.1 / 249.4, cv 20.7 %). The efficiency
-  classes were read from `GetSystemCpuSetInformation`; an earlier reading based
-  on an idle frequency snapshot had them backwards.
-
-`tests/run_windows_h3_acceptance.py` also returns in about 4 s when ComfyUI
-serves a cached execution, which silently produces invalid samples unless the
-seed is varied.
-
-### What was measured directly, and is therefore still valid
-
-Sampling AIMDO's own counters from inside the server over a complete 294 s
-prompt, rather than differencing wall-clock times:
-
-| Counter | Value over one prompt |
-| --- | ---: |
-| time inside the allocation hook | 973 ms, **0.331 %** of wall time |
-| hook calls | 50 |
-| synthetic OOM | 0 |
-| retry evictions | 0 |
-| host-to-device bytes | 37,143 MiB for a 19,995 MiB model, **1.86x** |
-| map / unmap | 39,040 / 13,568 MiB |
-
-The hook cannot account for a per-iteration difference of seconds. The traffic
-that can is the weight streaming, which moves 1.86 times the model size per
-prompt.
-
-The classification change in this branch is still justified on its own
-measurement - 2665 ns to 814 ns at the 38-frame stack depth a real PyTorch
-allocation has, from `tests/ur_usm_detour_unit.c` - but its end-to-end effect
-was never established and should not be claimed.
-
-## 11. Remaining plan
-
-Phase A - **done, and it changed the design.** See section 9.
-
-Phase B - `AIMDO_XPU_NATIVE_CACHE_TRIM` is **retained**, not retired. The two
-mechanisms cover opposite directions and both are required: the synthetic OOM
-when PyTorch allocates, the fault-boundary trim when AIMDO faults. What remains
-is to check they do not oscillate against each other under sustained pressure.
-
-Phase C - **obtain a measurable environment.** This is now the first blocker,
-not the last. Either quiesce the background component holding 40-47 % of the
-first GPU, or fix the second-GPU copy failure so a clean adapter can be used.
-Until then no wall-clock comparison on this machine means anything; use the
-in-process counters instead.
-
-Phase D - the synthetic OOM already skips requests PyTorch cannot answer, which
-removed 71 of 71 wasted refusals in the VBAR pressure reproducer and cut the
-extra driver allocations in the allocation benchmark from 1.93x to 1.25x. What
-is still unmeasured is its cost when the cache *is* present, because that
-requires Phase C.
-
-Phase E - investigate whether the fault path needs its own way to demand memory
-from PyTorch, since the trim is rate limited and best effort. The measured
-32 MiB against 30 GiB of cache suggests the current trim is far too weak at
-that boundary.
-
-Phase F - the gradient ladder, in full, once Phase C makes its timings
-interpretable. Only step 3 or above may be reported as a fix.
-
-## 12. What this does not establish
-
-1. **No interpretable end-to-end timing exists on this machine** (section 10),
-   and the second GPU cannot run the workload at all with DynamicVRAM enabled
-   ([second-GPU copy failure](WINDOWS_XPU_SECOND_GPU_COPY_FAILURE.md)). The
-   720p/10s livelock in the liveness analysis is an admission and watermark
-   policy problem, and section 9 shows the map/unmap thrash is still present.
-   Presenting any of this as a fix for that failure would be the third
-   occurrence of the method failure that document records - and section 9 is
-   itself a fourth occurrence caught early, because this document did claim the
-   cache trim was subsumed before it was measured, while section 10 is a fifth,
-   caught only after single-run timings had already been written down as
-   attributions.
-2. `native_reclaim_free_calls` has never been observed nonzero outside the
-   standalone probe. The mechanism is proven to exist; its usefulness in a real
-   allocation pattern is not.
-3. Eviction was exercised against a synthetic VBAR working set of uniform
-   32 MiB pages, not a real model with real access order.
-4. Multi-threaded attach was not exercised. `DetourUpdateThread` was called for
-   the installing thread only, which is safe when hooks are installed before the
-   worker threads allocate but is not a validated policy for attaching to a busy
-   process.
-5. Only one device was measured, and only the default allocator configuration.
-6. Interaction with other software that hooks the same UR or Level Zero entry
-   points was not tested.
-7. The Linux build was not compiled on this machine. The change to
-   `aimdo_xpu_evict_for_allocation()` is guarded so Linux keeps `vbars_free()`,
-   but that has not been verified by a Linux build.
-
-## 13. Reproducing
+The production smoke and VBAR competition checks require a Portable XPU
+runtime:
 
 ```powershell
-scripts\build-windows-xpu.cmd
-scripts\build-windows-ur-probe.cmd
-
-rem mechanism, standalone probe, no AIMDO involved
-<portable>\python_embeded\python.exe -s tests\run_windows_ur_hook_probe.py
-
-rem production control loop
 <portable>\python_embeded\python.exe -s tests\run_windows_ur_hook_smoke.py
-<portable>\python_embeded\python.exe -s tests\run_windows_ur_hook_smoke.py `
-    --reserve-mib 28000 --alloc-mib 2048
-
-rem real competition between a VBAR working set and a native Torch ramp
 <portable>\python_embeded\python.exe -s `
     tests\repro_windows_xpu_vbar_vs_torch.py --vbar-gib 6 --torch-gib 30
-
-rem integration: install into Portable first, then run the ladder
-$env:SETUPTOOLS_SCM_PRETEND_VERSION = "0.4.15.dev1"
-build\python-venv\Scripts\python.exe -m build --wheel --no-isolation `
-    --outdir build\wheel-ur-hook-dev1
-Remove-Item Env:SETUPTOOLS_SCM_PRETEND_VERSION
-<portable>\python_embeded\python.exe -s -m pip install `
-    --force-reinstall --no-deps build\wheel-ur-hook-dev1\comfy_aimdo-*.whl
-<portable>\python_embeded\python.exe -s tests\run_windows_h3_acceptance.py `
-    --server http://127.0.0.1:8188 --output-root <portable>\ComfyUI\output `
-    --width 864 --height 480 --frames 124 --steps 20 --runs 1
-
-rem unit test and classification timing, no device needed
-scripts\test-windows-xpu-hook.cmd
-
-rem attribute the hook's cost between overhead and its decisions
-<portable>\python_embeded\python.exe -s tests\benchmark_windows_ur_hook.py `
-    --pressure-reserve-mib 31500
-
-rem the expandable segments constraint, which must fail
-$env:PYTORCH_ALLOC_CONF = "expandable_segments:True"
-<portable>\python_embeded\python.exe -s tests\run_windows_ur_hook_probe.py
 ```
 
-The installed DLL must hash identically to `comfy_aimdo\aimdo_xpu.dll` from the
-build, and the server log must contain `arbitrating Unified Runtime USM
-allocations` together with the expected version, or the run is testing a
-different build. Both were confirmed for the measurements recorded here.
+Verify the loaded package/DLL identity before interpreting the counters. A
+real workload is still required for any end-to-end performance or liveness
+claim.
 
-The first three must print `RESULT: PASS`. The reproducer must complete without
-a fault error and reproduce the table in section 9, including the fourth phase
-in which VBAR residency does *not* recover. The last must fail checks 2, 3, 3c
-and 4b-4d while reporting nonzero `physical_mem_create_calls`; that failure is
-the expected, documented behaviour, and `control.init()` refuses the
-configuration outright.
+## Development history
 
-## Maintenance rule
-
-The same rule as the liveness analysis applies. Append revision-specific
-evidence; do not let a component pass overwrite a workload failure.
+The prototype sequence, rejected designs, measured counter tables, invalidated
+performance attributions, and remaining hypotheses are preserved in
+`omni-xpu-kernel-tuning/docs/results/bmg/2026-08-12/`. This file is only the
+current implementation contract.
