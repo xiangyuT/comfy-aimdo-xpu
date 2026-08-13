@@ -98,25 +98,21 @@ class CUDAPluggableAllocator(torch.cuda.memory.CUDAPluggableAllocator):
 class XPUPluggableAllocator(torch.xpu.memory.XPUPluggableAllocator):
     """Construct the XPU allocator from AIMDO's already-loaded library."""
 
-    def __init__(self, raw_segments=False):
-        alloc_name = "xpu_raw_alloc_fn" if raw_segments else "xpu_alloc_fn"
-        free_name = "xpu_raw_free_fn" if raw_segments else "xpu_free_fn"
+    def __init__(self):
         alloc_fn = ctypes.cast(
-            getattr(control.lib, alloc_name), ctypes.c_void_p).value
+            getattr(control.lib, "xpu_alloc_fn"), ctypes.c_void_p).value
         free_fn = ctypes.cast(
-            getattr(control.lib, free_name), ctypes.c_void_p).value
+            getattr(control.lib, "xpu_free_fn"), ctypes.c_void_p).value
         assert alloc_fn is not None
         assert free_fn is not None
         self._allocator = torch._C._xpu_customAllocator(alloc_fn, free_fn)
 
-def get_torch_allocator(raw_segments=False):
-    # In native-pool mode the callbacks own only raw native segments. Pool
-    # routing and pressure-lifecycle validation remain the caller's job.
+def get_torch_allocator():
     if control.implementation == "xpu":
         return (
             None
             if control.lib is None
-            else XPUPluggableAllocator(raw_segments=raw_segments)
+            else XPUPluggableAllocator()
         )
     logging.warning(f"WARNING: Aimdo+CUDAPluggableAllocator is experimental and unsupported.")
     return None if control.lib is None else CUDAPluggableAllocator()
