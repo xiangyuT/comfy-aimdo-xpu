@@ -30,6 +30,8 @@ def main():
     parser.add_argument("--copy-bytes", type=int, default=607744,
                         help="size ComfyUI was copying when it failed")
     parser.add_argument("--reserve-mib", type=int, default=4096)
+    parser.add_argument("--workaround", action="store_true",
+                        help="use AIMDO's safe small-copy path")
     args = parser.parse_args()
 
     from comfy_aimdo import control
@@ -44,7 +46,7 @@ def main():
         raise SystemExit("control.init_devices() failed")
 
     from comfy_aimdo.model_vbar import ModelVBAR, vbar_fault, vbar_unpin
-    from comfy_aimdo.torch import aimdo_to_tensor
+    from comfy_aimdo.torch import aimdo_to_tensor, copy_to_vbar
 
     device = torch.device("xpu", args.device)
     vbar = ModelVBAR(args.pages * VBAR_PAGE_SIZE, device=args.device)
@@ -63,8 +65,16 @@ def main():
         destination = aimdo_to_tensor(allocation, device)
         view = destination.view(torch.uint8)[: args.copy_bytes]
         try:
-            view.copy_(source, non_blocking=True)
+            if args.workaround:
+                copy_to_vbar(view, source, non_blocking=True)
+            else:
+                view.copy_(source, non_blocking=True)
             torch.xpu.synchronize()
+            if args.workaround:
+                read_size = max(args.copy_bytes, 2 * MIB + 1)
+                readback = destination[:read_size].cpu()
+                if not torch.equal(readback[:args.copy_bytes], source):
+                    raise RuntimeError("VBAR copy verification failed")
         except Exception as error:
             failures += 1
             print(f"  page {index}: COPY FAILED "
@@ -73,7 +83,10 @@ def main():
                 break
         vbar_unpin(allocation)
 
-    print(f"pages={args.pages} copy_failures={failures}")
+    print(f"pages={args.pages} copy_failures={failures} "
+          f"workaround={args.workaround}")
+    if args.workaround:
+        print(f"vmm_stats={control.get_xpu_vmm_stats()}")
     control.deinit()
     return 1 if failures else 0
 

@@ -81,6 +81,9 @@ enum XpuStat : size_t {
     kTorchAllocatorPhysicalAllocBytes,
     kTorchAllocatorPhysicalReleaseCalls,
     kTorchAllocatorPhysicalReleaseBytes,
+    kSmallVbarCopyFallbackCalls,
+    kSmallVbarCopyFallbackBytes,
+    kSmallVbarCopyFallbackFailures,
     kXpuStatCount,
 };
 
@@ -1365,6 +1368,151 @@ AIMDO_XPU_EXPORT bool xpu_set_queues(
         g_devices.clear();
         return false;
     }
+}
+
+/* Work around a Windows driver failure on the second B70 adapter.
+ *
+ * A host-to-VMM copy of 2 MiB or less is rejected with
+ * ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY even when the destination is mapped,
+ * pinned and more than 31 GiB is free. The same transfer at 2 MiB + 1 byte
+ * succeeds, and a kernel can write the VMM mapping. Pad only the transfer into
+ * a private device staging allocation, then have a kernel write exactly the
+ * requested destination range. Unlike padding the destination copy, this
+ * cannot overwrite an adjacent VBAR allocation.
+ *
+ * Call this above the failing torch/UR copy, after the source is ready and the
+ * destination range has been faulted and pinned. The operation is synchronous
+ * so the temporary allocations and source can be released on return. */
+extern "C" AIMDO_XPU_EXPORT bool aimdo_xpu_copy_host_to_vbar(
+    void *destination, const void *source, size_t size, int device) {
+    constexpr size_t kBrokenCopyMaximum = 2ULL * 1024 * 1024;
+    constexpr size_t kSafeStagingSize = kBrokenCopyMaximum + 1;
+    auto *state = find_device(device);
+    unsigned char *host_staging = nullptr;
+    unsigned char *device_staging = nullptr;
+    bool copied = false;
+    const char *stage = "validate";
+
+    if (!state || !destination || !source || size == 0 ||
+        size > kBrokenCopyMaximum) {
+        return false;
+    }
+    g_stats[kSmallVbarCopyFallbackCalls].fetch_add(
+        1, std::memory_order_relaxed);
+    try {
+        stage = "host_alloc";
+        host_staging = sycl::malloc_host<unsigned char>(
+            kSafeStagingSize, *state->queue);
+        stage = "device_alloc";
+        device_staging = sycl::malloc_device<unsigned char>(
+            kSafeStagingSize, *state->queue);
+        if (!host_staging || !device_staging) {
+            throw std::bad_alloc();
+        }
+
+        std::memset(host_staging, 0, kSafeStagingSize);
+        std::memcpy(host_staging, source, size);
+        stage = "padded_h2d";
+        state->queue->memcpy(device_staging, host_staging,
+                             kSafeStagingSize).wait_and_throw();
+
+        auto *bytes_out = static_cast<unsigned char *>(destination);
+        const auto *bytes_in = device_staging;
+        stage = "exact_kernel";
+        state->queue->parallel_for(
+            sycl::range<1>(size),
+            [=](sycl::id<1> index) {
+                bytes_out[index] = bytes_in[index];
+            }).wait_and_throw();
+        copied = true;
+    } catch (const sycl::exception &error) {
+        std::fprintf(stderr,
+                     "[AIMDO XPU ERROR] small VBAR copy fallback failed: "
+                     "stage=%s destination=%p size=%zu message=%s\n",
+                     stage, destination, size, error.what());
+        std::fflush(stderr);
+    } catch (const std::exception &error) {
+        std::fprintf(stderr,
+                     "[AIMDO XPU ERROR] small VBAR copy fallback failed: "
+                     "stage=%s destination=%p size=%zu message=%s\n",
+                     stage, destination, size, error.what());
+        std::fflush(stderr);
+    }
+
+    try {
+        if (device_staging) {
+            sycl::free(device_staging, state->queue->get_context());
+        }
+        if (host_staging) {
+            sycl::free(host_staging, state->queue->get_context());
+        }
+    } catch (...) {
+        /* The copy has already completed synchronously. A cleanup failure
+         * is not allowed to turn a correct tensor write back into the
+         * driver's spurious OOM. */
+    }
+    if (copied) {
+        g_stats[kSmallVbarCopyFallbackBytes].fetch_add(
+            size, std::memory_order_relaxed);
+    } else {
+        g_stats[kSmallVbarCopyFallbackFailures].fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    return copied;
+}
+
+extern "C" AIMDO_XPU_EXPORT bool aimdo_xpu_is_mapped_pinned_vbar(
+    void *address, size_t size) {
+    int mapped = 0;
+    unsigned pin = 0;
+    uint64_t page_index = 0;
+    uint64_t unmapped_page = UINT64_MAX;
+    uint64_t pages_spanned = 0;
+
+    return address && size && aimdo_vbar_describe_range(
+        reinterpret_cast<uint64_t>(address), size, &mapped, &pin,
+        &page_index, &unmapped_page, &pages_spanned) && mapped && pin;
+}
+
+/* The failing adapter reports node mask 0x2 even though its matching DXGI
+ * adapter exposes one D3D12 node; the working adapter reports 0x1. Route the
+ * copy before calling the poisoned driver path, because after the first
+ * rejected small copy even an otherwise safe padded H2D reports
+ * "device or resource busy". The override makes the policy reversible on a
+ * fixed driver and lets diagnostics force it on another adapter. */
+extern "C" AIMDO_XPU_EXPORT bool
+aimdo_xpu_needs_small_vbar_copy_workaround(int device) {
+#if defined(_WIN32) || defined(_WIN64)
+    const char *override_value =
+        std::getenv("AIMDO_XPU_SMALL_VBAR_COPY_FALLBACK");
+    auto *state = find_device(device);
+
+    if (override_value) {
+        if (std::strcmp(override_value, "0") == 0) {
+            return false;
+        }
+        if (std::strcmp(override_value, "1") == 0) {
+            return true;
+        }
+    }
+    if (!state) {
+        return false;
+    }
+    try {
+        const sycl::device sycl_device = state->queue->get_device();
+        if (!sycl_device.has(
+                sycl::aspect::ext_intel_device_info_node_mask)) {
+            return false;
+        }
+        return sycl_device.get_info<
+                   sycl::ext::intel::info::device::node_mask>() != 1;
+    } catch (...) {
+        return false;
+    }
+#else
+    (void)device;
+    return false;
+#endif
 }
 
 AIMDO_XPU_EXPORT int xpu_device_from_native_handle(

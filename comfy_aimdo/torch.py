@@ -1,9 +1,12 @@
 import torch
 import ctypes
+import platform
 
 import logging
 
 from . import control
+
+_SMALL_VBAR_COPY_MAXIMUM = 2 * 1024 * 1024
 
 def get_tensor_from_raw_ptr(ptr, size, device):
     device = torch.device(device)
@@ -39,6 +42,41 @@ def get_tensor_from_raw_ptr(ptr, size, device):
 def aimdo_to_tensor(alloc, device):
     _, ptr, size = alloc
     return get_tensor_from_raw_ptr(ptr, size, device)
+
+def copy_to_vbar(destination, source, non_blocking=False):
+    """Copy a tensor, avoiding the broken small VBAR path on Windows XPU."""
+    size = destination.numel() * destination.element_size()
+    if (
+        control.implementation == "xpu"
+        and platform.system() == "Windows"
+        and control.lib is not None
+        and destination.device.type == "xpu"
+        and source.device.type == "cpu"
+        and 0 < size <= _SMALL_VBAR_COPY_MAXIMUM
+        and destination.dtype == source.dtype
+        and destination.shape == source.shape
+        and destination.is_contiguous()
+        and source.is_contiguous()
+    ):
+        device = destination.device.index
+        if device is None:
+            device = torch.xpu.current_device()
+
+        if (
+            control.lib.aimdo_xpu_is_mapped_pinned_vbar(
+                destination.data_ptr(), size
+            )
+            and control.lib.aimdo_xpu_needs_small_vbar_copy_workaround(device)
+        ):
+            if not control.lib.aimdo_xpu_copy_host_to_vbar(
+                destination.data_ptr(), source.data_ptr(), size, device
+            ):
+                raise RuntimeError(
+                    f"AIMDO failed to copy {size} bytes into XPU VBAR memory"
+                )
+            return destination
+
+    return destination.copy_(source, non_blocking=non_blocking)
 
 def hostbuf_to_tensor(hostbuf):
     byte_view = (ctypes.c_uint8 * hostbuf.size).from_address(hostbuf.get_raw_address())

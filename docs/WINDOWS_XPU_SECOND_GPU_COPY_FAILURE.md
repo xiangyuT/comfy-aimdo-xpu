@@ -1,135 +1,141 @@
-# Windows XPU second-GPU copy failure
+# Windows XPU second-GPU small VBAR copy failure
 
-Status: **unresolved.** The failure is isolated to a one-call reproducer and
-its boundary is measured precisely, but it is not fixed. Five attempted fixes
-were each built, run, and observed to fail; they are recorded here so nobody
-repeats them.
+Status: **workaround implemented and end-to-end validated on 2026-08-13.**
 
-## Symptom
+## Result
 
-With AIMDO DynamicVRAM enabled on the second GPU (`ONEAPI_DEVICE_SELECTOR=level_zero:1`),
-the MiniMax H3 workflow fails about two seconds in, while loading the text
-encoder:
+The second Intel Arc Pro B70 rejects a host-to-VMM memory copy when the copy is
+2 MiB or smaller. The first B70 accepts the same operation. The error is the
+driver's `ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY` (`0x70000003`), not an actual
+memory shortage and not AIMDO's allocation-pressure policy.
+
+AIMDO now avoids that driver path on the affected Windows adapter. It copies a
+2 MiB + 1 byte padded host buffer into private device staging, then launches a
+kernel that writes exactly the requested byte range into VBAR. Padding never
+touches VBAR, so the workaround cannot overwrite a neighboring allocation.
+
+ComfyUI routes both ordinary gathered weights and quantized layout-parameter
+tensors through this operation. The fallback is deliberately limited to:
+
+* Windows XPU;
+* a CPU source and contiguous, same-shape/same-dtype XPU destination;
+* a fully mapped and pinned AIMDO VBAR range;
+* a transfer of 1 through 2 MiB;
+* the adapter reporting a Level Zero node mask other than `0x1`.
+
+`AIMDO_XPU_SMALL_VBAR_COPY_FALLBACK=0` disables the route for a fixed driver;
+setting it to `1` forces the route for diagnostics.
+
+## Original symptom
+
+With DynamicVRAM on the second physical GPU, MiniMax H3 failed about two
+seconds into text-encoder loading:
 
 ```text
-Model MiniMaxH3TEModel_ prepared for dynamic VRAM loading. 14956MB Staged.
-RuntimeError: level_zero backend failed with error: 39 (UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY)
-  comfy/ops.py:217 in cast_maybe_lowvram_patch
-  comfy/model_management.py:1500 in cast_to_gathered
-  comfy_kitchen/tensor/base.py:86 in copy_from -> Tensor.copy_
+RuntimeError: level_zero backend failed with error: 39
+  comfy/ops.py in cast_maybe_lowvram_patch
+  comfy/model_management.py in cast_to_gathered
+  comfy_kitchen/tensor/base.py in copy_from -> Tensor.copy_
 ```
 
-The same workflow completes on the same GPU with `--disable-dynamic-vram`
-(199.4 s), so AIMDO is involved, but see the measurement below: the failing
-operation is a plain `Tensor.copy_` into a VBAR mapping, and no AIMDO
-allocation path is entered.
+The same GPU completed with DynamicVRAM disabled because that path did not copy
+into a Level Zero virtual-memory mapping.
 
-## Reproducer
+## Isolation evidence
 
-`tests/repro_windows_xpu_vbar_copy.py` reduces a four-minute failure that needs
-a 19.5 GiB model to a single 594 KB copy that fails on the first VBAR page:
+`tests/repro_windows_xpu_vbar_copy.py` reduces the failure to one 607,744-byte
+copy. The transfer-size boundary is exact:
+
+| Copy size | Physical GPU 0 | Physical GPU 1 |
+| ---: | --- | --- |
+| 607,744 B | pass | fail |
+| 2 MiB | pass | fail |
+| 2 MiB + 1 B | pass | pass |
+
+At failure, all VBAR pages were mapped and pinned, the source was host USM, the
+queue and mapping shared a Level Zero context, and about 31 GiB remained free.
+Direct immediate Level Zero command lists failed on both the compute and copy
+queue groups with the same raw result, which excludes Unified Runtime and
+PyTorch as the origin of the rejection.
+
+`tests/diagnose_windows_xpu_devices.cpp` found the two adapters equivalent in
+memory properties, command-queue groups, D3D12 node count, and VMM page-size
+queries. Their Level Zero node masks differed:
+
+| Adapter | PCI | LUID | Node mask |
+| --- | --- | --- | ---: |
+| physical GPU 0 | `04:00.0` | `00000000:00016072` | `0x1` |
+| physical GPU 1 | `31:00.0` | `00000000:000163ad` | `0x2` |
+
+The node mask is a reliable selector on this system, not a claim about the
+driver's internal root cause.
+
+## Why the workaround has two stages
+
+The standalone `tests/diagnose_windows_xpu_vmm_copy.cpp` established:
+
+* direct host-to-VBAR copy at or below 2 MiB fails;
+* changing the VMM backing page size does not help;
+* direct Level Zero copies on compute and copy engines both fail;
+* a kernel can write the VBAR mapping;
+* host-to-private-device staging also fails when its transfer is at or below
+  2 MiB on the affected adapter;
+* padding only the private staging transfer to 2 MiB + 1 and then kernel-copying
+  the exact requested range passes with byte verification.
+
+A padded read-modify-write directly against VBAR also passed, but was rejected
+for production because it would race with adjacent allocations. The selected
+algorithm never writes outside the caller's destination range.
+
+An attempted `urEnqueueUSMMemcpy` detour was also rejected. Calling SYCL again
+inside the intercepted UR frame returned `device or resource busy`; moving the
+call to a joined worker deadlocked on the runtime lock. The working route is
+therefore invoked above PyTorch/UR at ComfyUI's AIMDO transfer boundary.
+
+## Validation
+
+Build the two standalone diagnostics:
 
 ```powershell
-$env:ONEAPI_DEVICE_SELECTOR = "level_zero:1"
-<portable>\python_embeded\python.exe -s tests\repro_windows_xpu_vbar_copy.py `
-    --pages 5 --copy-bytes 607744
+scripts\build-windows-xpu-device-diagnostic.cmd
+scripts\build-windows-xpu-vmm-copy-diagnostic.cmd
 ```
 
-## What was measured
+Run the production reproducer against physical GPU 1:
 
-The transfer size decides the outcome. Nothing else does.
+```powershell
+<portable>\python_embeded\python.exe -s tests\repro_windows_xpu_vbar_copy.py `
+    --device 1 --pages 5 --copy-bytes 607744 --workaround
+```
 
-| Copy size | Result |
-| ---: | --- |
-| 4 KiB | fails |
-| 64 KiB | fails |
-| 512 KiB | fails |
-| 607,744 B (the size ComfyUI uses) | fails |
-| 1 MiB | fails |
-| 1.5 MiB | fails |
-| 2 MiB exactly | fails |
-| **2 MiB + 1 byte** | **succeeds** |
-| 2.5 / 3 / 4 / 32 MiB | succeeds |
+The verified result was five successful copies, five fallback calls,
+3,038,720 copied bytes, and zero fallback failures. A 30-case matrix (two
+adapters, three boundary sizes, five VBAR pages) passed with byte verification.
 
-Alignment is not the variable: 607,744 is neither 4 KiB nor 64 KiB aligned and
-fails, while 2,097,153 is unaligned and succeeds. The boundary is 2 MiB, which
-is the Level Zero large-page granularity.
+A fresh 864x480 H3 run with the final wheel recorded 651 fallback calls,
+45,562,744 requested bytes, and zero fallback failures inside the ComfyUI
+process. This confirms the end-to-end pass exercised the workaround heavily.
 
-At the moment of failure every operand is valid:
+The formal MiniMax H3 workload and its GPU-specific gates then passed on
+physical GPU 1 in one fresh ComfyUI process:
 
-| Property | Observed |
-| --- | --- |
-| destination in a VBAR range | yes |
-| destination fully mapped | yes |
-| destination pinned | yes |
-| destination type from `zeMemGetAllocProperties` | `ZE_MEMORY_TYPE_DEVICE`, query succeeded |
-| source type | host USM, query succeeded |
-| queue context vs AIMDO's Level Zero context | identical |
-| device free memory | 31,407 MiB |
-| transfer size | 594 KB |
+* three sequential prompts with distinct seeds;
+* 1280x736, 362 frames, 24 fps, two steps;
+* all three `execution_success`;
+* server times 467.93 s, 456.23 s, and 456.47 s;
+* three valid 15.083-second MP4 files;
+* no UR error 39, AIMDO copy failure, `result=999`, or device reset.
 
-`zeCommandListAppendMemoryCopy` called directly on an immediate command list
-returns `0x70000003`, which is Level Zero's own `OUT_OF_DEVICE_MEMORY`. The
-refusal therefore comes from the driver, not from Unified Runtime's wrapper,
-and the error code does not describe a real shortage.
+Windows asyncio logged `ConnectionResetError [WinError 10054]` after the first
+two client connections closed. The server continued immediately and all three
+prompts passed; this is a separate HTTP transport log issue, not an XPU error.
+It still means the broader acceptance document's literal no-traceback log gate
+is not clean and should be tracked independently.
 
-## Hypotheses refuted by measurement
+## Remaining driver gap
 
-Each of these was proposed and then disproved. They are listed so the evidence
-against them is not lost.
-
-| Hypothesis | Evidence against |
-| --- | --- |
-| VBAR page not mapped | `all_mapped=1 pin=1` at the failure |
-| Driver staging buffer exhausted | a blocking retry fails identically |
-| Device memory exhausted | 594 KB copy with 31,407 MiB free |
-| Destination is not USM, so the driver cannot resolve it | `zeMemGetAllocProperties` succeeds and reports device memory |
-| Queue context differs from AIMDO's mapping context | both native handles compared equal |
-| Device index mis-plumbed to the second GPU | under the selector only one device exists and every index is 0; still fails |
-| Blocking reclaim in `vrambuf.c` | fixed and re-run; still fails |
-| VBAR pages never made resident | `zeContextMakeMemoryResident` added; still fails |
-
-## Fixes attempted and rejected
-
-None of these are in the tree. Each was built, installed, and run against the
-reproducer.
-
-1. **Blocking retry of the same copy.** Fails with the same code.
-2. **Stage through a USM device buffer** (host -> USM -> VBAR). The second leg
-   fails, which proves the destination is the problem and the source is not.
-3. **Copy with `zeCommandListAppendMemoryCopy` on an immediate command list.**
-   Fails with raw `0x70000003`, which is what established that the refusal is
-   the driver's own.
-4. **`zeContextMakeMemoryResident` after `zeVirtualMemMap`,** with a matching
-   `zeContextEvictMemory` before unmap. No effect.
-5. **Copy with a SYCL kernel** (`parallel_for` over bytes), since a kernel
-   `fill_` on the same range does work. Still failed.
-
-## What is not yet known
-
-Why the first GPU does not hit this. The same code, the same model and the same
-sizes complete there. That difference is the most likely route to the cause and
-it has not been investigated: the first GPU was in use for unrelated work, and
-a background driver component was measured holding 40-47 % of its 3D engine,
-so it is not a clean comparison either.
-
-The next step is to determine what differs between the two adapters for a
-sub-2 MiB copy into a `zeVirtualMemMap` range - copy-engine availability,
-peer/host visibility flags, or the page size reported by
-`zeVirtualMemQueryPageSize` - rather than to try another fix.
-
-## Separate defect found while investigating
-
-`src/vrambuf.c` called the blocking `vbars_free()` on an allocation path in
-three places. That function calls `cuCtxSynchronize()`, which on the XPU
-backend is `sycl::queue::wait_and_throw()`, and waiting there can block behind
-work that itself needs the residency being requested. Every equivalent site in
-`src/model-vbar.c` had already been converted to the non-blocking
-`vbars_free_retired()` on Windows XPU; `vrambuf.c` was missed.
-
-This is a real defect, it is **not** the cause of the failure above (fixing it
-changed nothing), and it is **not** currently in the tree: the working state was
-restored to the build used for the stress test. The change is preserved in
-`build/trace/diagnostics-and-wip.patch` and should be re-applied on its own
-merits, ideally behind a `vbars_reclaim_for_allocation()` helper so the
-platform rule lives in one place.
+The workaround restores correctness but does not explain why the driver binds
+the small-copy behavior to the second adapter. A future driver qualification
+should rerun the direct diagnostic. If direct copies pass, disable the route
+with the environment override, repeat the formal gate, then remove the
+workaround rather than carrying it indefinitely.

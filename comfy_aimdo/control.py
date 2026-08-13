@@ -279,6 +279,23 @@ def init(
         lib.xpu_get_vmm_stats.argtypes = [ctypes.POINTER(ctypes.c_uint64),
                                           ctypes.c_size_t]
         lib.xpu_get_vmm_stats.restype = ctypes.c_bool
+        if platform.system() == "Windows":
+            lib.aimdo_xpu_is_mapped_pinned_vbar.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+            ]
+            lib.aimdo_xpu_is_mapped_pinned_vbar.restype = ctypes.c_bool
+            lib.aimdo_xpu_needs_small_vbar_copy_workaround.argtypes = [
+                ctypes.c_int,
+            ]
+            lib.aimdo_xpu_needs_small_vbar_copy_workaround.restype = ctypes.c_bool
+            lib.aimdo_xpu_copy_host_to_vbar.argtypes = [
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.c_size_t,
+                ctypes.c_int,
+            ]
+            lib.aimdo_xpu_copy_host_to_vbar.restype = ctypes.c_bool
         lib.xpu_allocator_empty_cache.argtypes = [ctypes.c_bool]
         lib.xpu_allocator_empty_cache.restype = ctypes.c_bool
         lib.xpu_allocator_get_memory_stats.argtypes = [
@@ -589,6 +606,9 @@ def get_xpu_vmm_stats():
         "torch_allocator_physical_alloc_bytes",
         "torch_allocator_physical_release_calls",
         "torch_allocator_physical_release_bytes",
+        "small_vbar_copy_fallback_calls",
+        "small_vbar_copy_fallback_bytes",
+        "small_vbar_copy_fallback_failures",
     )
     values = (ctypes.c_uint64 * len(names))()
     if not lib.xpu_get_vmm_stats(values, len(names)):

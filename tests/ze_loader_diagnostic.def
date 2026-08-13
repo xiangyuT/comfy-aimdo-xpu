@@ -1,0 +1,24 @@
+LIBRARY ze_loader.dll
+EXPORTS
+    zeCommandListAppendMemoryCopy
+    zeCommandListCreateImmediate
+    zeCommandListDestroy
+    zeCommandListHostSynchronize
+    zeContextCreate
+    zeContextDestroy
+    zeDeviceGet
+    zeDeviceGetCommandQueueGroupProperties
+    zeDeviceGetMemoryAccessProperties
+    zeDeviceGetMemoryProperties
+    zeDeviceGetProperties
+    zeDevicePciGetPropertiesExt
+    zeDriverGet
+    zeDriverGetApiVersion
+    zeInit
+    zePhysicalMemCreate
+    zePhysicalMemDestroy
+    zeVirtualMemFree
+    zeVirtualMemMap
+    zeVirtualMemQueryPageSize
+    zeVirtualMemReserve
+    zeVirtualMemUnmap

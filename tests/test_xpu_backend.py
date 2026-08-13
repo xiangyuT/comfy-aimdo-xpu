@@ -101,6 +101,50 @@ def test_aimdo_to_tensor_resolves_indexless_xpu_to_current_device(
     _destroy_vbar(vbar)
 
 
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows driver workaround")
+def test_small_vbar_copy_workaround_writes_exact_range(monkeypatch):
+    from comfy_aimdo.model_vbar import ModelVBAR
+    from comfy_aimdo.torch import aimdo_to_tensor, copy_to_vbar
+
+    monkeypatch.setenv("AIMDO_XPU_SMALL_VBAR_COPY_FALLBACK", "1")
+    device = torch.device("xpu", torch.xpu.current_device())
+    copy_size = 607744
+    readback_size = 2 * 1024 * 1024 + 1
+    source = torch.arange(copy_size, dtype=torch.int64).to(torch.uint8)
+    stats_before = control.get_xpu_vmm_stats()
+    vbar = ModelVBAR(32 << 20, device.index)
+    allocation = vbar.alloc(32 << 20)
+    assert vbar.fault(allocation[1], allocation[2]) is not None
+    destination = aimdo_to_tensor(allocation, device)
+    destination.fill_(113)
+    torch.xpu.synchronize(device.index)
+
+    copy_to_vbar(destination[:copy_size], source, non_blocking=True)
+    readback = destination[:readback_size].cpu()
+    assert torch.equal(readback[:copy_size], source)
+    assert readback[copy_size:].eq(113).all()
+
+    stats_after = control.get_xpu_vmm_stats()
+    assert (
+        stats_after["small_vbar_copy_fallback_calls"]
+        - stats_before["small_vbar_copy_fallback_calls"]
+        == 1
+    )
+    assert (
+        stats_after["small_vbar_copy_fallback_bytes"]
+        - stats_before["small_vbar_copy_fallback_bytes"]
+        == copy_size
+    )
+    assert (
+        stats_after["small_vbar_copy_fallback_failures"]
+        == stats_before["small_vbar_copy_fallback_failures"]
+    )
+
+    vbar.unpin(allocation[1], allocation[2])
+    del readback, destination, source, allocation
+    _destroy_vbar(vbar)
+
+
 def test_unmap_waits_for_inflight_xpu_work():
     from comfy_aimdo.model_vbar import ModelVBAR
     from comfy_aimdo.torch import aimdo_to_tensor

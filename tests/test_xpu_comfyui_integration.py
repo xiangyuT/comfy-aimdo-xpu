@@ -27,7 +27,7 @@ def test_tensorwise_int8_quantized_tensor_rebuilds_inside_vbar():
     from comfy.memory_management import interpret_gathered_like, vram_aligned_size
     from comfy.quant_ops import QuantizedTensor, TensorWiseINT8Layout
     from comfy_aimdo.model_vbar import ModelVBAR
-    from comfy_aimdo.torch import aimdo_to_tensor
+    from comfy_aimdo.torch import aimdo_to_tensor, copy_to_vbar
 
     device = torch.device("xpu", torch.xpu.current_device())
     shape = (512, 256)
@@ -56,8 +56,8 @@ def test_tensorwise_int8_quantized_tensor_rebuilds_inside_vbar():
     gathered = aimdo_to_tensor(allocation, device)
     destination = interpret_gathered_like([source], gathered)[0]
 
-    destination._qdata.copy_(source._qdata)
-    destination._params.scale.copy_(source._params.scale)
+    copy_to_vbar(destination._qdata, source._qdata)
+    copy_to_vbar(destination._params.scale, source._params.scale)
     torch.xpu.synchronize()
 
     assert torch.equal(destination._qdata.cpu(), qdata)
