@@ -30,6 +30,7 @@ def test_windows_ur_hook_state_machine_and_classification_cost():
         cwd=root,
         capture_output=True,
         text=True,
+        errors="replace",
     )
     # The timing lines are the point of the test as much as the assertions, so
     # surface them even on success.

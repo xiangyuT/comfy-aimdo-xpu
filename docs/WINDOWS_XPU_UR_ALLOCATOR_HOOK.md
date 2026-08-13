@@ -112,13 +112,10 @@ synthetic retry, accounting, multi-thread interception, and timing:
 cmd /d /c scripts\test-windows-xpu-hook.cmd
 ```
 
-The production smoke and VBAR competition checks require a Portable XPU
-runtime:
+The production smoke check requires a Portable XPU runtime:
 
 ```powershell
 <portable>\python_embeded\python.exe -s tests\run_windows_ur_hook_smoke.py
-<portable>\python_embeded\python.exe -s `
-    tests\repro_windows_xpu_vbar_vs_torch.py --vbar-gib 6 --torch-gib 30
 ```
 
 Verify the loaded package/DLL identity before interpreting the counters. A

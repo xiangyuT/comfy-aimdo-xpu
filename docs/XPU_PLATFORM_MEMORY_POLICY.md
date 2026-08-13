@@ -147,10 +147,4 @@ python tests\repro_xpu_platform_memory_policy.py
 ```
 
 The script creates a lower-priority and an active VBAR, applies controlled
-pressure, and reports residency around the platform policy. For Windows hook
-behavior under native Torch growth, also run:
-
-```powershell
-<portable>\python_embeded\python.exe -s `
-    tests\repro_windows_xpu_vbar_vs_torch.py --vbar-gib 6 --torch-gib 30
-```
+pressure, and reports residency around the platform policy.

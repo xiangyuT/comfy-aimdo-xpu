@@ -23,9 +23,4 @@ mkdir -p "$BUILD_DIR"
     -ldl -o "$BUILD_DIR/ur_usm_hook_unit"
 "$BUILD_DIR/ur_usm_hook_unit"
 
-"$CXX" -std=c++17 -O2 -g -Wall -Wextra -Werror -fPIC -fsycl -shared \
-    "$ROOT_DIR/tests/xpu_direct_sycl_alloc.cpp" \
-    -o "$BUILD_DIR/xpu_direct_sycl_alloc.so"
-
 echo "passed UR hook unit tests"
-echo "built $BUILD_DIR/xpu_direct_sycl_alloc.so"

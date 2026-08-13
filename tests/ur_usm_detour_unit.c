@@ -338,9 +338,9 @@ static double elapsed_ns(LARGE_INTEGER start, LARGE_INTEGER stop,
 
 /* Stack depth matters more than anything else here. The per-frame form calls
  * GetModuleFileNameW once per frame, so a shallow microbenchmark flatters it
- * badly: the real PyTorch stack measured by tests/run_windows_ur_hook_probe.py
- * is 42 frames deep. These helpers recurse to a chosen depth first, and the
- * volatile accumulator keeps the recursion from being turned into a loop. */
+ * badly: a real PyTorch allocation stack is about 42 frames deep. These
+ * helpers recurse to a chosen depth first, and the volatile accumulator keeps
+ * the recursion from being turned into a loop. */
 static volatile int g_recursion_sink;
 
 static bool recurse_path(int depth) {

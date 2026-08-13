@@ -65,8 +65,7 @@ will run ComfyUI. Useful focused entry points include:
 
 ```powershell
 <portable>\python_embeded\python.exe -s tests\run_windows_ur_hook_smoke.py
-<portable>\python_embeded\python.exe -s `
-    tests\repro_windows_xpu_vbar_vs_torch.py --vbar-gib 6 --torch-gib 30
+python tests\repro_xpu_platform_memory_policy.py
 ```
 
 A component reproducer proves only the path it exercises. A memory-policy

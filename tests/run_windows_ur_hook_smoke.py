@@ -1,10 +1,9 @@
 """Verify that the Windows Unified Runtime hook actually arbitrates.
 
-`tests/run_windows_ur_hook_probe.py` proves the interception mechanism using a
-standalone probe. This script proves the *production* path: that
-`comfy_aimdo.control` selects the native hook on Windows, that
-`src-xpu/ur-usm-detour.c` attaches to `ur_loader.dll`, and that PyTorch's
-allocations are seen, classified and accounted by AIMDO itself.
+This proves the production path: that `comfy_aimdo.control` selects the native
+hook on Windows, that `src-xpu/ur-usm-detour.c` attaches to `ur_loader.dll`,
+and that PyTorch's allocations are seen, classified and accounted by AIMDO
+itself.
 
 It deliberately does not assert anything about memory policy. A pass means the
 control loop is connected, not that it makes good decisions.
