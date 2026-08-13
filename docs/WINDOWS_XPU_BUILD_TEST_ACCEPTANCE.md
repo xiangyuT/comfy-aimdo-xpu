@@ -44,6 +44,27 @@ Portable environments must also make their SYCL and Unified Runtime DLL
 directory visible before AIMDO loads. `comfy_aimdo.control` adds the embedded
 Python `Library/bin` directory on Windows.
 
+## Package version
+
+The version is derived by `setuptools-scm` from the git tag history and must
+never be supplied by hand. `SETUPTOOLS_SCM_PRETEND_VERSION` produces a number
+that is attached to no commit, so two different trees can install as the same
+version and a measurement cannot be traced back to a build.
+
+Deriving it requires the release tags to be present in the clone. A fork
+created without them yields `0.1.dev<count>`, which is what makes the override
+tempting. Fetch them once:
+
+```powershell
+git fetch https://github.com/Comfy-Org/comfy-aimdo.git "refs/tags/*:refs/tags/*"
+```
+
+`git describe --tags` then names the build, and a wheel built from a clean tree
+carries the matching version: `v0.4.13-40-g1a17d3e` builds `0.4.14.dev40`.
+Because the configured `local_scheme` drops the local segment, the version
+identifies a commit only when the tree is clean; do not record a result from a
+wheel built over uncommitted changes.
+
 ## Focused validation
 
 Run the hook unit test, which needs no XPU:
