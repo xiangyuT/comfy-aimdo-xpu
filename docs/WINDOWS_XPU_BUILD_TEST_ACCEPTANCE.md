@@ -46,24 +46,33 @@ Python `Library/bin` directory on Windows.
 
 ## Package version
 
-The version is derived by `setuptools-scm` from the git tag history and must
-never be supplied by hand. `SETUPTOOLS_SCM_PRETEND_VERSION` produces a number
-that is attached to no commit, so two different trees can install as the same
-version and a measurement cannot be traced back to a build.
+The version is derived by `setuptools-scm` and must never be supplied by hand.
+`SETUPTOOLS_SCM_PRETEND_VERSION` produces a number attached to no commit, so
+two different trees install as the same version and a measurement cannot be
+traced back to a build.
 
-Deriving it requires the release tags to be present in the clone. A fork
-created without them yields `0.1.dev<count>`, which is what makes the override
-tempting. Fetch them once:
+This repository is not a branch of the upstream release line; it is upstream
+plus a Windows/XPU port under the same distribution name. The version therefore
+uses a PEP 440 local identifier, which is the construct for a modification of
+an upstream release:
+
+```text
+0.4.13+xpu.g7acd727
+```
+
+The base is the newest upstream release the tree contains, `xpu` marks the
+port, and the commit follows. A tree with uncommitted changes appends `.dirty`,
+so a wheel built over local edits says so and must not be used to record a
+result. The schemes are defined in `setup.py`, because `setuptools-scm`
+resolves a scheme named in `pyproject.toml` through installed entry points and
+cannot import a module from an unbuilt source tree.
+
+Deriving the base requires the upstream release tags, which a fork is created
+without. Fetch them once, otherwise the base degrades to `0.1`:
 
 ```powershell
 git fetch https://github.com/Comfy-Org/comfy-aimdo.git "refs/tags/*:refs/tags/*"
 ```
-
-`git describe --tags` then names the build, and a wheel built from a clean tree
-carries the matching version: `v0.4.13-40-g1a17d3e` builds `0.4.14.dev40`.
-Because the configured `local_scheme` drops the local segment, the version
-identifies a commit only when the tree is clean; do not record a result from a
-wheel built over uncommitted changes.
 
 ## Focused validation
 

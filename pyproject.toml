@@ -19,6 +19,6 @@ packages = ["comfy_aimdo"]
 [tool.setuptools.package-data]
 "comfy_aimdo" = ["*.so", "*.dll"]
 
+# setuptools-scm is configured in setup.py, which is the only place the version
+# schemes below can be defined as callables.
 [tool.setuptools_scm]
-version_file = "comfy_aimdo/_version.py"
-local_scheme = "no-local-version"
