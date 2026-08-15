@@ -1,0 +1,174 @@
+name: Bug report (English)
+description: Report compatibility, VRAM management, crashes, or incorrect behavior in Aimdo XPU
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Before submitting
+
+        Aimdo participates in VRAM management across nearly the entire ComfyUI execution pipeline. Different versions of ComfyUI and custom nodes may implement model loading, weight replacement, unloading, patching, and VRAM management differently. Those implementations can conflict with Aimdo's design. Accurate versions and a complete workflow are therefore required to determine whether an issue is caused by Aimdo itself.
+
+        The default development and validation baseline for this project consists of the **ComfyUI-OmniXPU custom-node fixes and enhancements from llm-scaler** and the **OmniXPU kernel acceleration**. Some required fixes may live outside the comfy-aimdo-xpu repository. If an issue is reproducible only with another custom-node combination or version, maintainers may first ask for a retest against this baseline.
+
+        Do not provide only `latest`, a branch name, or an installation date. Provide tags, exact versions, and commit SHAs whenever possible. Remove credentials and private information from workflows, logs, and paths before submitting a public issue.
+
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: Submission checklist
+      options:
+        - label: I searched existing issues and found no report describing the same problem.
+          required: true
+        - label: I understand that Aimdo's default validation baseline includes the ComfyUI-OmniXPU changes and OmniXPU kernels from llm-scaler, and that fixes outside this repository may affect the result.
+          required: true
+
+  - type: textarea
+    id: aimdo_version
+    attributes:
+      label: comfy-aimdo-xpu version
+      description: Provide the release/tag, branch, and commit SHA. If you have local changes, also provide `git status --short` and the relevant diff or local commit.
+      placeholder: |
+        release/tag: for example, v0.x.y
+        branch: for example, main
+        commit: full commit SHA
+        local changes: none / paste git status and the relevant diff
+    validations:
+      required: true
+
+  - type: textarea
+    id: llm_scaler_version
+    attributes:
+      label: llm-scaler version and component sources
+      description: Provide the llm-scaler repository URL, branch/tag, and commit SHA. State whether the ComfyUI-OmniXPU custom node and OmniXPU kernels came from that version.
+      placeholder: |
+        repository: https://github.com/...
+        branch/tag:
+        commit: full commit SHA
+        ComfyUI-OmniXPU source/version:
+        OmniXPU kernel source/version:
+        local changes: none / describe local changes
+    validations:
+      required: true
+
+  - type: textarea
+    id: comfyui_version
+    attributes:
+      label: ComfyUI version
+      description: Provide the ComfyUI tag/version, branch, and commit SHA. For a portable build, also provide the package name or build date.
+      placeholder: |
+        version/tag:
+        branch:
+        commit: full commit SHA
+        portable package/build:
+    validations:
+      required: true
+
+  - type: textarea
+    id: custom_nodes
+    attributes:
+      label: Custom nodes and versions
+      description: List every custom node used by the workflow, plus any other custom node that may participate in model loading, quantization, patching, sampling, unloading, or VRAM management. Include the source and commit SHA/version for each one.
+      placeholder: |
+        - ComfyUI-OmniXPU: repository URL, tag/branch, commit SHA
+        - Custom-Node-A: repository URL, tag/branch, commit SHA
+        - Custom-Node-B: repository URL, tag/branch, commit SHA
+        Retest with other custom nodes disabled:
+    validations:
+      required: true
+
+  - type: upload
+    id: workflow
+    attributes:
+      label: Complete reproducible workflow
+      description: Upload the complete workflow JSON. Preserve the actual nodes, links, model/quantization types, and parameters so that the executed code path can be identified. Screenshots, abbreviated node lists, and generated images are not sufficient. If model names are sensitive, names may be replaced, but retain the model type, precision, quantization method, and size information. Multiple related files may be uploaded as a ZIP archive.
+    validations:
+      required: true
+      accept: ".json,.zip"
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem description and expected behavior
+      description: Describe what happened, what you expected to happen, and the approximate version or change where the problem first appeared.
+      placeholder: |
+        Actual behavior:
+        Expected behavior:
+        First affected version/change:
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction steps
+      description: Starting with the launch command and environment variables, provide the minimum steps that reliably reproduce the issue and include its reproduction rate.
+      placeholder: |
+        1. Start ComfyUI with the following command and environment variables...
+        2. Import the attached workflow...
+        3. Execute it ... times...
+        Reproduction rate: for example, 5/5 or after approximately 20 runs
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Runtime environment
+      description: VRAM issues commonly depend on the device, driver, PyTorch, and dependency versions. Provide the complete environment.
+      placeholder: |
+        OS and version:
+        GPU/XPU model and device count:
+        VRAM capacity:
+        graphics driver version:
+        Python version:
+        PyTorch version:
+        relevant oneAPI / IPEX / xpu-smi versions:
+        important dependency versions (for example, bitsandbytes):
+        launch command and relevant environment variables:
+    validations:
+      required: true
+
+  - type: upload
+    id: logs
+    attributes:
+      label: Complete logs and VRAM evidence
+      description: Upload the complete terminal log from ComfyUI startup and model loading through the failure. For OOM or device-lost problems, include allocated, reserved, and free VRAM immediately before and after the failure. Do not provide only the final error line. Multiple logs may be uploaded as a ZIP archive.
+    validations:
+      required: true
+      accept: ".log,.txt,.zip"
+
+  - type: textarea
+    id: traceback
+    attributes:
+      label: Key traceback (optional)
+      description: Paste the most directly relevant exception traceback here. Provide the complete context using the log upload above.
+      render: shell
+
+  - type: dropdown
+    id: baseline_comparison
+    attributes:
+      label: llm-scaler default-baseline comparison
+      description: Select the reproduction status against the default llm-scaler validation baseline.
+      options:
+        - Reproduced on the default baseline
+        - Not yet retested on the default baseline
+        - Unable to retest on the baseline in the current environment
+    validations:
+      required: true
+
+  - type: textarea
+    id: comparison_details
+    attributes:
+      label: Comparison details (optional)
+      description: If comparison tests were performed, provide the results with Aimdo disabled, suspected custom nodes disabled, or versions changed.
+      placeholder: |
+        Aimdo disabled:
+        Other custom nodes disabled:
+        Other version/configuration:
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional context
+      description: Optionally include the model type, resolution, frame count, batch size, the number and total size of extra LoRA/ControlNet weights, and links to related issues or pull requests.

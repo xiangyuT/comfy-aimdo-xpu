@@ -1,4 +1,5 @@
 import gc
+import sys
 import tempfile
 
 import pytest
@@ -18,6 +19,10 @@ pytestmark = pytest.mark.skipif(
 def initialized_xpu_backend():
     assert control.detect_vendor() == "xpu"
     assert control.init(implementation="xpu", simple_vram_headroom=64 << 20)
+    if sys.platform == "win32":
+        # Windows mirrors the CUDA integration: Torch keeps ownership of its
+        # caching allocator while AIMDO observes physical Level Zero growth.
+        assert control._torch_allocator is None
     assert control.init_devices([torch.xpu.current_device()])
     yield
     torch.xpu.synchronize()
@@ -93,6 +98,50 @@ def test_aimdo_to_tensor_resolves_indexless_xpu_to_current_device(
 
     vbar.unpin(allocation[1], allocation[2])
     del tensor, allocation
+    _destroy_vbar(vbar)
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows driver workaround")
+def test_small_vbar_copy_workaround_writes_exact_range(monkeypatch):
+    from comfy_aimdo.model_vbar import ModelVBAR
+    from comfy_aimdo.torch import aimdo_to_tensor, copy_to_vbar
+
+    monkeypatch.setenv("AIMDO_XPU_SMALL_VBAR_COPY_FALLBACK", "1")
+    device = torch.device("xpu", torch.xpu.current_device())
+    copy_size = 607744
+    readback_size = 2 * 1024 * 1024 + 1
+    source = torch.arange(copy_size, dtype=torch.int64).to(torch.uint8)
+    stats_before = control.get_xpu_vmm_stats()
+    vbar = ModelVBAR(32 << 20, device.index)
+    allocation = vbar.alloc(32 << 20)
+    assert vbar.fault(allocation[1], allocation[2]) is not None
+    destination = aimdo_to_tensor(allocation, device)
+    destination.fill_(113)
+    torch.xpu.synchronize(device.index)
+
+    copy_to_vbar(destination[:copy_size], source, non_blocking=True)
+    readback = destination[:readback_size].cpu()
+    assert torch.equal(readback[:copy_size], source)
+    assert readback[copy_size:].eq(113).all()
+
+    stats_after = control.get_xpu_vmm_stats()
+    assert (
+        stats_after["small_vbar_copy_fallback_calls"]
+        - stats_before["small_vbar_copy_fallback_calls"]
+        == 1
+    )
+    assert (
+        stats_after["small_vbar_copy_fallback_bytes"]
+        - stats_before["small_vbar_copy_fallback_bytes"]
+        == copy_size
+    )
+    assert (
+        stats_after["small_vbar_copy_fallback_failures"]
+        == stats_before["small_vbar_copy_fallback_failures"]
+    )
+
+    vbar.unpin(allocation[1], allocation[2])
+    del readback, destination, source, allocation
     _destroy_vbar(vbar)
 
 
@@ -178,18 +227,29 @@ def test_worker_stream_file_fill_rebinds_unmap_queue():
     _destroy_vbar(vbar)
 
 
-def test_torch_allocator_pressure_evicts_unpinned_vbar_pages():
+def test_torch_allocator_pressure_preserves_active_vbar_priority():
     from comfy_aimdo.model_vbar import ModelVBAR
 
     device = torch.device("xpu", torch.xpu.current_device())
     assert control.empty_xpu_allocator_cache(wait=True)
     total = torch.xpu.get_device_properties(device).total_memory
 
-    vbar = ModelVBAR(64 << 20, device.index)
-    allocation = vbar.alloc(64 << 20)
-    assert vbar.fault(allocation[1], allocation[2]) is not None
-    vbar.unpin(allocation[1], allocation[2])
-    assert vbar.get_residency() == [1, 1]
+    lower_vbar = ModelVBAR(64 << 20, device.index)
+    lower_allocation = lower_vbar.alloc(64 << 20)
+    assert lower_vbar.fault(
+        lower_allocation[1], lower_allocation[2]
+    ) is not None
+    lower_vbar.unpin(lower_allocation[1], lower_allocation[2])
+
+    active_vbar = ModelVBAR(64 << 20, device.index)
+    active_allocation = active_vbar.alloc(64 << 20)
+    assert active_vbar.fault(
+        active_allocation[1], active_allocation[2]
+    ) is not None
+    active_vbar.unpin(active_allocation[1], active_allocation[2])
+    assert lower_vbar.get_residency() == [1, 1]
+    assert active_vbar.get_residency() == [1, 1]
+
     recorded = control.get_total_vram_usage()
     control.init(simple_vram_headroom=total - recorded - (32 << 20))
     stats_before = control.get_xpu_vmm_stats()
@@ -198,7 +258,23 @@ def test_torch_allocator_pressure_evicts_unpinned_vbar_pages():
     activation.fill_(23)
     torch.xpu.synchronize()
     assert activation[:4096].cpu().eq(23).all()
-    assert vbar.get_residency() == [1, 0]
+    if sys.platform == "win32":
+        # The Level Zero callback only records native allocator growth on
+        # Windows. Pressure is applied at the next queue-safe model boundary,
+        # using peak native reservation as the next growth hint.
+        assert lower_vbar.get_residency() == [1, 1]
+        assert active_vbar.get_residency() == [1, 1]
+        del activation
+        torch.xpu.empty_cache()
+        active_vbar.prioritize()
+
+    # Both platforms may reclaim a lower-priority model. On Windows this is a
+    # speculative model-boundary reclaim, so the active model itself must not
+    # lose residency. Linux reaches the same result here from an exact live
+    # allocator request while enough lower-priority residency is available.
+    assert lower_vbar.get_residency() == [1, 0]
+    assert active_vbar.get_residency() == [1, 1]
+    assert active_vbar.get_watermark() == active_vbar.get_nr_pages()
     stats_after = control.get_xpu_vmm_stats()
     assert stats_after["unmap_bytes"] - stats_before["unmap_bytes"] == 32 << 20
     assert (
@@ -206,9 +282,55 @@ def test_torch_allocator_pressure_evicts_unpinned_vbar_pages():
         > stats_before["torch_allocator_physical_alloc_calls"]
     )
 
-    del activation, allocation
+    if sys.platform != "win32":
+        del activation
+    del lower_allocation, active_allocation
     torch.xpu.empty_cache()
     control.init(simple_vram_headroom=64 << 20)
+    _destroy_vbar(active_vbar)
+    _destroy_vbar(lower_vbar)
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="Windows model-boundary pressure uses deferred native growth",
+)
+def test_windows_reprioritize_reopens_pressure_reduced_watermark():
+    from comfy_aimdo.model_vbar import ModelVBAR
+
+    device = torch.device("xpu", torch.xpu.current_device())
+    vbar = ModelVBAR(64 << 20, device.index)
+    allocation = vbar.alloc(64 << 20)
+    assert vbar.fault(allocation[1], allocation[2]) is not None
+    vbar.unpin(allocation[1], allocation[2])
+    # Establish a pressure-reduced working set after the first activation.
+    vbar.prioritize()
+    vbar.set_watermark(32 << 20)
+    assert vbar.get_watermark() == 1
+    assert vbar.get_residency() == [1, 0]
+
+    # Create a native peak/current reservation gap so this exercises the
+    # Windows speculative model-boundary path rather than ordinary explicit
+    # free/refault reprioritization.
+    assert control.empty_xpu_allocator_cache(wait=True)
+    control.reset_xpu_allocator_peak_stats(device)
+    activation = torch.empty(64 << 20, dtype=torch.uint8, device=device)
+    activation.fill_(29)
+    torch.xpu.synchronize()
+    del activation
+    torch.xpu.empty_cache()
+
+    vbar.prioritize()
+
+    # Reprioritization must reopen the whole address range. Restoring the old
+    # watermark as a hard ceiling makes tiled models reload every later layer
+    # through the temporary host-to-device fallback on every tile.
+    assert vbar.get_watermark() == vbar.get_nr_pages() == 2
+    assert vbar.get_residency() == [1, 0]
+    assert vbar.fault(allocation[1] + (32 << 20), 32 << 20) is not None
+    vbar.unpin(allocation[1] + (32 << 20), 32 << 20)
+    assert vbar.get_residency() == [1, 1]
+    del allocation
     _destroy_vbar(vbar)
 
 
@@ -229,7 +351,12 @@ def test_torch_allocator_reuses_completed_same_size_block():
                 control.get_xpu_allocator_memory_stats(device)
             )
             assert active - active_before == 4 << 20
-            assert reserved - reserved_before == 4 << 20
+            if sys.platform == "win32":
+                # The native allocator rounds this request to a reusable
+                # segment (currently 20 MiB in Torch 2.12).
+                assert reserved - reserved_before >= 4 << 20
+            else:
+                assert reserved - reserved_before == 4 << 20
             assert peak_active >= active
             assert peak_reserved >= reserved
         del tensor
@@ -239,7 +366,10 @@ def test_torch_allocator_reuses_completed_same_size_block():
         control.get_xpu_allocator_memory_stats(device)
     )
     assert active_cached == active_before
-    assert reserved_cached - reserved_before == 4 << 20
+    if sys.platform == "win32":
+        assert reserved_cached - reserved_before >= 4 << 20
+    else:
+        assert reserved_cached - reserved_before == 4 << 20
 
     stats_after = control.get_xpu_vmm_stats()
     assert (
@@ -247,17 +377,77 @@ def test_torch_allocator_reuses_completed_same_size_block():
         - stats_before["torch_allocator_physical_alloc_calls"]
         == 1
     )
-    assert (
-        stats_after["torch_allocator_cache_hits"]
-        - stats_before["torch_allocator_cache_hits"]
-        == 2
-    )
+    if sys.platform != "win32":
+        assert (
+            stats_after["torch_allocator_cache_hits"]
+            - stats_before["torch_allocator_cache_hits"]
+            == 2
+        )
+    releases_before_empty = stats_after[
+        "torch_allocator_physical_release_calls"
+    ]
     assert control.empty_xpu_allocator_cache(wait=True)
     active_empty, reserved_empty, _, _ = (
         control.get_xpu_allocator_memory_stats(device)
     )
     assert active_empty == active_before
     assert reserved_empty == reserved_before
+    if sys.platform == "win32":
+        stats_empty = control.get_xpu_vmm_stats()
+        assert (
+            stats_empty["torch_allocator_physical_release_calls"]
+            > releases_before_empty
+        )
+
+
+@pytest.mark.skipif(
+    sys.platform != "win32",
+    reason="Windows retains the native Torch XPU caching allocator",
+)
+def test_windows_native_torch_allocator_owns_cached_usm_release():
+    device = torch.device("xpu", torch.xpu.current_device())
+    assert control.empty_xpu_allocator_cache(wait=True)
+    stats_before = control.get_xpu_vmm_stats()
+    active_before, reserved_before, _, _ = (
+        control.get_xpu_allocator_memory_stats(device)
+    )
+
+    first = torch.empty(3 << 20, dtype=torch.uint8, device=device)
+    first.fill_(11)
+    del first
+    torch.xpu.synchronize()
+
+    second = torch.empty(5 << 20, dtype=torch.uint8, device=device)
+    second.fill_(13)
+    del second
+    torch.xpu.synchronize()
+
+    active_cached, reserved_cached, _, _ = (
+        control.get_xpu_allocator_memory_stats(device)
+    )
+    stats_cached = control.get_xpu_vmm_stats()
+    assert active_cached == active_before
+    assert reserved_cached > reserved_before
+    assert (
+        stats_cached["torch_allocator_physical_alloc_calls"]
+        > stats_before["torch_allocator_physical_alloc_calls"]
+    )
+    assert (
+        stats_cached["torch_allocator_physical_release_calls"]
+        == stats_before["torch_allocator_physical_release_calls"]
+    )
+
+    assert control.empty_xpu_allocator_cache(wait=True)
+    active_empty, reserved_empty, _, _ = (
+        control.get_xpu_allocator_memory_stats(device)
+    )
+    stats_empty = control.get_xpu_vmm_stats()
+    assert active_empty == active_before
+    assert reserved_empty == reserved_before
+    assert (
+        stats_empty["torch_allocator_physical_release_calls"]
+        > stats_cached["torch_allocator_physical_release_calls"]
+    )
 
 
 def test_priority_evicts_the_lowest_vbar_first():
@@ -266,7 +456,11 @@ def test_priority_evicts_the_lowest_vbar_first():
     device = torch.device("xpu", torch.xpu.current_device())
     assert control.empty_xpu_allocator_cache(wait=True)
     total = torch.xpu.get_device_properties(device).total_memory
-    control.init(simple_vram_headroom=total - (128 << 20))
+    recorded = control.get_total_vram_usage()
+    # Normalize the test window against allocations already observed by
+    # AIMDO. The fourth fault reaches the 128 MiB limit and must evict only
+    # the lowest-priority resident VBAR.
+    control.init(simple_vram_headroom=total - recorded - (128 << 20))
 
     low = ModelVBAR(32 << 20, device.index)
     middle = ModelVBAR(32 << 20, device.index)

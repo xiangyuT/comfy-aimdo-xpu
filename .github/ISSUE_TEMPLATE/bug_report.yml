@@ -1,0 +1,174 @@
+name: 问题报告（中文）
+description: 报告 Aimdo XPU 的兼容性、显存管理、崩溃或运行结果异常
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## 提交前说明
+
+        Aimdo 会介入 ComfyUI 几乎全流程中多个组件的显存管理。不同版本的 ComfyUI 和 custom node 可能采用不同的模型加载、权重替换、卸载及显存管理方式，这些实现可能与 Aimdo 的设计发生冲突。因此，问题是否由 Aimdo 单独引起，必须结合准确版本和完整 workflow 判断。
+
+        本项目的默认开发与验证基线是 **llm-scaler 中的 ComfyUI-OmniXPU custom node 修复及功能增强**，以及 **OmniXPU kernel 加速**。部分必要修复可能位于 comfy-aimdo-xpu 仓库之外。若问题只能在其他 custom node 组合或版本上复现，维护者可能会先要求使用该基线复测。
+
+        请勿只填写 `latest`、分支名或安装日期；请尽量提供 tag、完整版本号和 commit SHA。提交公开 issue 前，请移除 workflow、日志和路径中的隐私信息或凭据。
+
+  - type: checkboxes
+    id: prerequisites
+    attributes:
+      label: 提交确认
+      options:
+        - label: 我已搜索现有 issue，确认没有内容相同的问题。
+          required: true
+        - label: 我理解 Aimdo 的默认验证基线包含 llm-scaler 中的 ComfyUI-OmniXPU 修改和 OmniXPU kernel；仓库外的修复也可能影响结论。
+          required: true
+
+  - type: textarea
+    id: aimdo_version
+    attributes:
+      label: comfy-aimdo-xpu 版本
+      description: 请提供 release/tag、分支及 commit SHA；若有本地修改，请同时提供 `git status --short` 和相关 diff/commit。
+      placeholder: |
+        release/tag: 例如 v0.x.y
+        branch: 例如 main
+        commit: 完整 commit SHA
+        local changes: 无 / 请粘贴 git status 和相关 diff
+    validations:
+      required: true
+
+  - type: textarea
+    id: llm_scaler_version
+    attributes:
+      label: llm-scaler 版本及组件来源
+      description: 请提供所用 llm-scaler 仓库地址、分支/tag 和 commit SHA，并注明 ComfyUI-OmniXPU custom node 与 OmniXPU kernel 是否来自该版本。
+      placeholder: |
+        repository: https://github.com/...
+        branch/tag:
+        commit: 完整 commit SHA
+        ComfyUI-OmniXPU source/version:
+        OmniXPU kernel source/version:
+        local changes: 无 / 说明本地修改
+    validations:
+      required: true
+
+  - type: textarea
+    id: comfyui_version
+    attributes:
+      label: ComfyUI 版本
+      description: 请提供 ComfyUI tag/version、分支和 commit SHA；使用 portable 包时也请注明包的名称或构建日期。
+      placeholder: |
+        version/tag:
+        branch:
+        commit: 完整 commit SHA
+        portable package/build:
+    validations:
+      required: true
+
+  - type: textarea
+    id: custom_nodes
+    attributes:
+      label: Custom nodes 及对应版本
+      description: 请列出 workflow 使用的全部 custom node，以及可能介入模型加载、量化、patch、采样、卸载或显存管理的其他 custom node。每项请提供来源和 commit SHA/版本号。
+      placeholder: |
+        - ComfyUI-OmniXPU: 仓库地址，tag/branch，commit SHA
+        - Custom-Node-A: 仓库地址，tag/branch，commit SHA
+        - Custom-Node-B: 仓库地址，tag/branch，commit SHA
+        是否禁用了其他 custom node 进行复测：
+    validations:
+      required: true
+
+  - type: upload
+    id: workflow
+    attributes:
+      label: 可复现的完整 workflow
+      description: 请上传完整 workflow JSON 文件。必须保留实际节点、连接、模型/量化类型及参数，以便确认运行时采用的具体代码路径；仅提供截图、精简后的节点列表或生成的图片不足以定位问题。如模型名称敏感，可以替换名称，但请保留模型类型、精度、量化方式和规模信息。多个相关文件可以打包为 ZIP 上传。
+    validations:
+      required: true
+      accept: ".json,.zip"
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 问题描述与预期行为
+      description: 请说明发生了什么、你认为应该发生什么，以及问题首次出现的大致版本或变更。
+      placeholder: |
+        实际行为：
+        预期行为：
+        首次出现的版本/变更：
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: 复现步骤
+      description: 从启动命令和环境变量开始，列出能够稳定触发问题的最小步骤，并注明复现频率。
+      placeholder: |
+        1. 使用以下命令和环境变量启动……
+        2. 导入所附 workflow……
+        3. 执行……次……
+        复现频率：例如 5/5、约 20 次后出现
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境
+      description: 显存问题通常依赖设备、驱动、PyTorch 和依赖版本，请提供完整环境。
+      placeholder: |
+        OS 及版本：
+        GPU/XPU 型号及数量：
+        显存容量：
+        显卡驱动版本：
+        Python 版本：
+        PyTorch 版本：
+        oneAPI / xpu-smi 等相关版本：
+        关键依赖版本（例如 bitsandbytes）：
+        启动命令与相关环境变量：
+    validations:
+      required: true
+
+  - type: upload
+    id: logs
+    attributes:
+      label: 完整日志与显存证据
+      description: 请上传从 ComfyUI 启动、模型加载到异常发生后的完整终端日志。OOM/设备丢失问题还应包含异常前后的 allocated、reserved、free 等显存信息；不要只提供最后一行错误。多个日志可以打包为 ZIP 上传。
+    validations:
+      required: true
+      accept: ".log,.txt,.zip"
+
+  - type: textarea
+    id: traceback
+    attributes:
+      label: 核心 traceback（可选）
+      description: 可在此粘贴最直接相关的异常堆栈，完整上下文仍请通过上面的日志文件提供。
+      render: shell
+
+  - type: dropdown
+    id: baseline_comparison
+    attributes:
+      label: llm-scaler 默认基线对照状态
+      description: 请选择当前问题在 llm-scaler 默认验证基线上的复现状态。
+      options:
+        - 已在默认基线上复现
+        - 尚未在默认基线上复测
+        - 当前环境无法进行基线复测
+    validations:
+      required: true
+
+  - type: textarea
+    id: comparison_details
+    attributes:
+      label: 对照测试详情（可选）
+      description: 如已进行对照测试，请注明关闭 Aimdo、禁用可疑 custom node 或切换版本后的结果。
+      placeholder: |
+        关闭 Aimdo：
+        禁用其他 custom node：
+        其他版本/配置：
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: 其他信息
+      description: 可补充模型类型、分辨率、帧数、batch size、LoRA/ControlNet 等额外权重的数量与总大小，以及相关 issue/PR 链接。

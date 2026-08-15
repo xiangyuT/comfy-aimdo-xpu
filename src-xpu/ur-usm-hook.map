@@ -1,0 +1,5 @@
+LIBUR_LOADER_0.12 {
+    global:
+        urUSMDeviceAlloc;
+        urUSMFree;
+};
