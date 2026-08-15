@@ -123,7 +123,7 @@ body:
         graphics driver version:
         Python version:
         PyTorch version:
-        relevant oneAPI / IPEX / xpu-smi versions:
+        relevant oneAPI / xpu-smi versions:
         important dependency versions (for example, bitsandbytes):
         launch command and relevant environment variables:
     validations:
