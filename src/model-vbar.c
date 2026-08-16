@@ -730,6 +730,20 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
     set_devctx((AimdoContext *)devctx);
 
     size_t page_end = VBAR_GET_PAGE_NR_UP(offset + size);
+    if (page_end > mv->nr_pages) {
+        /* ComfyUI sizes a VBAR as model_size()*10, but vbar_allocate() clamps
+         * the reservation to physical VRAM capacity.  Faults past the reserved
+         * range have no VA to map into: reopening the watermark there would
+         * index residency_map out of bounds and make zeVirtualMemMap fail
+         * with INVALID_ARGUMENT.  Return OOM so the caller streams the weight
+         * from host storage, matching the pre-reopen behavior. */
+        log(DEBUG,
+            "VBAR fault offset=%llu size=%llu exceeds reservation "
+            "(%zu pages); streaming from host storage\n",
+            (unsigned long long)offset, (unsigned long long)size,
+            mv->nr_pages);
+        return VBAR_FAULT_OOM;
+    }
 
     log(VVERBOSE, "%s (start): offset=%lldk, size=%lldk\n", __func__, (ull)(offset / K), (ull)(size / K));
     vbars_dirty = true;
