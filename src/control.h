@@ -41,6 +41,7 @@ typedef struct AimdoContext {
     uint64_t _control_timestamp_last_check;
     void *_highest_priority; /* ModelVBAR * */
     void *_lowest_priority; /* ModelVBAR * */
+    void *_vbar_lock; /* Mutex; protects VBAR lists and resident-page state */
     bool _vbars_dirty;
     bool _allocations_dirty;
     bool _integrated_device;
@@ -80,6 +81,7 @@ bool set_devctx_for_current_cuda_device(void);
 #define deficit_sync                (g_devctx->_deficit_sync)
 #define highest_priority_p          (*(ModelVBAR **)&g_devctx->_highest_priority)
 #define lowest_priority_p           (*(ModelVBAR **)&g_devctx->_lowest_priority)
+#define vbar_lock                    (g_devctx->_vbar_lock)
 #define vbars_dirty                 (g_devctx->_vbars_dirty)
 #define allocations_dirty           (g_devctx->_allocations_dirty)
 #define integrated_device           (g_devctx->_integrated_device)

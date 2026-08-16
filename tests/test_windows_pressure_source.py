@@ -127,7 +127,14 @@ def test_vbar_fault_wddm_retry_margin_is_windows_xpu_only():
     # are all Windows XPU only; Linux and CUDA keep the original behaviour.
     assert source.count(guard) >= 2
     assert "#define VBAR_WDDM_RETRY_RECLAIM (512 << 20)" in source
-    assert "vbars_free(VBAR_WDDM_RETRY_RECLAIM);" in source
+    assert "(void)vbars_free_retired(VBAR_WDDM_RETRY_RECLAIM);" in source
+    # A fault is already on the execution path that needs the missing page.
+    # Waiting for the whole device here can deadlock; a failed non-blocking
+    # reclaim must become a recoverable host-offload OOM instead.
+    retry = source.split(
+        "VBAR Windows XPU retry reclaiming an additional", 1
+    )[1].split("#endif", 1)[0]
+    assert "vbars_free(VBAR_WDDM_RETRY_RECLAIM)" not in retry
     for windows_only in ("VBAR_WDDM_RETRY_RECLAIM", "retire_epoch",
                          "vbars_free_retired"):
         assert windows_only not in source.split(guard, 1)[0]
@@ -150,3 +157,45 @@ def test_non_blocking_reclaim_never_waits_or_moves_the_watermark():
     # which turns a momentary spike into a permanently smaller working set.
     assert "watermark--" not in body
     assert "i->watermark =" not in body
+
+
+def test_windows_vbar_reclaim_serializes_page_state_without_waiting():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "src" / "model-vbar.c").read_text(encoding="utf-8")
+    control = (root / "src" / "control.c").read_text(encoding="utf-8")
+    header = (root / "src" / "control.h").read_text(encoding="utf-8")
+
+    assert "void *_vbar_lock" in header
+    assert "vbar_lock = mutex_create();" in control
+    assert "mutex_destroy((Mutex)vbar_lock);" in control
+
+    reclaim = source.split("size_t vbars_free_retired(ssize_t size)", 1)[1]
+    reclaim = reclaim.split("\n}\n", 1)[0]
+    assert "vbar_state_try_lock()" in reclaim
+    assert "vbar_state_lock()" not in reclaim
+    assert "cuCtxSynchronize" not in reclaim
+    assert "if (!vbar_async_reclaim_enabled())" in reclaim
+
+    fault = source.split("int vbar_fault(void *devctx", 1)[1]
+    fault = fault.split("\n}\n", 1)[0]
+    assert "vbar_state_lock();" in fault
+    assert "vbar_fault_locked(" in fault
+    assert "vbar_state_unlock();" in fault
+
+
+def test_windows_final_unpin_publishes_epoch_before_idle_state():
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "model-vbar.c"
+    ).read_text(encoding="utf-8")
+    unpin = source.split("void vbar_unpin_stream", 1)[1]
+    unpin = unpin.split("\n}\n", 1)[0]
+
+    epoch_snapshot = unpin.index(
+        "retirement_epoch = aimdo_xpu_retire_epoch_current();"
+    )
+    state_lock = unpin.index("vbar_state_lock();")
+    epoch_publish = unpin.index("rp->retire_epoch = retirement_epoch;")
+    idle_publish = unpin.index("rp->pin_count = 0;")
+    state_unlock = unpin.index("vbar_state_unlock();")
+
+    assert epoch_snapshot < state_lock < epoch_publish < idle_publish < state_unlock

@@ -17,6 +17,10 @@ void mutex_lock(Mutex mutex) {
     EnterCriticalSection(mutex);
 }
 
+bool mutex_try_lock(Mutex mutex) {
+    return TryEnterCriticalSection(mutex) != 0;
+}
+
 void mutex_unlock(Mutex mutex) {
     LeaveCriticalSection(mutex);
 }
