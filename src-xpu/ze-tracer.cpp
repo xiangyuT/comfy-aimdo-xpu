@@ -164,12 +164,12 @@ static void ZE_APICALL xpu_mem_alloc_device_epilogue(
     }
     if (result == ZE_RESULT_SUCCESS && **params->ppptr) {
         aimdo_xpu_note_native_allocation(**params->ppptr, *params->psize, device);
-        /* Reclaim only after the driver call has returned. */
+        /* Record pressure after the driver call; owner-side VBAR code reclaims. */
         aimdo_xpu_prepare_allocation(device, 0);
     } else if (result == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY) {
         // PyTorch's native caching allocator releases idle blocks and retries
-        // the physical allocation after an OOM. Prepare that retry by
-        // releasing one request-sized tranche of unpinned VBAR pages.
+        // the physical allocation after an OOM. Record one request-sized
+        // tranche for the next owner-side VBAR reclaim boundary.
         aimdo_xpu_retry_allocation(device, *params->psize);
     }
 }

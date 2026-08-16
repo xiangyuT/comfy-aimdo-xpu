@@ -36,6 +36,10 @@ typedef struct AimdoContext {
     uint64_t _extra_vram_headroom;
     uint64_t _malloc_async_clamp;
     uint64_t _total_vram_usage;
+    /* Windows XPU allocation/copy callbacks cannot safely unmap VBAR pages
+     * from inside the runtime call stack.  They publish the largest observed
+     * shortage here; the model owner consumes it at the next VBAR boundary. */
+    int64_t _vbar_reclaim_requested;
     uint64_t _total_vram_last_check;
     ssize_t _deficit_sync;
     uint64_t _control_timestamp_last_check;
@@ -77,6 +81,7 @@ bool set_devctx_for_current_cuda_device(void);
 #define extra_vram_headroom         (g_devctx->_extra_vram_headroom)
 #define malloc_async_clamp          (g_devctx->_malloc_async_clamp)
 #define total_vram_usage            (g_devctx->_total_vram_usage)
+#define vbar_reclaim_requested      (g_devctx->_vbar_reclaim_requested)
 #define total_vram_last_check       (g_devctx->_total_vram_last_check)
 #define deficit_sync                (g_devctx->_deficit_sync)
 #define highest_priority_p          (*(ModelVBAR **)&g_devctx->_highest_priority)

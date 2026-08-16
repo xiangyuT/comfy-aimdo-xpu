@@ -917,8 +917,8 @@ void *allocate_torch_block(size_t size, int device, sycl::queue *queue) {
     if (!pointer) {
         // A pending cached block is safer to wait here than letting the XPU
         // runtime enter an asynchronous OOM/device-lost state. Retry once
-        // after returning every idle block and evicting another request-size
-        // tranche of unpinned model pages.
+        // after returning every idle block and publishing another request-size
+        // tranche for owner-side VBAR reclaim.
         release_cached_torch_blocks(device, true);
         if (!aimdo_xpu_retry_allocation(device, size)) {
             return nullptr;

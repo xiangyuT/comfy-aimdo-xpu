@@ -26,15 +26,12 @@
  * A hook at the driver entry point cannot reclaim before the allocation
  * without re-entering Level Zero's own memory management from inside its
  * allocation call, which was observed to corrupt driver state and surface as
- * UR_RESULT_ERROR_DEVICE_LOST. Arbitrating one layer up removes that hazard:
- * when this hook returns a synthetic failure it has not called the adapter at
- * all, and when it evicts on the retry there is no driver allocation in flight
- * on the thread, so zeVirtualMemUnmap and zePhysicalMemDestroy are ordinary
- * calls.
- *
- * Reclaim on this path must still never wait. aimdo_xpu_evict_for_allocation()
- * routes to vbars_free_retired() on Windows, which releases only provably idle
- * pages and returns immediately otherwise.
+ * UR_RESULT_ERROR_DEVICE_LOST. Arbitrating one layer up enables PyTorch's
+ * native-cache refusal/retry protocol, but this function is still inside the
+ * allocator/UMF call stack.  On Windows, eviction calls therefore only publish
+ * a pressure request; an ensuing VBAR/model-owner boundary performs the
+ * actual unmap after checking page-retirement fences. Linux retains immediate
+ * allocator-time reclaim.
  */
 
 #include <windows.h>
@@ -553,8 +550,9 @@ static ur_result_t aimdo_urUSMDeviceAlloc_body(
         retry_matches(context, device, pool, size, generation)) {
         /* PyTorch is retrying the request this hook failed. It has just called
          * release_cached_blocks(), so its cache has already come back through
-         * urUSMFree and been credited. Evict what is still missing and let the
-         * allocation through. */
+         * urUSMFree and been credited. Publish what is still missing and let
+         * the allocation through; Windows drains it at the next owner-side
+         * VBAR boundary, while Linux still evicts immediately. */
         int reason = t_retry_reason;
         int64_t eviction = deficit > 0 ? deficit : 0;
         LONG64 returned = t_retry_returned_bytes;
@@ -605,7 +603,8 @@ static ur_result_t aimdo_urUSMDeviceAlloc_body(
             stat_add(kCacheLeverSkippedCalls, 1);
         }
         /* Either not a PyTorch segment request, or PyTorch has no cache to
-         * surrender. Evict directly; this never waits on Windows. */
+         * surrender. Windows records this for its next owner-side VBAR
+         * boundary; Linux evicts directly. */
         if (!aimdo_xpu_evict_for_allocation(aimdo_device, deficit)) {
             if (pointer) {
                 *pointer = NULL;

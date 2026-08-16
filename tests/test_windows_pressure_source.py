@@ -32,7 +32,7 @@ def test_xpu_pressure_accounts_for_wddm_nonlocal_fallback():
     assert '"WDDM non-local usage"' in source
 
 
-def test_xpu_reclaims_without_blocking_inside_the_allocation_path():
+def test_xpu_defers_vbar_mutation_out_of_the_allocation_path():
     source = (
         Path(__file__).resolve().parents[1] / "src-xpu" / "stubs.c"
     ).read_text(encoding="utf-8")
@@ -43,11 +43,54 @@ def test_xpu_reclaims_without_blocking_inside_the_allocation_path():
     windows_path = prepare.split(
         "#if defined(_WIN32) || defined(_WIN64)", 1
     )[1].split("#else", 1)[0]
-    # The allocation hook runs inside the driver's allocation call, so it may
-    # only use the reclaim that never waits on the compute queue.
-    assert "vbars_free_retired(deficit);" in windows_path
+    # Being above the driver entry point is not sufficient: the callback still
+    # runs under the allocator/UMF stack. It can publish pressure, but actual
+    # Level Zero unmap must happen at a model-owner boundary.
+    assert "vbars_request_reclaim(deficit);" in windows_path
+    assert "vbars_free_retired" not in windows_path
     assert "vbars_free(" not in windows_path
     assert "cuCtxSynchronize" not in windows_path
+
+    retry = source.split("bool aimdo_xpu_retry_allocation", 1)[1]
+    retry = retry.split("bool aimdo_xpu_allocation_deficit", 1)[0]
+    evict = source.split("bool aimdo_xpu_evict_for_allocation", 1)[1]
+    evict = evict.split("bool aimdo_xpu_account_allocation", 1)[0]
+    for allocation_path in (retry, evict):
+        assert "vbars_request_reclaim" in allocation_path
+        assert "vbars_free_retired" not in allocation_path
+
+
+def test_windows_streaming_paths_only_publish_reclaim_pressure():
+    root = Path(__file__).resolve().parents[1]
+
+    for relative in ("src/hostbuf.c", "src/hostbuf-file-reader.c"):
+        source = (root / relative).read_text(encoding="utf-8")
+
+        assert "vbars_request_reclaim(deficit);" in source
+        assert "vbars_free_retired(deficit);" not in source
+
+
+def test_windows_owner_boundary_consumes_deferred_reclaim():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "src" / "model-vbar.c").read_text(encoding="utf-8")
+    header = (root / "src" / "control.h").read_text(encoding="utf-8")
+
+    assert "int64_t _vbar_reclaim_requested;" in header
+    assert "void vbars_request_reclaim(ssize_t size)" in source
+    request = source.split("void vbars_request_reclaim(ssize_t size)", 1)[1]
+    request = request.split("\n}\n", 1)[0]
+    assert "InterlockedCompareExchange64" in request
+    assert "vbars_free_retired" not in request
+    assert "cuMemUnmap" not in request
+
+    fault = source.split("static int vbar_fault_locked", 1)[1]
+    fault = fault.split("\n}\n", 1)[0]
+    assert "vbars_reclaim_at_owner_boundary(budget_deficit(0));" in fault
+
+    prepare = source.split("void vbars_prepare_allocation", 1)[1]
+    prepare = prepare.split("void vbar_prioritize", 1)[0]
+    assert "vbars_take_reclaim_request();" in prepare
+    assert "vbars_free_except(reclaim, (ModelVBAR *)vbar);" in prepare
 
 
 def test_windows_model_boundary_applies_deferred_native_pressure():
@@ -101,10 +144,8 @@ def test_windows_speculative_reclaim_preserves_active_vbar():
         "void vbars_prepare_allocation(void *devctx, void *vbar, "
         "uint64_t size)"
     ) in normalized
-    assert (
-        "vbars_free_except(budget_deficit((size_t)size), "
-        "(ModelVBAR *)vbar);"
-    ) in normalized
+    assert "reclaim = budget_deficit((size_t)size);" in normalized
+    assert "vbars_free_except(reclaim, (ModelVBAR *)vbar);" in normalized
 
 
 def test_vbar_fault_reclaims_the_actual_deficit_before_retry():

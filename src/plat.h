@@ -235,6 +235,7 @@ uint64_t aimdo_xpu_retired_epoch(void);
 void aimdo_xpu_register_queue(void *queue);
 /* model_vbar.c */
 size_t vbars_free_retired(ssize_t size);
+void vbars_request_reclaim(ssize_t size);
 SHARED_EXPORT
 void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
                        uint64_t stream);

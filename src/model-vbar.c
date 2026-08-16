@@ -62,9 +62,7 @@ static inline void vbar_state_unlock(void) {
 }
 
 /* Diagnostic/correctness escape hatch.  A disabled asynchronous path leaves
- * reclaim to synchronized model boundaries and normal host offload.  Keep the
- * decision in vbars_free_retired() so every caller, including allocator hooks
- * and both host streaming implementations, is covered. */
+ * reclaim to synchronized model boundaries and normal host offload. */
 static bool vbar_async_reclaim_enabled(void) {
     static volatile LONG cached = -1;
     LONG enabled = InterlockedCompareExchange(&cached, -1, -1);
@@ -297,13 +295,57 @@ size_t vbars_free(ssize_t size) {
 }
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+/* Publish pressure from a runtime allocation/copy callback without touching
+ * Level Zero virtual memory from that callback's stack.  Deficits describe a
+ * target shortage, rather than independent allocations, so keep the maximum
+ * instead of adding concurrent requests. */
+void vbars_request_reclaim(ssize_t size) {
+    volatile LONG64 *requested;
+    LONG64 current;
+
+    if (!g_devctx || size <= 0) {
+        return;
+    }
+    requested = (volatile LONG64 *)&vbar_reclaim_requested;
+    current = InterlockedCompareExchange64(requested, 0, 0);
+    while (current < (LONG64)size) {
+        LONG64 observed =
+            InterlockedCompareExchange64(requested, (LONG64)size, current);
+
+        if (observed == current) {
+            return;
+        }
+        current = observed;
+    }
+}
+
+static ssize_t vbars_take_reclaim_request(void) {
+    return g_devctx
+        ? (ssize_t)InterlockedExchange64(
+              (volatile LONG64 *)&vbar_reclaim_requested, 0)
+        : 0;
+}
+
+static size_t vbars_reclaim_at_owner_boundary(ssize_t live_deficit) {
+    ssize_t requested = vbars_take_reclaim_request();
+
+    if (requested > 0) {
+        log(DEBUG,
+            "%s: deferred=%zu MB live=%zu MB\n", __func__,
+            (size_t)requested / M,
+            live_deficit > 0 ? (size_t)live_deficit / M : 0);
+    }
+    if (requested > live_deficit) {
+        live_deficit = requested;
+    }
+    return vbars_free_retired(live_deficit);
+}
+
 /* Reclaim without ever waiting on the compute queue.
  *
- * This is the only reclaim that is legal inside a native allocation path. A
- * Windows Torch allocation cannot fail - WDDM demotes the excess to non-local
- * memory instead - so there is no correctness requirement to free anything
- * before returning. Reclaim is therefore best effort: it releases every page
- * that is provably idle and skips the rest rather than waiting for one.
+ * This runs only from a VBAR/model-owner boundary, never from a native
+ * allocation or host-copy callback.  It is still best effort: release every
+ * page that is provably idle and skip the rest rather than waiting for one.
  *
  * Two differences from vbars_free_except() matter:
  *
@@ -544,6 +586,8 @@ void vbars_reset_watermark_limits(void *devctx) {
 
 SHARED_EXPORT
 void vbars_prepare_allocation(void *devctx, void *vbar, uint64_t size) {
+    ssize_t reclaim;
+
     set_devctx((AimdoContext *)devctx);
     one_time_setup();
     /*
@@ -554,7 +598,17 @@ void vbars_prepare_allocation(void *devctx, void *vbar, uint64_t size) {
      * pages from the active model on the strength of that prediction alone.
      * A later vbar_fault() still applies exact live pressure to every VBAR.
      */
-    vbars_free_except(budget_deficit((size_t)size), (ModelVBAR *)vbar);
+    reclaim = budget_deficit((size_t)size);
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+    {
+        ssize_t requested = vbars_take_reclaim_request();
+
+        if (requested > reclaim) {
+            reclaim = requested;
+        }
+    }
+#endif
+    vbars_free_except(reclaim, (ModelVBAR *)vbar);
 }
 
 SHARED_EXPORT
@@ -629,9 +683,10 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
      * py-spy caught the sampler thread inside
      * vbar_fault -> vbars_analyze -> queue::wait_and_throw -> urQueueFinish,
      * with per-step time degrading run over run as the resident set shrank and
-     * misses multiplied. Use the non-blocking reclaim: it releases every page
-     * that is provably idle and skips the rest. */
-    vbars_free_retired(budget_deficit(0));
+     * misses multiplied. Merge live pressure with requests recorded by native
+     * allocator/copy callbacks, then reclaim here: this is the model owner's
+     * call stack, outside the allocator/UMF critical section. */
+    vbars_reclaim_at_owner_boundary(budget_deficit(0));
 #else
     vbars_free(budget_deficit(0));
 #endif

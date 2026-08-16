@@ -14,10 +14,10 @@
  * so it is no longer the default.
  *
  * Everything reached from these hooks must be non-blocking. A hook body runs
- * inside the driver's allocation call, and the compute queue it would wait on
- * may be blocked behind work that needs the very residency being requested.
- * aimdo_xpu_prepare_allocation() therefore reclaims only VBAR pages that are
- * provably retired and returns immediately otherwise.
+ * inside the native allocator stack, and re-entering Level Zero virtual-memory
+ * management there can race UMF/WDDM even after the lower allocation returned.
+ * aimdo_xpu_prepare_allocation() therefore records pressure only; an ensuing
+ * VBAR/model-owner boundary performs the actual retired-page reclaim.
  */
 
 #include <ze_api.h>
@@ -115,10 +115,10 @@ static ze_result_t ZE_APICALL aimdo_zeMemAllocDevice(
      * observed to corrupt driver state and surface later as
      * UR_RESULT_ERROR_DEVICE_LOST, with progressive slowdown beforehand.
      *
-     * Nothing requires reclaim to complete first: a Windows device allocation
-     * does not fail, WDDM demotes the excess instead. Reclaiming immediately
-     * after the driver call returns keeps steady-state usage bounded just as
-     * well, without ever re-entering the driver. */
+     * Nothing requires reclaim to complete first: WDDM normally demotes an
+     * over-budget Windows allocation. After the call returns, publish the
+     * resulting pressure; do not mutate VBAR mappings until the next owner
+     * boundary has left the allocator/UMF stack. */
     aimdo_xpu_sample_pressure(device, size);
 
     result = true_zeMemAllocDevice(context, descriptor, size, alignment,
@@ -132,10 +132,9 @@ static ze_result_t ZE_APICALL aimdo_zeMemAllocDevice(
 
     if (result == ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY ||
         result == ZE_RESULT_ERROR_OUT_OF_HOST_MEMORY) {
-        /* WDDM normally demotes an over-budget allocation instead of failing,
-         * so reaching this point means the driver could not place the request
-         * at all. The driver call has returned, so reclaiming here is not
-         * re-entrant. */
+        /* WDDM normally demotes an over-budget allocation instead of failing.
+         * Even here the enclosing allocator stack is active, so record the
+         * request for owner-side reclaim before the allocator retries. */
         aimdo_xpu_retry_allocation(device, size);
         result = true_zeMemAllocDevice(context, descriptor, size, alignment,
                                        device_handle, pointer);
