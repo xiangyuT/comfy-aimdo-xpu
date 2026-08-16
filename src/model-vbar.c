@@ -564,10 +564,19 @@ void *vbar_allocate(void *devctx, uint64_t size, int device) {
     log(DEBUG, "%s (start): size=%zuM, device=%d\n", __func__, size / M, device);
 
     size_t nr_pages = VBAR_GET_PAGE_NR_UP(size);
+#if defined(AIMDO_XPU)
+    /* ComfyUI sizes a VBAR as model_size()*10 so the virtual address space
+     * covers the whole logical model (casts can inflate weight size several
+     * times over).  Physical residency is still bounded at fault time by
+     * budget_deficit()/reclaim, so capping the VA reservation at physical
+     * VRAM capacity only forced every weight beyond that offset to stream
+     * from host storage on each use.  Keep the full reservation. */
+#else
     size_t nr_pages_max = VBAR_GET_PAGE_NR(vram_capacity);
     if (nr_pages_max < nr_pages) {
         nr_pages = nr_pages_max;
     }
+#endif
     size = (uint64_t)nr_pages * VBAR_PAGE_SIZE;
 
     if (!(mv = calloc(1, sizeof(*mv) + nr_pages * sizeof(mv->residency_map[0])))) {
@@ -731,12 +740,11 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
 
     size_t page_end = VBAR_GET_PAGE_NR_UP(offset + size);
     if (page_end > mv->nr_pages) {
-        /* ComfyUI sizes a VBAR as model_size()*10, but vbar_allocate() clamps
-         * the reservation to physical VRAM capacity.  Faults past the reserved
-         * range have no VA to map into: reopening the watermark there would
-         * index residency_map out of bounds and make zeVirtualMemMap fail
-         * with INVALID_ARGUMENT.  Return OOM so the caller streams the weight
-         * from host storage, matching the pre-reopen behavior. */
+        /* Defense in depth: a fault past the reserved VA range has no address
+         * space to map into.  Reopening the watermark there would index
+         * residency_map out of bounds and make zeVirtualMemMap fail with
+         * INVALID_ARGUMENT.  Return OOM so the caller streams the weight from
+         * host storage instead. */
         log(DEBUG,
             "VBAR fault offset=%llu size=%llu exceeds reservation "
             "(%zu pages); streaming from host storage\n",
