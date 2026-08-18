@@ -229,10 +229,10 @@ SHARED_EXPORT
 uint64_t vbars_analyze(void *devctx, bool only_dirty);
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-/* dispatch.cpp: retirement epochs for queue-free reclaim */
-uint64_t aimdo_xpu_retire_epoch_current(void);
-uint64_t aimdo_xpu_retired_epoch(void);
-void aimdo_xpu_register_queue(void *queue);
+/* dispatch.cpp: per-queue retirement tokens for non-blocking reclaim */
+uint64_t aimdo_xpu_retire_token_current(void *queue);
+size_t aimdo_xpu_retire_snapshot(uint64_t *completed, size_t count,
+                                 bool force_submit);
 /* model_vbar.c */
 size_t vbars_free_retired(ssize_t size);
 void vbars_request_reclaim(ssize_t size);

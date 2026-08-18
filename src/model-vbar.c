@@ -19,10 +19,13 @@ typedef struct ResidentPage {
     uint32_t pin_count;
     size_t serial;
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-    /* Epoch at which this page stopped being used. Compared against the
-     * published retired epoch so a reclaim can prove the page is idle without
-     * waiting on the queue. */
-    uint64_t retire_epoch;
+    /* One dependency per queue that actually consumed this page. The token
+     * names both the queue and its fence generation. Sixty-four entries cost
+     * at most 512 bytes per 32 MiB VBAR page and avoid lossy fixed-size
+     * overflow or a heap allocation in the hot path. */
+    uint64_t retire_tokens[AIMDO_XPU_RETIRE_MAX_QUEUES];
+    uint8_t retire_token_count;
+    uint8_t retire_unknown;
 #endif
 } ResidentPage;
 
@@ -78,6 +81,59 @@ static bool vbar_async_reclaim_enabled(void) {
         enabled = InterlockedCompareExchange(&cached, -1, -1);
     }
     return enabled != 0;
+}
+
+static inline void vbar_retire_reset(ResidentPage *rp) {
+    rp->retire_token_count = 0;
+    rp->retire_unknown = 0;
+}
+
+static inline void vbar_retire_record(ResidentPage *rp, uint64_t token) {
+    uint64_t queue_tag;
+
+    if (!token) {
+        rp->retire_unknown = 1;
+        return;
+    }
+    queue_tag = token & AIMDO_XPU_RETIRE_TOKEN_QUEUE_MASK;
+    for (uint8_t index = 0; index < rp->retire_token_count; ++index) {
+        uint64_t existing = rp->retire_tokens[index];
+
+        if ((existing & AIMDO_XPU_RETIRE_TOKEN_QUEUE_MASK) == queue_tag) {
+            if (token > existing) {
+                rp->retire_tokens[index] = token;
+            }
+            return;
+        }
+    }
+    if (rp->retire_token_count >= AIMDO_XPU_RETIRE_MAX_QUEUES) {
+        rp->retire_unknown = 1;
+        return;
+    }
+    rp->retire_tokens[rp->retire_token_count++] = token;
+}
+
+static inline bool vbar_retire_complete(
+    const ResidentPage *rp, const uint64_t *completed, size_t count) {
+    if (rp->retire_unknown) {
+        return false;
+    }
+    for (uint8_t index = 0; index < rp->retire_token_count; ++index) {
+        uint64_t token = rp->retire_tokens[index];
+        uint64_t queue_tag = token & AIMDO_XPU_RETIRE_TOKEN_QUEUE_MASK;
+        size_t queue_index;
+        uint64_t generation;
+
+        if (!queue_tag) {
+            return false;
+        }
+        queue_index = (size_t)(queue_tag - 1);
+        generation = token >> AIMDO_XPU_RETIRE_TOKEN_QUEUE_BITS;
+        if (queue_index >= count || completed[queue_index] < generation) {
+            return false;
+        }
+    }
+    return true;
 }
 #else
 static inline void vbar_state_lock(void) {}
@@ -244,6 +300,9 @@ static inline bool mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unp
         CHECK_CU(cuMemRelease(rp->handle));
         total_vram_usage -= VBAR_PAGE_SIZE;
         rp->handle = 0;
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+        vbar_retire_reset(rp);
+#endif
         mv->resident_count--;
     }
     if (do_unpin) {
@@ -365,7 +424,8 @@ static size_t vbars_reclaim_at_owner_boundary(ssize_t live_deficit) {
  */
 size_t vbars_free_retired(ssize_t size) {
     size_t pages_needed;
-    uint64_t retired;
+    uint64_t completed[AIMDO_XPU_RETIRE_MAX_QUEUES] = {0};
+    size_t completed_count;
 
     if (size <= 0) {
         return 0;
@@ -375,7 +435,8 @@ size_t vbars_free_retired(ssize_t size) {
     if (!vbar_async_reclaim_enabled()) {
         return pages_needed;
     }
-    retired = aimdo_xpu_retired_epoch();
+    completed_count = aimdo_xpu_retire_snapshot(
+        completed, AIMDO_XPU_RETIRE_MAX_QUEUES, true);
 
     /* The Unified Runtime hook may arrive while fault/unpin owns the metadata
      * lock.  Waiting here would move the old allocation-path deadlock from a
@@ -408,7 +469,8 @@ size_t vbars_free_retired(ssize_t size) {
         while (pages_needed && page_nr > floor) {
             ResidentPage *rp = &i->residency_map[--page_nr];
 
-            if (!rp->handle || rp->pin_count || rp->retire_epoch > retired) {
+            if (!rp->handle || rp->pin_count ||
+                !vbar_retire_complete(rp, completed, completed_count)) {
                 continue;
             }
             if (mod1(i, page_nr, true, false)) {
@@ -881,26 +943,18 @@ void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
                        uint64_t stream) {
     ModelVBAR *mv = (ModelVBAR *)vbar;
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-    uint64_t retirement_epoch;
+    uint64_t retirement_token;
 #endif
 
     set_devctx((AimdoContext *)devctx);
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-    /* VBAR map/unmap use the Level Zero virtual-memory calls, which carry no
-     * stream, so this is the only point where the queue that actually consumed
-     * the weight is visible. Register it before tagging the pages: a
-     * retirement fence submitted only to the default queue does not order work
-     * queued elsewhere, and reclaiming on that proof released pages that were
-     * still in use. */
-    if (stream) {
-        aimdo_xpu_register_queue((void *)(uintptr_t)stream);
-    }
-    /* Snapshot the epoch after the operator was submitted but before taking
-     * the page-state lock.  This preserves the retire-lock -> VBAR-lock order
-     * used by reclaim and avoids a lock inversion.  Publishing the epoch and
-     * the final pin transition happens atomically under vbar_state_lock(). */
-    retirement_epoch = aimdo_xpu_retire_epoch_current();
+    /* Capture the actual consuming queue after its operator was submitted.
+     * The token call owns only the retire lock; taking it before the page lock
+     * preserves the retire-lock -> VBAR-lock order used by pressure scans. A
+     * missing/overflowed queue returns zero and makes the page fail closed. */
+    retirement_token = aimdo_xpu_retire_token_current(
+        (void *)(uintptr_t)stream);
 #else
     (void)stream;
 #endif
@@ -910,10 +964,9 @@ void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
     size_t page_end = VBAR_GET_PAGE_NR_UP(offset + size);
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-    /* Windows never frees a page from here. Pages above the watermark are
-     * tagged with a retirement epoch and released later by the non-blocking
-     * reclaim, so neither synchronize below is needed - and both ran on every
-     * unpinned weight, which is the hot path. */
+    /* Windows never frees a page from here. Pages above the watermark retain
+     * per-queue completion tokens and are released later by non-blocking
+     * reclaim, so neither synchronize below is needed. */
     const bool free_above_watermark = false;
 #else
     const bool free_above_watermark = true;
@@ -926,13 +979,12 @@ void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
     for (uint64_t page_nr = VBAR_GET_PAGE_NR(offset); page_nr < page_end && page_nr < mv->nr_pages; page_nr++) {
         ResidentPage *rp = &mv->residency_map[page_nr];
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-        /* Publish the retirement proof before making the page idle. Because
-         * reclaim holds the same lock, it can never observe pin_count == 0
-         * paired with the previous use's retire_epoch. */
-        if (rp->pin_count == 1) {
-            rp->retire_epoch = retirement_epoch;
-            rp->pin_count = 0;
-        } else if (rp->pin_count) {
+        /* Record every concurrent consumer, not just the final unpin. The last
+         * caller to drop pin_count cannot prove that earlier queues have also
+         * completed. Publishing dependencies before decrementing makes the
+         * transition to idle atomic to the reclaim scan. */
+        if (rp->pin_count) {
+            vbar_retire_record(rp, retirement_token);
             rp->pin_count--;
         }
 #else
@@ -949,18 +1001,7 @@ void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
     }
 #endif
 
-#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-    /* Advance retirement while the model runs, not only once something is
-     * already under pressure. Polling here keeps at most one fence in flight
-     * and costs a single barrier per completion interval, but it means the
-     * published retired epoch is current by the time an allocation hook needs
-     * to reclaim. Waiting until first pressure to submit a fence would leave
-     * every page unprovable exactly when the memory is needed. */
     vbar_state_unlock();
-    (void)aimdo_xpu_retired_epoch();
-#else
-    vbar_state_unlock();
-#endif
 }
 
 SHARED_EXPORT

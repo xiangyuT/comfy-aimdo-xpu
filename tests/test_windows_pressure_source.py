@@ -164,8 +164,8 @@ def test_vbar_fault_wddm_retry_margin_is_windows_xpu_only():
     ).read_text(encoding="utf-8")
 
     guard = "#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))"
-    # The retry margin, the page retirement epoch and the non-blocking reclaim
-    # are all Windows XPU only; Linux and CUDA keep the original behaviour.
+    # The retry margin, page retirement tokens and non-blocking reclaim are all
+    # Windows XPU only; Linux and CUDA keep the original behaviour.
     assert source.count(guard) >= 2
     assert "#define VBAR_WDDM_RETRY_RECLAIM (512 << 20)" in source
     assert "(void)vbars_free_retired(VBAR_WDDM_RETRY_RECLAIM);" in source
@@ -176,7 +176,7 @@ def test_vbar_fault_wddm_retry_margin_is_windows_xpu_only():
         "VBAR Windows XPU retry reclaiming an additional", 1
     )[1].split("#endif", 1)[0]
     assert "vbars_free(VBAR_WDDM_RETRY_RECLAIM)" not in retry
-    for windows_only in ("VBAR_WDDM_RETRY_RECLAIM", "retire_epoch",
+    for windows_only in ("VBAR_WDDM_RETRY_RECLAIM", "retire_tokens",
                          "vbars_free_retired"):
         assert windows_only not in source.split(guard, 1)[0]
 
@@ -192,8 +192,8 @@ def test_non_blocking_reclaim_never_waits_or_moves_the_watermark():
     # Waiting here would block the driver's allocation call behind work that
     # may itself be waiting for the residency being requested.
     assert "cuCtxSynchronize" not in body
-    assert "aimdo_xpu_retired_epoch()" in body
-    assert "rp->retire_epoch > retired" in body
+    assert "aimdo_xpu_retire_snapshot(" in body
+    assert "vbar_retire_complete(rp, completed, completed_count)" in body
     # Lowering the watermark denies future faults until the next activation,
     # which turns a momentary spike into a permanently smaller working set.
     assert "watermark--" not in body
@@ -224,19 +224,45 @@ def test_windows_vbar_reclaim_serializes_page_state_without_waiting():
     assert "vbar_state_unlock();" in fault
 
 
-def test_windows_final_unpin_publishes_epoch_before_idle_state():
+def test_windows_unpin_publishes_queue_token_before_idle_state():
     source = (
         Path(__file__).resolve().parents[1] / "src" / "model-vbar.c"
     ).read_text(encoding="utf-8")
     unpin = source.split("void vbar_unpin_stream", 1)[1]
     unpin = unpin.split("\n}\n", 1)[0]
 
-    epoch_snapshot = unpin.index(
-        "retirement_epoch = aimdo_xpu_retire_epoch_current();"
+    token_snapshot = unpin.index(
+        "retirement_token = aimdo_xpu_retire_token_current("
     )
     state_lock = unpin.index("vbar_state_lock();")
-    epoch_publish = unpin.index("rp->retire_epoch = retirement_epoch;")
-    idle_publish = unpin.index("rp->pin_count = 0;")
+    token_publish = unpin.index(
+        "vbar_retire_record(rp, retirement_token);"
+    )
+    idle_publish = unpin.index("rp->pin_count--;")
     state_unlock = unpin.index("vbar_state_unlock();")
 
-    assert epoch_snapshot < state_lock < epoch_publish < idle_publish < state_unlock
+    assert token_snapshot < state_lock < token_publish < idle_publish < state_unlock
+
+
+def test_windows_retirement_is_per_queue_and_fence_submissions_are_batched():
+    root = Path(__file__).resolve().parents[1]
+    dispatch = (root / "src-xpu" / "dispatch.cpp").read_text(
+        encoding="utf-8"
+    )
+    model_vbar = (root / "src" / "model-vbar.c").read_text(
+        encoding="utf-8"
+    )
+
+    assert "constexpr size_t kRetireBatchUses = 64;" in dispatch
+    assert "struct RetireQueue" in dispatch
+    assert "uint64_t aimdo_xpu_retire_token_current(" in dispatch
+    assert "retire_queue.pending_uses >= kRetireBatchUses" in dispatch
+    assert "size_t aimdo_xpu_retire_snapshot(" in dispatch
+    assert "force_submit && retire_queue.pending_uses" in dispatch
+    assert "g_retired_epoch" not in dispatch
+    assert "g_retire_pending" not in dispatch
+
+    assert "retire_tokens[AIMDO_XPU_RETIRE_MAX_QUEUES]" in model_vbar
+    assert "vbar_retire_record(rp, retirement_token);" in model_vbar
+    assert "vbar_retire_complete(" in model_vbar
+    assert "retire_unknown" in model_vbar

@@ -603,6 +603,12 @@ def get_xpu_vmm_stats():
         "small_vbar_copy_fallback_calls",
         "small_vbar_copy_fallback_bytes",
         "small_vbar_copy_fallback_failures",
+        "retire_token_calls",
+        "retire_fence_submit_calls",
+        "retire_fence_complete_calls",
+        "retire_fence_submit_failures",
+        "retire_force_polls",
+        "retire_tracked_queues",
     )
     values = (ctypes.c_uint64 * len(names))()
     if not lib.xpu_get_vmm_stats(values, len(names)):
