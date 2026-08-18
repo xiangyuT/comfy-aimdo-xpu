@@ -100,7 +100,15 @@ def test_windows_model_boundary_applies_deferred_native_pressure():
         / "model_vbar.py"
     ).read_text(encoding="utf-8")
 
-    assert "anticipated_growth = max(0, peak_reserved - reserved)" in source
+    assert "historical_growth = max(0, peak_reserved - reserved)" in source
+    assert (
+        "inference_budget = current_inference_memory_budget(self.device)"
+        in source
+    )
+    assert (
+        "anticipated_growth = max(historical_growth, inference_budget)"
+        in source
+    )
     assert "lib.vbars_prepare_allocation(" in source
     normalized = " ".join(source.split())
     assert (
