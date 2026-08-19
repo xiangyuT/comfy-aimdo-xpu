@@ -102,19 +102,15 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
             return false;
         }
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-        /* Streaming a missed weight is the largest consumer of device memory
-         * that never allocates through a hooked entry point, so nothing else
-         * applies pressure here.
-         *
-         * Under suspicion: reclaim can only skip the destination page while it
-         * is pinned, and that has not been verified for this call path. Set
-         * AIMDO_XPU_NO_STREAM_RECLAIM=1 to disable it and compare.
-         */
+        /* The destination was budgeted and pinned by the preceding VBAR
+         * fault.  A copy callback may observe later pressure, but it must not
+         * unmap other pages while Level Zero is preparing this transfer.
+         * Publish the shortage for the next owner-side fault instead. */
         if (!aimdo_stream_reclaim_disabled()) {
             ssize_t deficit = budget_deficit(chunk);
 
             if (deficit > 0) {
-                vbars_free_retired(deficit);
+                vbars_request_reclaim(deficit);
             }
         }
 #endif

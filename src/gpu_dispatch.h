@@ -4,6 +4,13 @@
 
 #include <stdbool.h>
 
+/* Windows/XPU VBAR retirement token layout. Queue tags are one based, leaving
+ * token zero as an explicit unknown/fail-closed dependency. */
+#define AIMDO_XPU_RETIRE_MAX_QUEUES 64
+#define AIMDO_XPU_RETIRE_TOKEN_QUEUE_BITS 7
+#define AIMDO_XPU_RETIRE_TOKEN_QUEUE_MASK \
+    ((1ull << AIMDO_XPU_RETIRE_TOKEN_QUEUE_BITS) - 1)
+
 typedef CUresult (CUDAAPI *PFN_cuInit)(unsigned int flags);
 typedef CUresult (CUDAAPI *PFN_cuGetProcAddress)(const char *symbol, void **pfn, int cudaVersion,
                                                  cuuint64_t flags,

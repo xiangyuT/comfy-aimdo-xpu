@@ -1,4 +1,5 @@
 #include "plat.h"
+#include "thread-plat.h"
 
 #define VBAR_PAGE_SIZE (32 << 20)
 
@@ -18,10 +19,13 @@ typedef struct ResidentPage {
     uint32_t pin_count;
     size_t serial;
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-    /* Epoch at which this page stopped being used. Compared against the
-     * published retired epoch so a reclaim can prove the page is idle without
-     * waiting on the queue. */
-    uint64_t retire_epoch;
+    /* One dependency per queue that actually consumed this page. The token
+     * names both the queue and its fence generation. Sixty-four entries cost
+     * at most 512 bytes per 32 MiB VBAR page and avoid lossy fixed-size
+     * overflow or a heap allocation in the hot path. */
+    uint64_t retire_tokens[AIMDO_XPU_RETIRE_MAX_QUEUES];
+    uint8_t retire_token_count;
+    uint8_t retire_unknown;
 #endif
 } ResidentPage;
 
@@ -40,6 +44,102 @@ typedef struct ModelVBAR {
 
     ResidentPage residency_map[1]; /* Must be last! */
 } ModelVBAR;
+
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+/* VBAR mappings are visible to the Python model thread and to allocations
+ * intercepted on arbitrary runtime threads.  The retirement fence proves GPU
+ * completion, but it cannot make the CPU-side handle/pin/epoch transition
+ * atomic.  Serialize that metadata exactly as a caching allocator serializes
+ * its block state.  Allocation-path reclaim uses try-lock below, so this lock
+ * never makes a driver allocation wait behind the model thread. */
+static inline void vbar_state_lock(void) {
+    mutex_lock((Mutex)vbar_lock);
+}
+
+static inline bool vbar_state_try_lock(void) {
+    return mutex_try_lock((Mutex)vbar_lock);
+}
+
+static inline void vbar_state_unlock(void) {
+    mutex_unlock((Mutex)vbar_lock);
+}
+
+/* Diagnostic/correctness escape hatch.  A disabled asynchronous path leaves
+ * reclaim to synchronized model boundaries and normal host offload. */
+static bool vbar_async_reclaim_enabled(void) {
+    static volatile LONG cached = -1;
+    LONG enabled = InterlockedCompareExchange(&cached, -1, -1);
+
+    if (enabled < 0) {
+        char value[8];
+        DWORD length = GetEnvironmentVariableA(
+            "AIMDO_XPU_ASYNC_VBAR_RECLAIM", value, sizeof(value));
+        LONG detected = !(length > 0 && length < sizeof(value) &&
+                          value[0] == '0');
+
+        InterlockedCompareExchange(&cached, detected, -1);
+        enabled = InterlockedCompareExchange(&cached, -1, -1);
+    }
+    return enabled != 0;
+}
+
+static inline void vbar_retire_reset(ResidentPage *rp) {
+    rp->retire_token_count = 0;
+    rp->retire_unknown = 0;
+}
+
+static inline void vbar_retire_record(ResidentPage *rp, uint64_t token) {
+    uint64_t queue_tag;
+
+    if (!token) {
+        rp->retire_unknown = 1;
+        return;
+    }
+    queue_tag = token & AIMDO_XPU_RETIRE_TOKEN_QUEUE_MASK;
+    for (uint8_t index = 0; index < rp->retire_token_count; ++index) {
+        uint64_t existing = rp->retire_tokens[index];
+
+        if ((existing & AIMDO_XPU_RETIRE_TOKEN_QUEUE_MASK) == queue_tag) {
+            if (token > existing) {
+                rp->retire_tokens[index] = token;
+            }
+            return;
+        }
+    }
+    if (rp->retire_token_count >= AIMDO_XPU_RETIRE_MAX_QUEUES) {
+        rp->retire_unknown = 1;
+        return;
+    }
+    rp->retire_tokens[rp->retire_token_count++] = token;
+}
+
+static inline bool vbar_retire_complete(
+    const ResidentPage *rp, const uint64_t *completed, size_t count) {
+    if (rp->retire_unknown) {
+        return false;
+    }
+    for (uint8_t index = 0; index < rp->retire_token_count; ++index) {
+        uint64_t token = rp->retire_tokens[index];
+        uint64_t queue_tag = token & AIMDO_XPU_RETIRE_TOKEN_QUEUE_MASK;
+        size_t queue_index;
+        uint64_t generation;
+
+        if (!queue_tag) {
+            return false;
+        }
+        queue_index = (size_t)(queue_tag - 1);
+        generation = token >> AIMDO_XPU_RETIRE_TOKEN_QUEUE_BITS;
+        if (queue_index >= count || completed[queue_index] < generation) {
+            return false;
+        }
+    }
+    return true;
+}
+#else
+static inline void vbar_state_lock(void) {}
+static inline bool vbar_state_try_lock(void) { return true; }
+static inline void vbar_state_unlock(void) {}
+#endif
 
 static inline void one_time_setup() {
     if (!highest_priority_p) {
@@ -62,9 +162,11 @@ uint64_t vbars_analyze(void *devctx, bool only_dirty) {
     size_t calculated_total_vram = 0;
 
     set_devctx((AimdoContext *)devctx);
+    vbar_state_lock();
 
     one_time_setup();
     if (only_dirty && !vbars_dirty) {
+        vbar_state_unlock();
         return 0;
     }
     vbars_dirty = false;
@@ -102,6 +204,7 @@ uint64_t vbars_analyze(void *devctx, bool only_dirty) {
     }
 
     log(DEBUG, "Total VRAM for VBARs: %zu MB\n", calculated_total_vram / M);
+    vbar_state_unlock();
     return (uint64_t)calculated_total_vram;
 }
 
@@ -121,6 +224,7 @@ int aimdo_vbar_describe_range(uint64_t address, uint64_t size, int *mapped,
     if (!g_devctx) {
         return 0;
     }
+    vbar_state_lock();
     one_time_setup();
     for (ModelVBAR *i = lowest_priority.higher; i && i != &highest_priority;
          i = i->higher) {
@@ -164,9 +268,11 @@ int aimdo_vbar_describe_range(uint64_t address, uint64_t size, int *mapped,
             if (pages_spanned) {
                 *pages_spanned = (uint64_t)(last - first + 1);
             }
+            vbar_state_unlock();
             return 1;
         }
     }
+    vbar_state_unlock();
     return 0;
 }
 
@@ -194,6 +300,9 @@ static inline bool mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unp
         CHECK_CU(cuMemRelease(rp->handle));
         total_vram_usage -= VBAR_PAGE_SIZE;
         rp->handle = 0;
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+        vbar_retire_reset(rp);
+#endif
         mv->resident_count--;
     }
     if (do_unpin) {
@@ -206,12 +315,13 @@ static size_t vbars_free_except(ssize_t size, ModelVBAR *preserved) {
     size_t pages_needed;
     bool dirty = false;
 
-    one_time_setup();
-    vbars_dirty = true;
-
     if (size <= 0) {
         return 0;
     }
+
+    vbar_state_lock();
+    one_time_setup();
+    vbars_dirty = true;
 
     pages_needed = VBAR_GET_PAGE_NR_UP((size_t)size);
 
@@ -235,6 +345,7 @@ static size_t vbars_free_except(ssize_t size, ModelVBAR *preserved) {
         CHECK_CU(cuCtxSynchronize());
     }
 
+    vbar_state_unlock();
     return pages_needed;
 }
 
@@ -243,13 +354,57 @@ size_t vbars_free(ssize_t size) {
 }
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+/* Publish pressure from a runtime allocation/copy callback without touching
+ * Level Zero virtual memory from that callback's stack.  Deficits describe a
+ * target shortage, rather than independent allocations, so keep the maximum
+ * instead of adding concurrent requests. */
+void vbars_request_reclaim(ssize_t size) {
+    volatile LONG64 *requested;
+    LONG64 current;
+
+    if (!g_devctx || size <= 0) {
+        return;
+    }
+    requested = (volatile LONG64 *)&vbar_reclaim_requested;
+    current = InterlockedCompareExchange64(requested, 0, 0);
+    while (current < (LONG64)size) {
+        LONG64 observed =
+            InterlockedCompareExchange64(requested, (LONG64)size, current);
+
+        if (observed == current) {
+            return;
+        }
+        current = observed;
+    }
+}
+
+static ssize_t vbars_take_reclaim_request(void) {
+    return g_devctx
+        ? (ssize_t)InterlockedExchange64(
+              (volatile LONG64 *)&vbar_reclaim_requested, 0)
+        : 0;
+}
+
+static size_t vbars_reclaim_at_owner_boundary(ssize_t live_deficit) {
+    ssize_t requested = vbars_take_reclaim_request();
+
+    if (requested > 0) {
+        log(DEBUG,
+            "%s: deferred=%zu MB live=%zu MB\n", __func__,
+            (size_t)requested / M,
+            live_deficit > 0 ? (size_t)live_deficit / M : 0);
+    }
+    if (requested > live_deficit) {
+        live_deficit = requested;
+    }
+    return vbars_free_retired(live_deficit);
+}
+
 /* Reclaim without ever waiting on the compute queue.
  *
- * This is the only reclaim that is legal inside a native allocation path. A
- * Windows Torch allocation cannot fail - WDDM demotes the excess to non-local
- * memory instead - so there is no correctness requirement to free anything
- * before returning. Reclaim is therefore best effort: it releases every page
- * that is provably idle and skips the rest rather than waiting for one.
+ * This runs only from a VBAR/model-owner boundary, never from a native
+ * allocation or host-copy callback.  It is still best effort: release every
+ * page that is provably idle and skip the rest rather than waiting for one.
  *
  * Two differences from vbars_free_except() matter:
  *
@@ -269,16 +424,31 @@ size_t vbars_free(ssize_t size) {
  */
 size_t vbars_free_retired(ssize_t size) {
     size_t pages_needed;
-    uint64_t retired;
-
-    one_time_setup();
+    uint64_t completed[AIMDO_XPU_RETIRE_MAX_QUEUES] = {0};
+    size_t completed_count;
 
     if (size <= 0) {
         return 0;
     }
 
     pages_needed = VBAR_GET_PAGE_NR_UP((size_t)size);
-    retired = aimdo_xpu_retired_epoch();
+    if (!vbar_async_reclaim_enabled()) {
+        return pages_needed;
+    }
+    completed_count = aimdo_xpu_retire_snapshot(
+        completed, AIMDO_XPU_RETIRE_MAX_QUEUES, true);
+
+    /* The Unified Runtime hook may arrive while fault/unpin owns the metadata
+     * lock.  Waiting here would move the old allocation-path deadlock from a
+     * GPU queue wait to a CPU lock wait, so fail closed and retry later. */
+    if (!vbar_state_try_lock()) {
+        log(VVERBOSE,
+            "%s: VBAR metadata busy; skipped %zu pages without waiting\n",
+            __func__, pages_needed);
+        return pages_needed;
+    }
+
+    one_time_setup();
     vbars_dirty = true;
 
     for (ModelVBAR *i = lowest_priority.higher; pages_needed && i != &highest_priority;
@@ -299,7 +469,8 @@ size_t vbars_free_retired(ssize_t size) {
         while (pages_needed && page_nr > floor) {
             ResidentPage *rp = &i->residency_map[--page_nr];
 
-            if (!rp->handle || rp->pin_count || rp->retire_epoch > retired) {
+            if (!rp->handle || rp->pin_count ||
+                !vbar_retire_complete(rp, completed, completed_count)) {
                 continue;
             }
             if (mod1(i, page_nr, true, false)) {
@@ -313,6 +484,7 @@ size_t vbars_free_retired(ssize_t size) {
             __func__, pages_needed);
     }
 
+    vbar_state_unlock();
     return pages_needed;
 }
 #endif
@@ -388,10 +560,8 @@ void *vbar_allocate(void *devctx, uint64_t size, int device) {
 
     set_devctx((AimdoContext *)devctx);
 
-    one_time_setup();
     log_reset_shots();
     log(DEBUG, "%s (start): size=%zuM, device=%d\n", __func__, size / M, device);
-    vbars_dirty = true;
 
     size_t nr_pages = VBAR_GET_PAGE_NR_UP(size);
     size_t nr_pages_max = VBAR_GET_PAGE_NR(vram_capacity);
@@ -414,8 +584,12 @@ void *vbar_allocate(void *devctx, uint64_t size, int device) {
 
     mv->device = device;
     mv->nr_pages = mv->watermark = nr_pages;
-    
+
+    vbar_state_lock();
+    one_time_setup();
+    vbars_dirty = true;
     insert_vbar(mv);
+    vbar_state_unlock();
 
     log(DEBUG, "%s (return): vbar=%p\n", __func__, (void *)mv);
     return mv;
@@ -428,7 +602,9 @@ void vbar_set_watermark_limit(void *devctx, void *vbar, uint64_t size) {
     set_devctx((AimdoContext *)devctx);
 
     log(DEBUG, "%s: size=%zu\n", __func__, size);
+    vbar_state_lock();
     mv->watermark_limit = VBAR_GET_PAGE_NR_UP(size);
+    vbar_state_unlock();
 }
 
 SHARED_EXPORT
@@ -439,6 +615,7 @@ void vbar_set_watermark(void *devctx, void *vbar, uint64_t size) {
     set_devctx((AimdoContext *)devctx);
 
     log(DEBUG, "%s: size=%zu\n", __func__, size);
+    vbar_state_lock();
     vbars_dirty = true;
 
     if (watermark > mv->nr_pages) {
@@ -453,23 +630,27 @@ void vbar_set_watermark(void *devctx, void *vbar, uint64_t size) {
     }
 
     mv->watermark = watermark;
+    vbar_state_unlock();
 }
 
 SHARED_EXPORT
 void vbars_reset_watermark_limits(void *devctx) {
     set_devctx((AimdoContext *)devctx);
+    vbar_state_lock();
     one_time_setup();
     log(VERBOSE, "%s\n", __func__);
 
     for (ModelVBAR *i = lowest_priority.higher; i && i != &highest_priority; i = i->higher) {
         i->watermark_limit = 0;
     }
+    vbar_state_unlock();
 }
 
 SHARED_EXPORT
 void vbars_prepare_allocation(void *devctx, void *vbar, uint64_t size) {
+    ssize_t reclaim;
+
     set_devctx((AimdoContext *)devctx);
-    one_time_setup();
     /*
      * Windows cannot evict from the Level Zero allocation callback because
      * doing so waits re-entrantly on the same SYCL queue.  Its model-boundary
@@ -478,7 +659,17 @@ void vbars_prepare_allocation(void *devctx, void *vbar, uint64_t size) {
      * pages from the active model on the strength of that prediction alone.
      * A later vbar_fault() still applies exact live pressure to every VBAR.
      */
-    vbars_free_except(budget_deficit((size_t)size), (ModelVBAR *)vbar);
+    reclaim = budget_deficit((size_t)size);
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+    {
+        ssize_t requested = vbars_take_reclaim_request();
+
+        if (requested > reclaim) {
+            reclaim = requested;
+        }
+    }
+#endif
+    vbars_free_except(reclaim, (ModelVBAR *)vbar);
 }
 
 SHARED_EXPORT
@@ -489,6 +680,7 @@ void vbar_prioritize(void *devctx, void *vbar, uint64_t clamp) {
     malloc_async_clamp = clamp;
 
     log(DEBUG, "%s vbar=%p\n", __func__, vbar);
+    vbar_state_lock();
     vbars_dirty = true;
 
     log_reset_shots();
@@ -497,6 +689,7 @@ void vbar_prioritize(void *devctx, void *vbar, uint64_t clamp) {
     insert_vbar(mv);
 
     mv->watermark = mv->nr_pages;
+    vbar_state_unlock();
 }
 
 SHARED_EXPORT
@@ -506,12 +699,14 @@ void vbar_deprioritize(void *devctx, void *vbar) {
     set_devctx((AimdoContext *)devctx);
 
     log(DEBUG, "%s vbar=%p\n", __func__, vbar);
+    vbar_state_lock();
     vbars_dirty = true;
 
     log_reset_shots();
 
     remove_vbar(mv);
     insert_vbar_last(mv);
+    vbar_state_unlock();
 }
 
 SHARED_EXPORT
@@ -525,8 +720,8 @@ uint64_t vbar_get(void *devctx, void *vbar) {
 #define VBAR_FAULT_OOM               1
 #define VBAR_FAULT_ERROR             2
 
-SHARED_EXPORT
-int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size, uint32_t *signature) {
+static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
+                             uint64_t size, uint32_t *signature) {
     ModelVBAR *mv = (ModelVBAR *)vbar;
     int ret = VBAR_FAULT_SUCCESS;
     size_t signature_index = 0;
@@ -549,9 +744,10 @@ int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size, uint32_
      * py-spy caught the sampler thread inside
      * vbar_fault -> vbars_analyze -> queue::wait_and_throw -> urQueueFinish,
      * with per-step time degrading run over run as the resident set shrank and
-     * misses multiplied. Use the non-blocking reclaim: it releases every page
-     * that is provably idle and skips the rest. */
-    vbars_free_retired(budget_deficit(0));
+     * misses multiplied. Merge live pressure with requests recorded by native
+     * allocator/copy callbacks, then reclaim here: this is the model owner's
+     * call stack, outside the allocator/UMF critical section. */
+    vbars_reclaim_at_owner_boundary(budget_deficit(0));
 #else
     vbars_free(budget_deficit(0));
 #endif
@@ -673,17 +869,15 @@ int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size, uint32_
                      * contiguous physical headroom than one VBAR page.  This
                      * path is reached only after a real allocation failure,
                      * so reclaiming the WDDM safety margin is not speculative.
-                     * Try the non-blocking reclaim first and only fall back to
-                     * the synchronizing one if nothing was idle: this is the
-                     * last resort before the weight is streamed from host
-                     * storage, so one wait here is cheaper than the miss. */
+                     * Retry only with pages whose completion events have
+                     * already retired. Waiting for the compute queue inside a
+                     * fault can deadlock behind work that needs this page; if
+                     * no retired page is ready, report OOM so the caller can
+                     * use its host-streaming fallback. */
                     log(DEBUG,
                         "VBAR Windows XPU retry reclaiming an additional %zu MB ...\n",
                         (size_t)VBAR_WDDM_RETRY_RECLAIM / M);
-                    if (vbars_free_retired(VBAR_WDDM_RETRY_RECLAIM) ==
-                        VBAR_GET_PAGE_NR_UP(VBAR_WDDM_RETRY_RECLAIM)) {
-                        vbars_free(VBAR_WDDM_RETRY_RECLAIM);
-                    }
+                    (void)vbars_free_retired(VBAR_WDDM_RETRY_RECLAIM);
                     if (page_end > mv->watermark) {
                         log(DEBUG,
                             "VBAR allocation cancelled after Windows XPU retry reclaim\n");
@@ -727,6 +921,18 @@ int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size, uint32_
 }
 
 SHARED_EXPORT
+int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size,
+               uint32_t *signature) {
+    int result;
+
+    set_devctx((AimdoContext *)devctx);
+    vbar_state_lock();
+    result = vbar_fault_locked(devctx, vbar, offset, size, signature);
+    vbar_state_unlock();
+    return result;
+}
+
+SHARED_EXPORT
 void vbar_unpin(void *devctx, void *vbar, uint64_t offset, uint64_t size) {
     vbar_unpin_stream(devctx, vbar, offset, size, 0);
 }
@@ -735,31 +941,31 @@ SHARED_EXPORT
 void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
                        uint64_t stream) {
     ModelVBAR *mv = (ModelVBAR *)vbar;
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+    uint64_t retirement_token;
+#endif
 
     set_devctx((AimdoContext *)devctx);
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-    /* VBAR map/unmap use the Level Zero virtual-memory calls, which carry no
-     * stream, so this is the only point where the queue that actually consumed
-     * the weight is visible. Register it before tagging the pages: a
-     * retirement fence submitted only to the default queue does not order work
-     * queued elsewhere, and reclaiming on that proof released pages that were
-     * still in use. */
-    if (stream) {
-        aimdo_xpu_register_queue((void *)(uintptr_t)stream);
-    }
+    /* Capture the actual consuming queue after its operator was submitted.
+     * The token call owns only the retire lock; taking it before the page lock
+     * preserves the retire-lock -> VBAR-lock order used by pressure scans. A
+     * missing/overflowed queue returns zero and makes the page fail closed. */
+    retirement_token = aimdo_xpu_retire_token_current(
+        (void *)(uintptr_t)stream);
 #else
     (void)stream;
 #endif
     log(VVERBOSE, "%s (start): offset=%lldk, size=%lldk\n", __func__, (ull)(offset / K), (ull)(size / K));
+    vbar_state_lock();
     vbars_dirty = true;
     size_t page_end = VBAR_GET_PAGE_NR_UP(offset + size);
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-    /* Windows never frees a page from here. Pages above the watermark are
-     * tagged with a retirement epoch and released later by the non-blocking
-     * reclaim, so neither synchronize below is needed - and both ran on every
-     * unpinned weight, which is the hot path. */
+    /* Windows never frees a page from here. Pages above the watermark retain
+     * per-queue completion tokens and are released later by non-blocking
+     * reclaim, so neither synchronize below is needed. */
     const bool free_above_watermark = false;
 #else
     const bool free_above_watermark = true;
@@ -771,15 +977,18 @@ void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
 
     for (uint64_t page_nr = VBAR_GET_PAGE_NR(offset); page_nr < page_end && page_nr < mv->nr_pages; page_nr++) {
         ResidentPage *rp = &mv->residency_map[page_nr];
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+        /* Record every concurrent consumer, not just the final unpin. The last
+         * caller to drop pin_count cannot prove that earlier queues have also
+         * completed. Publishing dependencies before decrementing makes the
+         * transition to idle atomic to the reclaim scan. */
         if (rp->pin_count) {
+            vbar_retire_record(rp, retirement_token);
             rp->pin_count--;
         }
-#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-        /* The operator has been submitted, so this page's last use is already
-         * queued. Record the epoch now; proving it retired costs nothing here
-         * and lets an allocation-path reclaim select it later without waiting. */
-        if (!rp->pin_count) {
-            rp->retire_epoch = aimdo_xpu_retire_epoch_current();
+#else
+        if (rp->pin_count) {
+            rp->pin_count--;
         }
 #endif
         mod1(mv, page_nr, free_above_watermark && page_nr >= mv->watermark, false);
@@ -791,15 +1000,7 @@ void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
     }
 #endif
 
-#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-    /* Advance retirement while the model runs, not only once something is
-     * already under pressure. Polling here keeps at most one fence in flight
-     * and costs a single barrier per completion interval, but it means the
-     * published retired epoch is current by the time an allocation hook needs
-     * to reclaim. Waiting until first pressure to submit a fence would leave
-     * every page unprovable exactly when the memory is needed. */
-    (void)aimdo_xpu_retired_epoch();
-#endif
+    vbar_state_unlock();
 }
 
 SHARED_EXPORT
@@ -809,6 +1010,7 @@ void vbar_free(void *devctx, void *vbar) {
     set_devctx((AimdoContext *)devctx);
 
     log(DEBUG, "%s: vbar=%p\n", __func__, vbar);
+    vbar_state_lock();
     vbars_dirty = true;
 
     CHECK_CU(cuCtxSynchronize());
@@ -819,30 +1021,43 @@ void vbar_free(void *devctx, void *vbar) {
     remove_vbar(mv);
     CHECK_CU(cuMemAddressFree(mv->vbar, (size_t)mv->nr_pages * VBAR_PAGE_SIZE));
     CHECK_CU(cuCtxSynchronize());
+    vbar_state_unlock();
     free(mv);
 }
 
 SHARED_EXPORT
 size_t vbar_loaded_size(void *devctx, void *vbar) {
     ModelVBAR *mv = (ModelVBAR *)vbar;
+    size_t loaded;
 
     set_devctx((AimdoContext *)devctx);
 
-    return mv->resident_count * VBAR_PAGE_SIZE;
+    vbar_state_lock();
+    loaded = mv->resident_count * VBAR_PAGE_SIZE;
+    vbar_state_unlock();
+    return loaded;
 }
 
 SHARED_EXPORT
 size_t vbar_get_nr_pages(void *devctx, void *vbar) {
     ModelVBAR *mv = (ModelVBAR *)vbar;
+    size_t pages;
     set_devctx((AimdoContext *)devctx);
-    return mv->nr_pages;
+    vbar_state_lock();
+    pages = mv->nr_pages;
+    vbar_state_unlock();
+    return pages;
 }
 
 SHARED_EXPORT
 size_t vbar_get_watermark(void *devctx, void *vbar) {
     ModelVBAR *mv = (ModelVBAR *)vbar;
+    size_t watermark;
     set_devctx((AimdoContext *)devctx);
-    return mv->watermark;
+    vbar_state_lock();
+    watermark = mv->watermark;
+    vbar_state_unlock();
+    return watermark;
 }
 
 SHARED_EXPORT
@@ -851,11 +1066,13 @@ void vbar_get_residency(void *devctx, void *vbar, uint8_t *out, size_t max_pages
     size_t n = mv->nr_pages < max_pages ? mv->nr_pages : max_pages;
 
     set_devctx((AimdoContext *)devctx);
+    vbar_state_lock();
     for (size_t i = 0; i < n; i++) {
         ResidentPage *rp = &mv->residency_map[i];
         /* bit 0: resident, bit 1: pinned */
         out[i] = (rp->handle ? 1 : 0) | (rp->pin_count ? 2 : 0);
     }
+    vbar_state_unlock();
 }
 
 SHARED_EXPORT
@@ -867,6 +1084,7 @@ uint64_t vbar_free_memory(void *devctx, void *vbar, uint64_t size) {
     set_devctx((AimdoContext *)devctx);
 
     log(DEBUG, "%s (start): size=%lldk\n", __func__, (ull)size);
+    vbar_state_lock();
     vbars_dirty = true;
 
     CHECK_CU(cuCtxSynchronize());
@@ -883,5 +1101,6 @@ uint64_t vbar_free_memory(void *devctx, void *vbar, uint64_t size) {
 
     CHECK_CU(cuCtxSynchronize());
 
+    vbar_state_unlock();
     return (uint64_t)pages_freed * VBAR_PAGE_SIZE;
 }

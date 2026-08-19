@@ -278,14 +278,13 @@ bool hostbuf_read_file_slice(void *hostbuf_ptr, int device,
         CUresult copy_result;
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-        /* Same reasoning as hostbuf_file_reader_read(): this streams a weight
-         * into device memory without going through any hooked allocation, so
-         * nothing else applies pressure before the copy. */
+        /* Match hostbuf_file_reader_read(): record pressure here and let the
+         * next VBAR owner boundary mutate mappings. */
         {
             ssize_t deficit = budget_deficit(chunk);
 
             if (deficit > 0) {
-                vbars_free_retired(deficit);
+                vbars_request_reclaim(deficit);
             }
         }
 #endif

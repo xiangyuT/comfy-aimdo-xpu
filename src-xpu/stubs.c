@@ -45,21 +45,15 @@ bool aimdo_xpu_prepare_allocation(int device, size_t size) {
 #if defined(_WIN32) || defined(_WIN64)
     ssize_t deficit;
 
-    /* Called after the driver's allocation call has returned, never during
-     * it: releasing a VBAR page issues zeVirtualMemUnmap and
-     * zePhysicalMemDestroy, and re-entering Level Zero memory management from
-     * inside zeMemAllocDevice corrupts driver state.
-     *
-     * It also must not wait on the compute queue: that queue may be blocked
-     * behind work which itself needs the residency being requested.
-     * vbars_free_retired() releases only pages that are provably idle and
-     * returns immediately otherwise. Any remaining shortage is absorbed by
-     * WDDM, and the next fault or unpin boundary reclaims it. */
+    /* This can run under PyTorch's allocator/UMF locks.  Re-entering Level
+     * Zero virtual-memory management here is enough to destabilize WDDM even
+     * though the lower driver allocation call has returned.  Record pressure
+     * only; the next VBAR/model-owner boundary performs the actual unmap. */
     deficit = budget_deficit(size);
     log(VVERBOSE, "%s: device=%d size=%zuk recorded=%zuk deficit=%zdk\n", __func__,
         device, size / K, (size_t)total_vram_usage / K, deficit / (ssize_t)K);
     if (deficit > 0) {
-        vbars_free_retired(deficit);
+        vbars_request_reclaim(deficit);
     }
 #else
     vbars_free(budget_deficit(size));
@@ -72,11 +66,10 @@ bool aimdo_xpu_retry_allocation(int device, size_t size) {
         return false;
     }
 #if defined(_WIN32) || defined(_WIN64)
-    /* Reached only after a real Level Zero allocation failure, which on this
-     * platform means the driver could not place the request even in non-local
-     * memory. Re-sample and reclaim again, still without waiting. */
+    /* Even the retry is still inside the allocator's call stack.  Force a
+     * fresh pressure sample, but leave VBAR mutation to its owner. */
     aimdo_wddm_force_poll();
-    vbars_free_retired((ssize_t)size);
+    vbars_request_reclaim((ssize_t)size);
 #else
     vbars_free((ssize_t)size);
 #endif
@@ -97,13 +90,10 @@ bool aimdo_xpu_evict_for_allocation(int device, int64_t deficit) {
     }
     if (deficit > 0) {
 #if defined(_WIN32) || defined(_WIN64)
-        /* Called from the Unified Runtime allocation hook. Nothing on this
-         * path may wait on the compute queue: that queue can be blocked behind
-         * work which itself needs the residency being requested.
-         * vbars_free_retired() releases only pages that are provably idle and
-         * returns immediately otherwise. Linux keeps the exact reclaim because
-         * its allocator-time arbitration must satisfy the request. */
-        vbars_free_retired((ssize_t)deficit);
+        /* The UR hook is above the driver call but remains inside the native
+         * allocation stack.  Publish the shortage and let WDDM place this
+         * request; the next VBAR fault drains it outside allocator locks. */
+        vbars_request_reclaim((ssize_t)deficit);
 #else
         vbars_free((ssize_t)deficit);
 #endif

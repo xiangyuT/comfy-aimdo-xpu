@@ -1,8 +1,10 @@
 import ctypes
+import contextvars
 import itertools
 import os
 import sys
 import time
+from contextlib import contextmanager
 
 from . import control
 
@@ -13,6 +15,9 @@ _boundary_trace_enabled = (
     os.environ.get("AIMDO_XPU_BOUNDARY_TRACE") == "1"
 )
 _trace_calls = itertools.count(1)
+_inference_memory_budgets = contextvars.ContextVar(
+    "comfy_aimdo_inference_memory_budgets", default=None
+)
 
 # Torch's native XPU allocator keeps freed blocks cached, and that cache holds
 # WDDM local memory that AIMDO cannot reclaim: a tensor that is freed does not
@@ -73,6 +78,35 @@ def _trace_vbar(operation, phase, alloc, caller, result=None):
         file=sys.stderr,
         flush=True,
     )
+
+
+@contextmanager
+def inference_memory_budget(memory_required, devices):
+    """Publish a scoped inference allocation budget for model activation."""
+    budget = max(0, int(memory_required))
+    current = _inference_memory_budgets.get()
+    updated = {} if current is None else dict(current)
+    for device in devices:
+        device_index = getattr(device, "index", device)
+        if device_index is not None:
+            device_index = int(device_index)
+            updated[device_index] = max(budget, updated.get(device_index, 0))
+
+    token = _inference_memory_budgets.set(updated)
+    try:
+        yield
+    finally:
+        _inference_memory_budgets.reset(token)
+
+
+def current_inference_memory_budget(device):
+    budgets = _inference_memory_budgets.get()
+    if budgets is None:
+        return 0
+    device_index = getattr(device, "index", device)
+    if device_index is None:
+        return 0
+    return budgets.get(int(device_index), 0)
 
 # Bindings
 if lib is not None:
@@ -191,7 +225,9 @@ class ModelVBAR:
             _, reserved, _, peak_reserved = (
                 control.get_xpu_allocator_memory_stats(self.device)
             )
-            anticipated_growth = max(0, peak_reserved - reserved)
+            historical_growth = max(0, peak_reserved - reserved)
+            inference_budget = current_inference_memory_budget(self.device)
+            anticipated_growth = max(historical_growth, inference_budget)
             prepared_allocation = False
             if anticipated_growth:
                 # Linux's pluggable allocator can safely grow a newly
@@ -218,6 +254,8 @@ class ModelVBAR:
                     f"previous_watermark={previous_watermark} "
                     f"current_watermark={current_watermark} "
                     f"reserved={reserved} peak_reserved={peak_reserved} "
+                    f"historical_growth={historical_growth} "
+                    f"inference_budget={inference_budget} "
                     f"anticipated_growth={anticipated_growth} "
                     f"prepared_allocation={prepared_allocation}",
                     flush=True,

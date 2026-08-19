@@ -23,6 +23,7 @@ extern "C" {
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 extern "C" bool aimdo_xpu_prepare_allocation(int device, size_t size);
@@ -84,6 +85,12 @@ enum XpuStat : size_t {
     kSmallVbarCopyFallbackCalls,
     kSmallVbarCopyFallbackBytes,
     kSmallVbarCopyFallbackFailures,
+    kRetireTokenCalls,
+    kRetireFenceSubmitCalls,
+    kRetireFenceCompleteCalls,
+    kRetireFenceSubmitFailures,
+    kRetireForcePolls,
+    kRetireTrackedQueues,
     kXpuStatCount,
 };
 
@@ -114,50 +121,41 @@ std::unordered_map<int, uint64_t> g_torch_reserved_bytes;
 std::unordered_map<int, uint64_t> g_torch_peak_active_bytes;
 std::unordered_map<int, uint64_t> g_torch_peak_reserved_bytes;
 
-// Retirement epochs.
-//
-// Torch's XPU queues are in-order, so a barrier submitted at reclaim time
-// waits for everything already queued.  That is precisely the whole-queue wait
-// that must never happen inside an allocation path.  A VBAR page is therefore
-// tagged with the current epoch when it is unpinned, which costs one atomic
-// read and submits nothing.  One bounded fence per completion interval then
-// publishes how far retirement has progressed, so reclaim only has to compare
-// two integers and never blocks.
+// VBAR retirement follows the same ownership rule as a caching allocator's
+// recordStream(): a page remembers only the queues that actually consumed it,
+// and each queue advances independently.  This avoids the old process-global
+// minimum epoch, where one unrelated/hidden queue both delayed every page and
+// forced a barrier onto every queue for every completion interval.
 std::mutex g_retire_mutex;
-std::atomic<uint64_t> g_retire_epoch{1};
-std::atomic<uint64_t> g_retired_epoch{0};
-std::atomic<bool> g_retire_pending{false};
 
-// A single outstanding fence is too coarse. On an in-order queue a fence only
-// completes after everything submitted before it, so one submitted late is
-// pessimistic: pages whose real last use finished long ago stay unprovable
-// because the fence is stuck behind unrelated work queued since. A small ring
-// keeps several finer-grained fences in flight, which bounds how far the
-// published retirement can lag without submitting one barrier per unpin.
+// Fences are deliberately batched.  Submitting one barrier per weight caused
+// thousands of live Level Zero events during long H3 cycles.  Sixty-four uses
+// amortizes submission while the force poll at real pressure closes a partial
+// batch, so reclaim does not depend on reaching the batch size.
 constexpr size_t kRetireFenceSlots = 8;
+constexpr size_t kRetireBatchUses = 64;
 
-// Torch hands out 32 round-robin queues per device pool, and a VBAR page can
-// be consumed on any of them. A barrier submitted to one queue orders nothing
-// on the others, so proving retirement from a single queue can release a page
-// whose real consumer is still running - observed as
-// UR_RESULT_ERROR_DEVICE_LOST. Every queue AIMDO has seen is therefore
-// fenced, and an epoch only retires once all of them have passed it.
-constexpr size_t kMaxTrackedQueues = 64;
-
-sycl::queue *g_tracked_queues[kMaxTrackedQueues];
-size_t g_tracked_queue_count = 0;
-// Set if more distinct queues appear than can be tracked. Retirement then
-// stops advancing, because an untracked queue cannot be proven idle.
-std::atomic<bool> g_retire_tracking_overflow{false};
+// The token format is shared with model-vbar.c through plat.h.  Queue tags are
+// one based so token zero remains the fail-closed "unknown queue" value.
+constexpr size_t kMaxTrackedQueues = AIMDO_XPU_RETIRE_MAX_QUEUES;
 
 struct RetireFence {
     sycl::event event;
-    uint64_t epoch = 0;
+    uint64_t generation = 0;
     bool valid = false;
 };
 
-// One fence ring per tracked queue.
-RetireFence g_retire_fences[kMaxTrackedQueues][kRetireFenceSlots];
+struct RetireQueue {
+    sycl::queue *queue = nullptr;
+    uint64_t open_generation = 1;
+    uint64_t retired_generation = 0;
+    size_t pending_uses = 0;
+    RetireFence fences[kRetireFenceSlots];
+};
+
+RetireQueue g_retire_queues[kMaxTrackedQueues];
+size_t g_retire_queue_count = 0;
+std::atomic<bool> g_retire_tracking_overflow{false};
 
 void increase_torch_bytes(std::unordered_map<int, uint64_t> &current,
                           std::unordered_map<int, uint64_t> &peak,
@@ -228,37 +226,39 @@ int device_from_native_handle(uintptr_t native_handle) {
     return found == g_devices.end() ? -1 : found->id;
 }
 
-/* Register a queue AIMDO has seen so its work is covered by retirement fences.
- * Called from resolve_queue(), so any queue that faults, copies into or
- * consumes a VBAR page is tracked before that page can be reclaimed. */
-void aimdo_xpu_note_queue(sycl::queue *queue) {
+size_t aimdo_xpu_note_queue_locked(sycl::queue *queue) {
     if (!queue) {
-        return;
+        return kMaxTrackedQueues;
     }
-    std::lock_guard<std::mutex> guard(g_retire_mutex);
-    for (size_t index = 0; index < g_tracked_queue_count; ++index) {
-        if (g_tracked_queues[index] == queue) {
-            return;
+    for (size_t index = 0; index < g_retire_queue_count; ++index) {
+        if (g_retire_queues[index].queue == queue) {
+            return index;
         }
     }
-    if (g_tracked_queue_count >= kMaxTrackedQueues) {
+    if (g_retire_queue_count >= kMaxTrackedQueues) {
         // Cannot prove retirement on an untracked queue, so stop advancing
-        // retirement rather than release a page that may be in use. This is
-        // recoverable: aimdo_xpu_retire_reset() clears it, and the table is
-        // only ever this large if Torch really used that many queues.
+        // pages that name it rather than guessing from a different queue.
         if (!g_retire_tracking_overflow.exchange(true, std::memory_order_relaxed)) {
             std::fprintf(stderr,
                          "[AIMDO XPU] tracked queue table full (%zu); VBAR "
-                         "reclaim is disabled until reinitialization\n",
+                         "pages on additional queues are non-reclaimable\n",
                          kMaxTrackedQueues);
             std::fflush(stderr);
         }
-        return;
+        return kMaxTrackedQueues;
     }
-    g_tracked_queues[g_tracked_queue_count++] = queue;
-    // A page tagged before this queue existed has no fence covering the work
-    // this queue may already hold, so ask for one immediately.
-    g_retire_pending.store(true, std::memory_order_relaxed);
+    const size_t index = g_retire_queue_count++;
+    g_retire_queues[index].queue = queue;
+    g_stats[kRetireTrackedQueues].store(
+        g_retire_queue_count, std::memory_order_relaxed);
+    return index;
+}
+
+/* Register a queue AIMDO has seen.  Page retirement itself is scoped to the
+ * queue token returned at unpin, not to this process-wide registry. */
+void aimdo_xpu_note_queue(sycl::queue *queue) {
+    std::lock_guard<std::mutex> guard(g_retire_mutex);
+    (void)aimdo_xpu_note_queue_locked(queue);
 }
 
 sycl::queue *resolve_queue(CUstream stream) {
@@ -340,9 +340,10 @@ CUresult xpu_context_synchronize() {
         state->queue->wait_and_throw();
         {
             std::lock_guard<std::mutex> guard(g_retire_mutex);
-            for (size_t index = 0; index < g_tracked_queue_count; ++index) {
-                if (g_tracked_queues[index] != state->queue) {
-                    g_tracked_queues[index]->wait_and_throw();
+            for (size_t index = 0; index < g_retire_queue_count; ++index) {
+                sycl::queue *queue = g_retire_queues[index].queue;
+                if (queue && queue != state->queue) {
+                    queue->wait_and_throw();
                 }
             }
         }
@@ -917,8 +918,8 @@ void *allocate_torch_block(size_t size, int device, sycl::queue *queue) {
     if (!pointer) {
         // A pending cached block is safer to wait here than letting the XPU
         // runtime enter an asynchronous OOM/device-lost state. Retry once
-        // after returning every idle block and evicting another request-size
-        // tranche of unpinned model pages.
+        // after returning every idle block and publishing another request-size
+        // tranche for owner-side VBAR reclaim.
         release_cached_torch_blocks(device, true);
         if (!aimdo_xpu_retry_allocation(device, size)) {
             return nullptr;
@@ -1095,6 +1096,63 @@ CUresult xpu_device_get_luid(char *luid, unsigned int *node_mask,
 #endif
 }
 
+void poll_retire_queue_locked(RetireQueue &retire_queue) {
+    for (size_t slot = 0; slot < kRetireFenceSlots; ++slot) {
+        RetireFence &fence = retire_queue.fences[slot];
+        if (!fence.valid || !event_is_complete(fence.event)) {
+            continue;
+        }
+        retire_queue.retired_generation = std::max(
+            retire_queue.retired_generation, fence.generation);
+        fence.valid = false;
+        fence.event = sycl::event();
+        fence.generation = 0;
+        g_stats[kRetireFenceCompleteCalls].fetch_add(
+            1, std::memory_order_relaxed);
+    }
+}
+
+bool submit_retire_fence_locked(RetireQueue &retire_queue) {
+    if (!retire_queue.queue || retire_queue.pending_uses == 0) {
+        return true;
+    }
+
+    size_t free_slot = kRetireFenceSlots;
+    for (size_t slot = 0; slot < kRetireFenceSlots; ++slot) {
+        if (!retire_queue.fences[slot].valid) {
+            free_slot = slot;
+            break;
+        }
+    }
+    if (free_slot == kRetireFenceSlots) {
+        return false;
+    }
+
+    // Hold g_retire_mutex while submitting and advance the generation only
+    // after the barrier exists.  A concurrent unpin can therefore receive
+    // either the generation ordered by this barrier or the next generation,
+    // never a token whose fence was already submitted before its operator.
+    try {
+        sycl::event event =
+            retire_queue.queue->ext_oneapi_submit_barrier();
+        RetireFence &fence = retire_queue.fences[free_slot];
+        fence.event = std::move(event);
+        fence.generation = retire_queue.open_generation;
+        fence.valid = true;
+        retire_queue.open_generation++;
+        retire_queue.pending_uses = 0;
+        g_stats[kRetireFenceSubmitCalls].fetch_add(
+            1, std::memory_order_relaxed);
+        return true;
+    } catch (...) {
+        // Leave the generation open and all pages carrying it
+        // non-reclaimable. A later pressure poll may retry safely.
+        g_stats[kRetireFenceSubmitFailures].fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+    }
+}
+
 }  // namespace
 
 extern "C" {
@@ -1126,149 +1184,84 @@ void aimdo_xpu_record_native_release(size_t size) {
         size, std::memory_order_relaxed);
 }
 
-/* Tag a page that has just stopped being used.  This must stay cheap: it is
- * called once per weight per model pass and deliberately submits nothing.
- *
- * It also registers the caller's current queue. VBAR map/unmap go through the
- * Level Zero virtual-memory calls, which carry no stream argument, so this is
- * the only point where the queue that actually consumed the page is visible.
- * ComfyUI can fault and consume weights on a non-default stream, and a fence
- * on the default queue alone does not order that work. */
-uint64_t aimdo_xpu_retire_epoch_current(void) {
-    auto *state = current_device();
-    if (state && state->queue) {
-        aimdo_xpu_note_queue(state->queue);
+/* Return a token for the actual queue that consumed a VBAR page.  Tokens from
+ * the same queue share one generation until a bounded batch is closed. */
+uint64_t aimdo_xpu_retire_token_current(void *queue_pointer) {
+    auto *queue = reinterpret_cast<sycl::queue *>(queue_pointer);
+    if (!queue) {
+        return 0;
     }
-    g_retire_pending.store(true, std::memory_order_relaxed);
-    return g_retire_epoch.load(std::memory_order_relaxed);
-}
 
-/* Register the queue that consumed a VBAR page, named by the caller. */
-void aimdo_xpu_register_queue(void *queue) {
-    aimdo_xpu_note_queue(reinterpret_cast<sycl::queue *>(queue));
-}
-
-/* Publish how far retirement has progressed, without ever blocking.
- *
- * Publish how far retirement has progressed, without ever blocking.
- *
- * One fence per tracked queue is outstanding at a time, so a busy model pass
- * costs one barrier per queue per completion interval rather than one per
- * unpin.  A page whose epoch is at or below the returned value had its last
- * use submitted before a fence that has already completed on every queue
- * AIMDO has seen, so it can be unmapped immediately. */
-uint64_t aimdo_xpu_retired_epoch(void) {
     std::lock_guard<std::mutex> guard(g_retire_mutex);
-    const uint64_t published = g_retired_epoch.load(std::memory_order_relaxed);
-    const bool wanted =
-        g_retire_pending.exchange(false, std::memory_order_relaxed);
-    // An epoch is retired only once every tracked queue has passed it, so the
-    // result is the minimum across queues. A queue with no completed fence
-    // holds the published value back, which is the safe direction.
-    uint64_t retired = UINT64_MAX;
-    bool missed_a_fence = false;
-    uint64_t fence_epoch = 0;
-
-    if (g_tracked_queue_count == 0 ||
-        g_retire_tracking_overflow.load(std::memory_order_relaxed)) {
-        return published;
+    const size_t index = aimdo_xpu_note_queue_locked(queue);
+    if (index >= kMaxTrackedQueues) {
+        return 0;
     }
 
-    if (wanted) {
-        // Close the current epoch *before* submitting any barrier. A page is
-        // tagged in unpin after its operator was submitted, so a barrier
-        // queued after the epoch is closed is guaranteed to sit behind the
-        // work of every page carrying that epoch.
-        //
-        // Incrementing afterwards, as this did, left a window where a page
-        // could be tagged with an epoch whose barrier had already been
-        // submitted. Its work was then queued behind that barrier, yet the
-        // barrier completing marked it retired, and reclaim unmapped a page
-        // that was still in flight: the H2D copy into it failed with
-        // result=999 and the device was lost shortly after.
-        fence_epoch = g_retire_epoch.fetch_add(1, std::memory_order_relaxed);
+    RetireQueue &retire_queue = g_retire_queues[index];
+    poll_retire_queue_locked(retire_queue);
+    const uint64_t token =
+        (retire_queue.open_generation <<
+         AIMDO_XPU_RETIRE_TOKEN_QUEUE_BITS) |
+        (index + 1);
+    if (retire_queue.pending_uses < kRetireBatchUses) {
+        retire_queue.pending_uses++;
     }
-
-    for (size_t index = 0; index < g_tracked_queue_count; ++index) {
-        RetireFence *ring = g_retire_fences[index];
-        uint64_t queue_retired = published;
-        size_t free_slot = kRetireFenceSlots;
-
-        for (size_t slot = 0; slot < kRetireFenceSlots; ++slot) {
-            RetireFence &fence = ring[slot];
-            if (!fence.valid) {
-                if (free_slot == kRetireFenceSlots) {
-                    free_slot = slot;
-                }
-                continue;
-            }
-            if (event_is_complete(fence.event)) {
-                // Each queue is in order, so a completed fence also proves
-                // every earlier fence on that same queue completed.
-                if (fence.epoch > queue_retired) {
-                    queue_retired = fence.epoch;
-                }
-                fence.valid = false;
-                fence.event = sycl::event();
-                if (free_slot == kRetireFenceSlots) {
-                    free_slot = slot;
-                }
-            }
-        }
-
-        if (wanted) {
-            if (free_slot >= kRetireFenceSlots) {
-                // Ring full: this queue gets no fence for the current epoch,
-                // so the request must survive to the next poll. Dropping it
-                // would leave the last pages of a pass unprovable forever.
-                missed_a_fence = true;
-            } else {
-                try {
-                    ring[free_slot].epoch = fence_epoch;
-                    ring[free_slot].event =
-                        g_tracked_queues[index]->ext_oneapi_submit_barrier();
-                    ring[free_slot].valid = true;
-                } catch (...) {
-                    missed_a_fence = true;
-                }
-            }
-        }
-
-        if (queue_retired < retired) {
-            retired = queue_retired;
-        }
+    g_stats[kRetireTokenCalls].fetch_add(1, std::memory_order_relaxed);
+    if (retire_queue.pending_uses >= kRetireBatchUses) {
+        (void)submit_retire_fence_locked(retire_queue);
     }
-
-    if (missed_a_fence) {
-        // A queue carries no barrier for the closed epoch, so ask again. The
-        // epoch itself stays closed: reusing it would reintroduce the window
-        // this ordering exists to remove.
-        g_retire_pending.store(true, std::memory_order_relaxed);
-    }
-    if (retired == UINT64_MAX) {
-        retired = published;
-    }
-    if (retired > published) {
-        g_retired_epoch.store(retired, std::memory_order_relaxed);
-    }
-    return retired;
+    return token;
 }
 
-/* Drop every outstanding fence. Called before the SYCL context is torn down so
- * no event outlives the queue it was submitted to. */
+/* Snapshot independently completed generations.  Normal unpin batching never
+ * waits. A force poll is used only by an owner-side pressure scan and closes
+ * partial batches so a later retry can reclaim them. */
+size_t aimdo_xpu_retire_snapshot(uint64_t *completed, size_t count,
+                                 bool force_submit) {
+    if (!completed || count == 0) {
+        return 0;
+    }
+
+    std::lock_guard<std::mutex> guard(g_retire_mutex);
+    if (force_submit) {
+        g_stats[kRetireForcePolls].fetch_add(1, std::memory_order_relaxed);
+    }
+    const size_t copied = std::min(count, g_retire_queue_count);
+    for (size_t index = 0; index < g_retire_queue_count; ++index) {
+        RetireQueue &retire_queue = g_retire_queues[index];
+        poll_retire_queue_locked(retire_queue);
+        if (force_submit && retire_queue.pending_uses) {
+            (void)submit_retire_fence_locked(retire_queue);
+        }
+        if (index < copied) {
+            completed[index] = retire_queue.retired_generation;
+        }
+    }
+    for (size_t index = copied; index < count; ++index) {
+        completed[index] = 0;
+    }
+    return copied;
+}
+
+/* Drop every outstanding fence before the SYCL context is torn down. */
 void aimdo_xpu_retire_reset(void) {
     std::lock_guard<std::mutex> guard(g_retire_mutex);
     for (size_t index = 0; index < kMaxTrackedQueues; ++index) {
+        RetireQueue &retire_queue = g_retire_queues[index];
         for (size_t slot = 0; slot < kRetireFenceSlots; ++slot) {
-            g_retire_fences[index][slot].valid = false;
-            g_retire_fences[index][slot].event = sycl::event();
-            g_retire_fences[index][slot].epoch = 0;
+            retire_queue.fences[slot].valid = false;
+            retire_queue.fences[slot].event = sycl::event();
+            retire_queue.fences[slot].generation = 0;
         }
-        g_tracked_queues[index] = nullptr;
+        retire_queue.queue = nullptr;
+        retire_queue.open_generation = 1;
+        retire_queue.retired_generation = 0;
+        retire_queue.pending_uses = 0;
     }
-    g_tracked_queue_count = 0;
+    g_retire_queue_count = 0;
     g_retire_tracking_overflow.store(false, std::memory_order_relaxed);
-    g_retire_pending.store(false, std::memory_order_relaxed);
+    g_stats[kRetireTrackedQueues].store(0, std::memory_order_relaxed);
 }
 
 AIMDO_XPU_EXPORT void *xpu_alloc_fn(

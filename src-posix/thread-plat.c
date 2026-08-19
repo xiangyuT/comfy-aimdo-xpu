@@ -17,6 +17,10 @@ void mutex_lock(Mutex mutex) {
     pthread_mutex_lock(mutex);
 }
 
+bool mutex_try_lock(Mutex mutex) {
+    return pthread_mutex_trylock(mutex) == 0;
+}
+
 void mutex_unlock(Mutex mutex) {
     pthread_mutex_unlock(mutex);
 }

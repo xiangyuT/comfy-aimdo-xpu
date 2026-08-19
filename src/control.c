@@ -1,5 +1,6 @@
 #include "plat.h"
 #include "aimdo-time.h"
+#include "thread-plat.h"
 #include "xfer-file.h"
 
 #if !defined(_WIN32) && !defined(_WIN64) && defined(AIMDO_CUDA)
@@ -212,6 +213,8 @@ void cleanup(void) {
         allocations_cleanup();
 
         free(highest_priority_p); /* FIXME: move the model_vbar. */
+        mutex_destroy((Mutex)vbar_lock);
+        vbar_lock = NULL;
     }
 
     free(g_all_devctxs);
@@ -241,7 +244,9 @@ bool init(const int *cuda_device_ids, const uint64_t *extra_vram_headrooms, size
         devctx->_hostbuf_file_reader_active = -1;
         set_devctx(devctx);
 
-        if (!allocations_init() ||
+        vbar_lock = mutex_create();
+        if (!vbar_lock ||
+            !allocations_init() ||
             !CHECK_CU(cuDeviceGet(&dev, cuda_device_ids[i])) ||
             !CHECK_CU(cuDeviceTotalMem(&vram_capacity, dev))) {
             goto fail;

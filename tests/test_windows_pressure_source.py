@@ -32,7 +32,7 @@ def test_xpu_pressure_accounts_for_wddm_nonlocal_fallback():
     assert '"WDDM non-local usage"' in source
 
 
-def test_xpu_reclaims_without_blocking_inside_the_allocation_path():
+def test_xpu_defers_vbar_mutation_out_of_the_allocation_path():
     source = (
         Path(__file__).resolve().parents[1] / "src-xpu" / "stubs.c"
     ).read_text(encoding="utf-8")
@@ -43,11 +43,54 @@ def test_xpu_reclaims_without_blocking_inside_the_allocation_path():
     windows_path = prepare.split(
         "#if defined(_WIN32) || defined(_WIN64)", 1
     )[1].split("#else", 1)[0]
-    # The allocation hook runs inside the driver's allocation call, so it may
-    # only use the reclaim that never waits on the compute queue.
-    assert "vbars_free_retired(deficit);" in windows_path
+    # Being above the driver entry point is not sufficient: the callback still
+    # runs under the allocator/UMF stack. It can publish pressure, but actual
+    # Level Zero unmap must happen at a model-owner boundary.
+    assert "vbars_request_reclaim(deficit);" in windows_path
+    assert "vbars_free_retired" not in windows_path
     assert "vbars_free(" not in windows_path
     assert "cuCtxSynchronize" not in windows_path
+
+    retry = source.split("bool aimdo_xpu_retry_allocation", 1)[1]
+    retry = retry.split("bool aimdo_xpu_allocation_deficit", 1)[0]
+    evict = source.split("bool aimdo_xpu_evict_for_allocation", 1)[1]
+    evict = evict.split("bool aimdo_xpu_account_allocation", 1)[0]
+    for allocation_path in (retry, evict):
+        assert "vbars_request_reclaim" in allocation_path
+        assert "vbars_free_retired" not in allocation_path
+
+
+def test_windows_streaming_paths_only_publish_reclaim_pressure():
+    root = Path(__file__).resolve().parents[1]
+
+    for relative in ("src/hostbuf.c", "src/hostbuf-file-reader.c"):
+        source = (root / relative).read_text(encoding="utf-8")
+
+        assert "vbars_request_reclaim(deficit);" in source
+        assert "vbars_free_retired(deficit);" not in source
+
+
+def test_windows_owner_boundary_consumes_deferred_reclaim():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "src" / "model-vbar.c").read_text(encoding="utf-8")
+    header = (root / "src" / "control.h").read_text(encoding="utf-8")
+
+    assert "int64_t _vbar_reclaim_requested;" in header
+    assert "void vbars_request_reclaim(ssize_t size)" in source
+    request = source.split("void vbars_request_reclaim(ssize_t size)", 1)[1]
+    request = request.split("\n}\n", 1)[0]
+    assert "InterlockedCompareExchange64" in request
+    assert "vbars_free_retired" not in request
+    assert "cuMemUnmap" not in request
+
+    fault = source.split("static int vbar_fault_locked", 1)[1]
+    fault = fault.split("\n}\n", 1)[0]
+    assert "vbars_reclaim_at_owner_boundary(budget_deficit(0));" in fault
+
+    prepare = source.split("void vbars_prepare_allocation", 1)[1]
+    prepare = prepare.split("void vbar_prioritize", 1)[0]
+    assert "vbars_take_reclaim_request();" in prepare
+    assert "vbars_free_except(reclaim, (ModelVBAR *)vbar);" in prepare
 
 
 def test_windows_model_boundary_applies_deferred_native_pressure():
@@ -57,7 +100,15 @@ def test_windows_model_boundary_applies_deferred_native_pressure():
         / "model_vbar.py"
     ).read_text(encoding="utf-8")
 
-    assert "anticipated_growth = max(0, peak_reserved - reserved)" in source
+    assert "historical_growth = max(0, peak_reserved - reserved)" in source
+    assert (
+        "inference_budget = current_inference_memory_budget(self.device)"
+        in source
+    )
+    assert (
+        "anticipated_growth = max(historical_growth, inference_budget)"
+        in source
+    )
     assert "lib.vbars_prepare_allocation(" in source
     normalized = " ".join(source.split())
     assert (
@@ -101,10 +152,18 @@ def test_windows_speculative_reclaim_preserves_active_vbar():
         "void vbars_prepare_allocation(void *devctx, void *vbar, "
         "uint64_t size)"
     ) in normalized
-    assert (
-        "vbars_free_except(budget_deficit((size_t)size), "
-        "(ModelVBAR *)vbar);"
-    ) in normalized
+    assert "reclaim = budget_deficit((size_t)size);" in normalized
+    assert "vbars_free_except(reclaim, (ModelVBAR *)vbar);" in normalized
+
+    prepare = source.split("void vbars_prepare_allocation", 1)[1]
+    prepare = prepare.split("\n}\n", 1)[0]
+    assert "one_time_setup();" not in prepare
+
+    free_except = source.split("static size_t vbars_free_except", 1)[1]
+    free_except = free_except.split("\n}\n", 1)[0]
+    assert free_except.index("vbar_state_lock();") < free_except.index(
+        "one_time_setup();"
+    )
 
 
 def test_vbar_fault_reclaims_the_actual_deficit_before_retry():
@@ -123,12 +182,19 @@ def test_vbar_fault_wddm_retry_margin_is_windows_xpu_only():
     ).read_text(encoding="utf-8")
 
     guard = "#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))"
-    # The retry margin, the page retirement epoch and the non-blocking reclaim
-    # are all Windows XPU only; Linux and CUDA keep the original behaviour.
+    # The retry margin, page retirement tokens and non-blocking reclaim are all
+    # Windows XPU only; Linux and CUDA keep the original behaviour.
     assert source.count(guard) >= 2
     assert "#define VBAR_WDDM_RETRY_RECLAIM (512 << 20)" in source
-    assert "vbars_free(VBAR_WDDM_RETRY_RECLAIM);" in source
-    for windows_only in ("VBAR_WDDM_RETRY_RECLAIM", "retire_epoch",
+    assert "(void)vbars_free_retired(VBAR_WDDM_RETRY_RECLAIM);" in source
+    # A fault is already on the execution path that needs the missing page.
+    # Waiting for the whole device here can deadlock; a failed non-blocking
+    # reclaim must become a recoverable host-offload OOM instead.
+    retry = source.split(
+        "VBAR Windows XPU retry reclaiming an additional", 1
+    )[1].split("#endif", 1)[0]
+    assert "vbars_free(VBAR_WDDM_RETRY_RECLAIM)" not in retry
+    for windows_only in ("VBAR_WDDM_RETRY_RECLAIM", "retire_tokens",
                          "vbars_free_retired"):
         assert windows_only not in source.split(guard, 1)[0]
 
@@ -144,9 +210,78 @@ def test_non_blocking_reclaim_never_waits_or_moves_the_watermark():
     # Waiting here would block the driver's allocation call behind work that
     # may itself be waiting for the residency being requested.
     assert "cuCtxSynchronize" not in body
-    assert "aimdo_xpu_retired_epoch()" in body
-    assert "rp->retire_epoch > retired" in body
+    assert "aimdo_xpu_retire_snapshot(" in body
+    assert "vbar_retire_complete(rp, completed, completed_count)" in body
     # Lowering the watermark denies future faults until the next activation,
     # which turns a momentary spike into a permanently smaller working set.
     assert "watermark--" not in body
     assert "i->watermark =" not in body
+
+
+def test_windows_vbar_reclaim_serializes_page_state_without_waiting():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "src" / "model-vbar.c").read_text(encoding="utf-8")
+    control = (root / "src" / "control.c").read_text(encoding="utf-8")
+    header = (root / "src" / "control.h").read_text(encoding="utf-8")
+
+    assert "void *_vbar_lock" in header
+    assert "vbar_lock = mutex_create();" in control
+    assert "mutex_destroy((Mutex)vbar_lock);" in control
+
+    reclaim = source.split("size_t vbars_free_retired(ssize_t size)", 1)[1]
+    reclaim = reclaim.split("\n}\n", 1)[0]
+    assert "vbar_state_try_lock()" in reclaim
+    assert "vbar_state_lock()" not in reclaim
+    assert "cuCtxSynchronize" not in reclaim
+    assert "if (!vbar_async_reclaim_enabled())" in reclaim
+
+    fault = source.split("int vbar_fault(void *devctx", 1)[1]
+    fault = fault.split("\n}\n", 1)[0]
+    assert "vbar_state_lock();" in fault
+    assert "vbar_fault_locked(" in fault
+    assert "vbar_state_unlock();" in fault
+
+
+def test_windows_unpin_publishes_queue_token_before_idle_state():
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "model-vbar.c"
+    ).read_text(encoding="utf-8")
+    unpin = source.split("void vbar_unpin_stream", 1)[1]
+    unpin = unpin.split("\n}\n", 1)[0]
+
+    token_snapshot = unpin.index(
+        "retirement_token = aimdo_xpu_retire_token_current("
+    )
+    state_lock = unpin.index("vbar_state_lock();")
+    token_publish = unpin.index(
+        "vbar_retire_record(rp, retirement_token);"
+    )
+    idle_publish = unpin.index("rp->pin_count--;")
+    state_unlock = unpin.index("vbar_state_unlock();")
+
+    assert token_snapshot < state_lock < token_publish < idle_publish < state_unlock
+
+
+def test_windows_retirement_is_per_queue_and_fence_submissions_are_batched():
+    root = Path(__file__).resolve().parents[1]
+    dispatch = (root / "src-xpu" / "dispatch.cpp").read_text(
+        encoding="utf-8"
+    )
+    model_vbar = (root / "src" / "model-vbar.c").read_text(
+        encoding="utf-8"
+    )
+
+    assert "constexpr size_t kRetireBatchUses = 64;" in dispatch
+    assert "struct RetireQueue" in dispatch
+    assert "uint64_t aimdo_xpu_retire_token_current(" in dispatch
+    assert "retire_queue.pending_uses < kRetireBatchUses" in dispatch
+    assert "retire_queue.pending_uses >= kRetireBatchUses" in dispatch
+    assert "size_t aimdo_xpu_retire_snapshot(" in dispatch
+    assert "force_submit && retire_queue.pending_uses" in dispatch
+    assert "g_retired_epoch" not in dispatch
+    assert "g_retire_pending" not in dispatch
+
+    assert "retire_tokens[AIMDO_XPU_RETIRE_MAX_QUEUES]" in model_vbar
+    assert "vbar_retire_record(rp, retirement_token);" in model_vbar
+    assert "vbar_retire_complete(" in model_vbar
+    assert "retire_unknown" in model_vbar
