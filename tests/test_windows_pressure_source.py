@@ -155,6 +155,16 @@ def test_windows_speculative_reclaim_preserves_active_vbar():
     assert "reclaim = budget_deficit((size_t)size);" in normalized
     assert "vbars_free_except(reclaim, (ModelVBAR *)vbar);" in normalized
 
+    prepare = source.split("void vbars_prepare_allocation", 1)[1]
+    prepare = prepare.split("\n}\n", 1)[0]
+    assert "one_time_setup();" not in prepare
+
+    free_except = source.split("static size_t vbars_free_except", 1)[1]
+    free_except = free_except.split("\n}\n", 1)[0]
+    assert free_except.index("vbar_state_lock();") < free_except.index(
+        "one_time_setup();"
+    )
+
 
 def test_vbar_fault_reclaims_the_actual_deficit_before_retry():
     source = (
@@ -264,6 +274,7 @@ def test_windows_retirement_is_per_queue_and_fence_submissions_are_batched():
     assert "constexpr size_t kRetireBatchUses = 64;" in dispatch
     assert "struct RetireQueue" in dispatch
     assert "uint64_t aimdo_xpu_retire_token_current(" in dispatch
+    assert "retire_queue.pending_uses < kRetireBatchUses" in dispatch
     assert "retire_queue.pending_uses >= kRetireBatchUses" in dispatch
     assert "size_t aimdo_xpu_retire_snapshot(" in dispatch
     assert "force_submit && retire_queue.pending_uses" in dispatch

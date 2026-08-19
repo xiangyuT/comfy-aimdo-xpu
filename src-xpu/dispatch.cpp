@@ -1204,7 +1204,9 @@ uint64_t aimdo_xpu_retire_token_current(void *queue_pointer) {
         (retire_queue.open_generation <<
          AIMDO_XPU_RETIRE_TOKEN_QUEUE_BITS) |
         (index + 1);
-    retire_queue.pending_uses++;
+    if (retire_queue.pending_uses < kRetireBatchUses) {
+        retire_queue.pending_uses++;
+    }
     g_stats[kRetireTokenCalls].fetch_add(1, std::memory_order_relaxed);
     if (retire_queue.pending_uses >= kRetireBatchUses) {
         (void)submit_retire_fence_locked(retire_queue);

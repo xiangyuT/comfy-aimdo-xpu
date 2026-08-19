@@ -651,7 +651,6 @@ void vbars_prepare_allocation(void *devctx, void *vbar, uint64_t size) {
     ssize_t reclaim;
 
     set_devctx((AimdoContext *)devctx);
-    one_time_setup();
     /*
      * Windows cannot evict from the Level Zero allocation callback because
      * doing so waits re-entrantly on the same SYCL queue.  Its model-boundary
