@@ -78,10 +78,13 @@ def test_windows_direct_file_reader_reclaims_before_submitting_h2d():
         "#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))", 2
     )[2].split("#endif", 1)[0]
 
-    assert "remaining_pages = vbars_free_retired(deficit);" in windows_path
+    assert "fit_deficit = budget_deficit(chunk);" in windows_path
+    assert "fit_deficit > 0" in windows_path
+    assert "MAX(fit_deficit, (ssize_t)AIMDO_XPU_WDDM_RECLAIM_FLOOR)" in windows_path
+    assert "remaining_pages = vbars_free_retired(reclaim_target);" in windows_path
     assert "if (remaining_pages)" in windows_path
-    assert "vbars_request_reclaim(deficit);" in windows_path
-    assert source.index("remaining_pages = vbars_free_retired(deficit);") < source.index(
+    assert "remaining_pages * (32ULL << 20)" in windows_path
+    assert source.index("remaining_pages = vbars_free_retired(reclaim_target);") < source.index(
         "CUresult copy_result = cuMemcpyHtoDAsync"
     )
     assert '"[AIMDO XPU RECLAIM] op=pre_h2d destination=%p "' in windows_path
@@ -209,26 +212,27 @@ def test_vbar_fault_reclaims_the_actual_deficit_before_retry():
 
 
 def test_vbar_fault_wddm_retry_margin_is_windows_xpu_only():
-    source = (
-        Path(__file__).resolve().parents[1] / "src" / "model-vbar.c"
-    ).read_text(encoding="utf-8")
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "src" / "model-vbar.c").read_text(encoding="utf-8")
+    platform = (root / "src" / "plat.h").read_text(encoding="utf-8")
 
     guard = "#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))"
     # The retry margin, page retirement tokens and non-blocking reclaim are all
     # Windows XPU only; Linux and CUDA keep the original behaviour.
     assert source.count(guard) >= 2
-    assert "#define VBAR_WDDM_RETRY_RECLAIM (512 << 20)" in source
-    assert "(void)vbars_free_retired(VBAR_WDDM_RETRY_RECLAIM);" in source
+    assert "#define AIMDO_XPU_WDDM_RECLAIM_FLOOR (512ULL << 20)" in platform
+    assert "(void)vbars_free_retired(AIMDO_XPU_WDDM_RECLAIM_FLOOR);" in source
     # A fault is already on the execution path that needs the missing page.
     # Waiting for the whole device here can deadlock; a failed non-blocking
     # reclaim must become a recoverable host-offload OOM instead.
     retry = source.split(
         "VBAR Windows XPU retry reclaiming an additional", 1
     )[1].split("#endif", 1)[0]
-    assert "vbars_free(VBAR_WDDM_RETRY_RECLAIM)" not in retry
-    for windows_only in ("VBAR_WDDM_RETRY_RECLAIM", "retire_tokens",
+    assert "vbars_free(AIMDO_XPU_WDDM_RECLAIM_FLOOR)" not in retry
+    for windows_only in ("AIMDO_XPU_WDDM_RECLAIM_FLOOR", "retire_tokens",
                          "vbars_free_retired"):
-        assert windows_only not in source.split(guard, 1)[0]
+        if windows_only != "AIMDO_XPU_WDDM_RECLAIM_FLOOR":
+            assert windows_only not in source.split(guard, 1)[0]
 
 
 def test_non_blocking_reclaim_never_waits_or_moves_the_watermark():

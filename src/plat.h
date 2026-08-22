@@ -10,6 +10,13 @@
 typedef int cudaError_t;
 typedef struct CUstream_st *cudaStream_t;
 
+/* WDDM can require substantially more progress residency than the allocation
+ * that first crosses the sampled budget.  Use one shared Windows/XPU floor for
+ * both VBAR allocation retry and synchronous file-to-VBAR copy pressure. */
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+#define AIMDO_XPU_WDDM_RECLAIM_FLOOR (512ULL << 20)
+#endif
+
 #if defined(__HIP_PLATFORM_AMD__) && !defined(_WIN32) && !defined(_WIN64)
 #include <sys/mman.h>
 /* Work around ROCm VMM unmap behavior by reprotecting the range after unmap.

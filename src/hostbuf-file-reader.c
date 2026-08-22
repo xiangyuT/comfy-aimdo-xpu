@@ -122,29 +122,42 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
          * deadlock forward progress when the synchronous H2D wait itself is
          * the operation that cannot complete under residency pressure.
          *
-         * Never wait here. If the completed set cannot satisfy the shortage,
-         * preserve the request for the next model-owner boundary. */
+         * An exact allocation-fit deficit is insufficient for WDDM progress:
+         * a 7 MiB deficit was satisfied by releasing one 32 MiB page, but the
+         * following SYCL copy still waited forever in urEventWait. Once a real
+         * shortage exists, use the same bounded safety batch as the physical
+         * VBAR allocation retry. Do not reserve that margin while the copy
+         * still fits, because doing so would churn weights on every H2D.
+         *
+         * Never wait here. If the completed set cannot satisfy the target,
+         * preserve only the remainder for the next model-owner boundary. */
         if (!aimdo_stream_reclaim_disabled()) {
-            ssize_t deficit = budget_deficit(chunk);
+            ssize_t fit_deficit = budget_deficit(chunk);
+            ssize_t reclaim_target = fit_deficit > 0
+                ? MAX(fit_deficit, (ssize_t)AIMDO_XPU_WDDM_RECLAIM_FLOOR)
+                : 0;
             size_t requested_pages = 0;
             size_t remaining_pages = 0;
 
-            if (deficit > 0) {
-                requested_pages = ((size_t)deficit + (32ULL << 20) - 1) /
+            if (reclaim_target > 0) {
+                requested_pages = ((size_t)reclaim_target + (32ULL << 20) - 1) /
                                   (32ULL << 20);
-                remaining_pages = vbars_free_retired(deficit);
+                remaining_pages = vbars_free_retired(reclaim_target);
 
                 if (remaining_pages) {
-                    vbars_request_reclaim(deficit);
+                    vbars_request_reclaim(
+                        (ssize_t)(remaining_pages * (32ULL << 20)));
                 }
             }
             if (aimdo_stream_reclaim_trace_enabled()) {
                 fprintf(stderr,
                         "[AIMDO XPU RECLAIM] op=pre_h2d destination=%p "
-                        "size=%zu deficit=%lld requested_pages=%zu "
+                        "size=%zu fit_deficit=%lld reclaim_target=%lld "
+                        "requested_pages=%zu "
                         "reclaimed_pages=%zu remaining_pages=%zu\n",
                         (void *)(uintptr_t)device_ptr, chunk,
-                        (long long)deficit, requested_pages,
+                        (long long)fit_deficit, (long long)reclaim_target,
+                        requested_pages,
                         requested_pages - remaining_pages, remaining_pages);
                 fflush(stderr);
             }

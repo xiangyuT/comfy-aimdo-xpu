@@ -8,7 +8,6 @@
  * receives exact allocator-time pressure and must retain its existing
  * behavior. */
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-#define VBAR_WDDM_RETRY_RECLAIM (512 << 20)
 #define VBAR_CUDA_ERROR_UNKNOWN ((CUresult)999)
 #endif
 
@@ -1381,8 +1380,8 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
                      * use its host-streaming fallback. */
                     log(DEBUG,
                         "VBAR Windows XPU retry reclaiming an additional %zu MB ...\n",
-                        (size_t)VBAR_WDDM_RETRY_RECLAIM / M);
-                    (void)vbars_free_retired(VBAR_WDDM_RETRY_RECLAIM);
+                        (size_t)AIMDO_XPU_WDDM_RECLAIM_FLOOR / M);
+                    (void)vbars_free_retired(AIMDO_XPU_WDDM_RECLAIM_FLOOR);
                     if (page_end > mv->watermark) {
                         log(DEBUG,
                             "VBAR allocation cancelled after Windows XPU retry reclaim\n");
