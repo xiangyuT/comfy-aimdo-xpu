@@ -20,6 +20,18 @@ static bool aimdo_stream_reclaim_disabled(void) {
     }
     return disabled != 0;
 }
+
+static bool aimdo_stream_reclaim_trace_enabled(void) {
+    static int enabled = -1;
+    char value[8];
+
+    if (enabled < 0) {
+        DWORD length = GetEnvironmentVariableA(
+            "AIMDO_XPU_SYNC_TRACE", value, sizeof(value));
+        enabled = length > 0 && length < sizeof(value) && value[0] == '1';
+    }
+    return enabled != 0;
+}
 #endif
 
 static bool hostbuf_file_reader_retire_active(void) {
@@ -114,13 +126,27 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
          * preserve the request for the next model-owner boundary. */
         if (!aimdo_stream_reclaim_disabled()) {
             ssize_t deficit = budget_deficit(chunk);
+            size_t requested_pages = 0;
+            size_t remaining_pages = 0;
 
             if (deficit > 0) {
-                size_t remaining = vbars_free_retired(deficit);
+                requested_pages = ((size_t)deficit + (32ULL << 20) - 1) /
+                                  (32ULL << 20);
+                remaining_pages = vbars_free_retired(deficit);
 
-                if (remaining) {
+                if (remaining_pages) {
                     vbars_request_reclaim(deficit);
                 }
+            }
+            if (aimdo_stream_reclaim_trace_enabled()) {
+                fprintf(stderr,
+                        "[AIMDO XPU RECLAIM] op=pre_h2d destination=%p "
+                        "size=%zu deficit=%lld requested_pages=%zu "
+                        "reclaimed_pages=%zu remaining_pages=%zu\n",
+                        (void *)(uintptr_t)device_ptr, chunk,
+                        (long long)deficit, requested_pages,
+                        requested_pages - remaining_pages, remaining_pages);
+                fflush(stderr);
             }
         }
 #endif

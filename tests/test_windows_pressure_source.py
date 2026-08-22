@@ -78,12 +78,14 @@ def test_windows_direct_file_reader_reclaims_before_submitting_h2d():
         "#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))", 2
     )[2].split("#endif", 1)[0]
 
-    assert "remaining = vbars_free_retired(deficit);" in windows_path
-    assert "if (remaining)" in windows_path
+    assert "remaining_pages = vbars_free_retired(deficit);" in windows_path
+    assert "if (remaining_pages)" in windows_path
     assert "vbars_request_reclaim(deficit);" in windows_path
-    assert source.index("remaining = vbars_free_retired(deficit);") < source.index(
+    assert source.index("remaining_pages = vbars_free_retired(deficit);") < source.index(
         "CUresult copy_result = cuMemcpyHtoDAsync"
     )
+    assert '"[AIMDO XPU RECLAIM] op=pre_h2d destination=%p "' in windows_path
+    assert "requested_pages - remaining_pages" in windows_path
     assert "cuCtxSynchronize" not in windows_path
 
 
