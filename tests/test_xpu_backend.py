@@ -477,6 +477,11 @@ def test_priority_evicts_the_lowest_vbar_first():
 
     newest = ModelVBAR(32 << 20, device.index)
     newest_allocation = newest.alloc(8 << 20)
+    if sys.platform == "win32":
+        # The default correctness-reference mode performs destructive VBAR
+        # reclaim only at an explicit model-owner boundary. A per-weight fault
+        # must not hide a queue-wide synchronize when async retirement is off.
+        newest.prioritize()
     assert newest.fault(newest_allocation[1], newest_allocation[2]) is not None
     newest.unpin(newest_allocation[1], newest_allocation[2])
 

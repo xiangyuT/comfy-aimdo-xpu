@@ -83,14 +83,19 @@ def test_windows_owner_boundary_consumes_deferred_reclaim():
     assert "vbars_free_retired" not in request
     assert "cuMemUnmap" not in request
 
-    fault = source.split("static int vbar_fault_locked", 1)[1]
+    fault = source.split("int vbar_fault(void *devctx", 1)[1]
     fault = fault.split("\n}\n", 1)[0]
     assert "vbars_reclaim_at_owner_boundary(budget_deficit(0));" in fault
+    assert fault.index("vbars_reclaim_at_owner_boundary") < fault.index(
+        "vbar_state_lock();"
+    )
 
     prepare = source.split("void vbars_prepare_allocation", 1)[1]
     prepare = prepare.split("void vbar_prioritize", 1)[0]
     assert "vbars_take_reclaim_request();" in prepare
-    assert "vbars_free_except(reclaim, (ModelVBAR *)vbar);" in prepare
+    assert "vbars_free_synchronized_except(reclaim, (ModelVBAR *)vbar);" in prepare
+    assert "vbars_free_retired_except(reclaim, (ModelVBAR *)vbar);" in prepare
+    assert "if (vbar_async_reclaim_enabled())" in prepare
 
 
 def test_windows_model_boundary_applies_deferred_native_pressure():
@@ -110,6 +115,7 @@ def test_windows_model_boundary_applies_deferred_native_pressure():
         in source
     )
     assert "lib.vbars_prepare_allocation(" in source
+    assert "if anticipated_growth:" not in source
     normalized = " ".join(source.split())
     assert (
         "lib.vbars_prepare_allocation.argtypes = [ "
@@ -153,7 +159,14 @@ def test_windows_speculative_reclaim_preserves_active_vbar():
         "uint64_t size)"
     ) in normalized
     assert "reclaim = budget_deficit((size_t)size);" in normalized
-    assert "vbars_free_except(reclaim, (ModelVBAR *)vbar);" in normalized
+    assert (
+        "(void)vbars_free_synchronized_except(reclaim, (ModelVBAR *)vbar);"
+        in normalized
+    )
+    assert (
+        "(void)vbars_free_retired_except(reclaim, (ModelVBAR *)vbar);"
+        in normalized
+    )
 
     prepare = source.split("void vbars_prepare_allocation", 1)[1]
     prepare = prepare.split("\n}\n", 1)[0]
@@ -204,14 +217,21 @@ def test_non_blocking_reclaim_never_waits_or_moves_the_watermark():
         Path(__file__).resolve().parents[1] / "src" / "model-vbar.c"
     ).read_text(encoding="utf-8")
 
-    body = source.split("size_t vbars_free_retired(ssize_t size)", 1)[1]
+    body = source.split(
+        "static size_t vbars_free_retired_except", 1
+    )[1]
     body = body.split("\n}\n", 1)[0]
 
     # Waiting here would block the driver's allocation call behind work that
     # may itself be waiting for the residency being requested.
     assert "cuCtxSynchronize" not in body
     assert "aimdo_xpu_retire_snapshot(" in body
-    assert "vbar_retire_complete(rp, completed, completed_count)" in body
+    assert "vbar_freeze_retired_candidates(" in body
+    freeze = source.split(
+        "static size_t vbar_freeze_retired_candidates", 1
+    )[1].split("\n}\n", 1)[0]
+    assert "vbar_retire_complete(rp, completed, completed_count)" in freeze
+    assert "cuCtxSynchronize" not in freeze
     # Lowering the watermark denies future faults until the next activation,
     # which turns a momentary spike into a permanently smaller working set.
     assert "watermark--" not in body
@@ -228,12 +248,27 @@ def test_windows_vbar_reclaim_serializes_page_state_without_waiting():
     assert "vbar_lock = mutex_create();" in control
     assert "mutex_destroy((Mutex)vbar_lock);" in control
 
-    reclaim = source.split("size_t vbars_free_retired(ssize_t size)", 1)[1]
+    reclaim = source.split(
+        "static size_t vbars_free_retired_except", 1
+    )[1]
     reclaim = reclaim.split("\n}\n", 1)[0]
-    assert "vbar_state_try_lock()" in reclaim
-    assert "vbar_state_lock()" not in reclaim
+    freeze = source.split(
+        "static size_t vbar_freeze_retired_candidates", 1
+    )[1].split("\n}\n", 1)[0]
+    commit = source.split(
+        "static size_t vbar_commit_candidates", 1
+    )[1].split("\n}\n", 1)[0]
+    assert "vbar_state_try_lock()" in freeze
     assert "cuCtxSynchronize" not in reclaim
     assert "if (!vbar_async_reclaim_enabled())" in reclaim
+    assert "rp->evicting = 1;" in freeze
+    for identity in (
+        "rp->handle != candidate->handle",
+        "rp->serial != candidate->serial",
+        "rp->eviction_generation != candidate->eviction_generation",
+        "rp->pin_count",
+    ):
+        assert identity in commit
 
     fault = source.split("int vbar_fault(void *devctx", 1)[1]
     fault = fault.split("\n}\n", 1)[0]
@@ -249,9 +284,7 @@ def test_windows_unpin_publishes_queue_token_before_idle_state():
     unpin = source.split("void vbar_unpin_stream", 1)[1]
     unpin = unpin.split("\n}\n", 1)[0]
 
-    token_snapshot = unpin.index(
-        "retirement_token = aimdo_xpu_retire_token_current("
-    )
+    token_snapshot = unpin.index("retirement_token = vbar_consumer_dependency(")
     state_lock = unpin.index("vbar_state_lock();")
     token_publish = unpin.index(
         "vbar_retire_record(rp, retirement_token);"
@@ -260,6 +293,91 @@ def test_windows_unpin_publishes_queue_token_before_idle_state():
     state_unlock = unpin.index("vbar_state_unlock();")
 
     assert token_snapshot < state_lock < token_publish < idle_publish < state_unlock
+
+
+def test_windows_reference_mode_has_no_retirement_token_or_barrier_path():
+    root = Path(__file__).resolve().parents[1]
+    source = (root / "src" / "model-vbar.c").read_text(encoding="utf-8")
+    dispatch = (root / "src-xpu" / "dispatch.cpp").read_text(
+        encoding="utf-8"
+    )
+
+    dependency = source.split("static uint64_t vbar_consumer_dependency", 1)[1]
+    dependency = dependency.split("\n}\n", 1)[0]
+    disabled = dependency.split("if (!vbar_async_reclaim_enabled())", 1)[1]
+    disabled = disabled.split("return 0;", 1)[0]
+    assert "aimdo_xpu_register_consumer_queue" in disabled
+    assert "aimdo_xpu_retire_token_current" not in disabled
+    assert "submit_retire_fence_locked" not in disabled
+    default_mode = source.split(
+        "static bool vbar_async_reclaim_enabled", 1
+    )[1].split("static inline void vbar_retire_reset", 1)[0]
+    assert "value[0] == '1'" in default_mode
+
+    assert "std::atomic<bool> g_retire_accepting{false};" in dispatch
+    assert "g_retire_accepting.store(false" in dispatch
+    assert "queue.wait_and_throw();" in dispatch
+    reset = dispatch.split("bool aimdo_xpu_retire_reset(void)", 1)[1]
+    reset = reset.split("AIMDO_XPU_EXPORT void *xpu_alloc_fn", 1)[0]
+    assert "if (!drained)" in reset
+    assert reset.index("if (!drained)") < reset.index("queue.reset();")
+
+
+def test_windows_queue_registry_owns_and_validates_queue_identity():
+    dispatch = (
+        Path(__file__).resolve().parents[1] / "src-xpu" / "dispatch.cpp"
+    ).read_text(encoding="utf-8")
+
+    assert "std::shared_ptr<sycl::queue> queue;" in dispatch
+    assert "void *source_pointer = nullptr;" in dispatch
+    assert "ze_context_handle_t context = nullptr;" in dispatch
+    assert "ze_device_handle_t device = nullptr;" in dispatch
+    assert "uint64_t incarnation = 0;" in dispatch
+    assert "retire_queue.context == context" in dispatch
+    assert "retire_queue.device == device" in dispatch
+    assert "*retire_queue.queue == *queue" in dispatch
+    context_sync = dispatch.split("CUresult xpu_context_synchronize()", 1)[1]
+    context_sync = context_sync.split("\n}\n", 1)[0]
+    lock_end = context_sync.index("for (sycl::queue &queue : queues)")
+    assert context_sync.index("std::lock_guard<std::mutex>") < lock_end
+    assert context_sync.index("queue.wait_and_throw();") > lock_end
+
+
+def test_windows_explicit_consumer_and_capture_fail_closed_are_exposed():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "comfy_aimdo"
+        / "model_vbar.py"
+    ).read_text(encoding="utf-8")
+
+    assert "def vbar_register_consumer(alloc, stream=None):" in source
+    assert "lib.vbar_register_consumer_stream(" in source
+    assert 'getattr(torch.xpu, "is_current_stream_capturing", None)' in source
+    capture = source.split("def _consumer_queue_ptr", 1)[1]
+    capture = capture.split("def _trace_vbar", 1)[0]
+    assert "if callable(is_capturing) and is_capturing():" in capture
+    assert "return 0" in capture
+
+
+def test_windows_unmap_release_failure_keeps_metadata_truthful():
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "model-vbar.c"
+    ).read_text(encoding="utf-8")
+    mod1 = source.split("static inline bool mod1", 1)[1]
+    mod1 = mod1.split("static size_t vbars_free_except", 1)[0]
+
+    assert "if (!CHECK_CU_ERROR(cuMemUnmap" in mod1
+    assert "if (!CHECK_CU_ERROR(cuMemRelease" in mod1
+    assert "vbar_restore_page_mapping" in mod1
+    assert "rp->mapped = VBAR_MAPPING_UNMAPPED;" in mod1
+    assert "rp->retire_unknown = 1;" in mod1
+    assert mod1.index("cuMemRelease") < mod1.index("rp->handle = 0;")
+
+    map_new = source.split("static CUresult vbar_map_new_page", 1)[1]
+    map_new = map_new.split("static inline bool mod1", 1)[0]
+    assert "if (rp->handle)" in map_new
+    assert "VBAR_MAPPING_UNKNOWN" in map_new
+    assert "total_vram_usage += VBAR_PAGE_SIZE;" in map_new
 
 
 def test_windows_retirement_is_per_queue_and_fence_submissions_are_batched():
@@ -278,6 +396,8 @@ def test_windows_retirement_is_per_queue_and_fence_submissions_are_batched():
     assert "retire_queue.pending_uses >= kRetireBatchUses" in dispatch
     assert "size_t aimdo_xpu_retire_snapshot(" in dispatch
     assert "force_submit && retire_queue.pending_uses" in dispatch
+    assert "retire_queue.incarnation <<" in dispatch
+    assert "completed_incarnation != incarnation" in model_vbar
     assert "g_retired_epoch" not in dispatch
     assert "g_retire_pending" not in dispatch
 

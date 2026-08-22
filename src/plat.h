@@ -230,7 +230,8 @@ uint64_t vbars_analyze(void *devctx, bool only_dirty);
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
 /* dispatch.cpp: per-queue retirement tokens for non-blocking reclaim */
-uint64_t aimdo_xpu_retire_token_current(void *queue);
+bool aimdo_xpu_register_consumer_queue(void *queue, int device);
+uint64_t aimdo_xpu_retire_token_current(void *queue, int device);
 size_t aimdo_xpu_retire_snapshot(uint64_t *completed, size_t count,
                                  bool force_submit);
 /* model_vbar.c */
@@ -239,6 +240,9 @@ void vbars_request_reclaim(ssize_t size);
 SHARED_EXPORT
 void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
                        uint64_t stream);
+SHARED_EXPORT
+void vbar_register_consumer_stream(void *devctx, void *vbar, uint64_t offset,
+                                   uint64_t size, uint64_t stream);
 #endif
 
 /* pyt-cu-alloc.c */

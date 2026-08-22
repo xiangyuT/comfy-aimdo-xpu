@@ -39,21 +39,39 @@ _unpin_stream_supported = (
     and sys.platform == "win32"
     and control.implementation == "xpu"
 )
+_consumer_registration_supported = (
+    _unpin_stream_supported
+    and hasattr(lib, "vbar_register_consumer_stream")
+)
 
 if _unpin_stream_supported:
     lib.vbar_unpin_stream.argtypes = [
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
         ctypes.c_uint64,
     ]
+if _consumer_registration_supported:
+    lib.vbar_register_consumer_stream.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+        ctypes.c_uint64,
+    ]
 
 
-def _current_queue_ptr(device):
-    """SYCL queue backing the caller's current Torch XPU stream."""
+def _consumer_queue_ptr(device, stream=None):
+    """SYCL queue backing a submitted VBAR consumer.
+
+    Registration is intentionally post-submission.  During graph capture a
+    completion marker cannot prove replay lifetime, so return the explicit
+    unknown token and keep the page non-reclaimable.
+    """
     try:
         import torch
 
-        return int(torch.xpu.current_stream(
-            torch.device("xpu", device)).sycl_queue)
+        is_capturing = getattr(torch.xpu, "is_current_stream_capturing", None)
+        if callable(is_capturing) and is_capturing():
+            return 0
+        if stream is None:
+            stream = torch.xpu.current_stream(torch.device("xpu", device))
+        return int(getattr(stream, "sycl_queue", stream))
     except Exception:
         return 0
 
@@ -228,21 +246,19 @@ class ModelVBAR:
             historical_growth = max(0, peak_reserved - reserved)
             inference_budget = current_inference_memory_budget(self.device)
             anticipated_growth = max(historical_growth, inference_budget)
-            prepared_allocation = False
-            if anticipated_growth:
-                # Linux's pluggable allocator can safely grow a newly
-                # prioritized model under exact allocation-time pressure.
-                # Windows only has a historical model-boundary estimate. Keep
-                # the normal reset-to-full watermark so a tiled/repeated model
-                # can fault its complete address range again, while excluding
-                # the active VBAR from this speculative reclaim.
-                # Level Zero allocation callbacks cannot safely wait on the
-                # same SYCL queue. Reclaim at this model-switch boundary using
-                # the native allocator's observed peak as the next-burst hint.
-                lib.vbars_prepare_allocation(
-                    self._devctx, self._ptr, anticipated_growth
-                )
-                prepared_allocation = True
+            prepared_allocation = True
+            # Linux's pluggable allocator can safely grow a newly prioritized
+            # model under exact allocation-time pressure. Windows uses the
+            # historical estimate and any deferred callback pressure while
+            # excluding the active VBAR from speculative reclaim.
+            # Always enter the Windows owner boundary, including when the
+            # historical estimate is zero. The synchronized reference mode
+            # consumes deferred callback pressure only here; skipping this
+            # call would strand it until another model happened to report
+            # anticipated growth.
+            lib.vbars_prepare_allocation(
+                self._devctx, self._ptr, anticipated_growth
+            )
             if _boundary_trace_enabled:
                 current_watermark = lib.vbar_get_watermark(
                     self._devctx, self._ptr
@@ -299,7 +315,17 @@ class ModelVBAR:
         else:
             raise RuntimeError(f"Fault failed: {res}")
 
-    def unpin(self, alloc, size):
+    def register_consumer(self, alloc, size, stream=None):
+        if not _consumer_registration_supported:
+            return False
+        offset = alloc - self.base_addr
+        queue = _consumer_queue_ptr(self.device, stream)
+        lib.vbar_register_consumer_stream(
+            self._devctx, self._ptr, offset, size, queue
+        )
+        return bool(queue)
+
+    def unpin(self, alloc, size, stream=None):
         offset = alloc - self.base_addr
         if _unpin_stream_supported:
             # VBAR map/unmap carry no stream, so this is the only point where
@@ -309,7 +335,7 @@ class ModelVBAR:
             # work: reclaiming on that proof caused DEVICE_LOST.
             lib.vbar_unpin_stream(
                 self._devctx, self._ptr, offset, size,
-                _current_queue_ptr(self.device))
+                _consumer_queue_ptr(self.device, stream))
             return
         lib.vbar_unpin(self._devctx, self._ptr, offset, size)
 
@@ -365,12 +391,20 @@ def vbar_fault(alloc):
     )
     return result
 
-def vbar_unpin(alloc):
+def vbar_register_consumer(alloc, stream=None):
+    """Register an additional post-submission consumer before final unpin."""
+    if alloc is None:
+        return False
+    vbar, offset, size = alloc
+    return vbar.register_consumer(offset, size, stream)
+
+
+def vbar_unpin(alloc, stream=None):
     if alloc is not None:
         caller = sys._getframe(1)
         _trace_vbar("unpin", "begin", alloc, caller)
         vbar, offset, size = alloc
-        vbar.unpin(offset, size)
+        vbar.unpin(offset, size, stream)
         _trace_vbar("unpin", "end", alloc, caller)
 
 def vbar_signature_compare(a, b):
