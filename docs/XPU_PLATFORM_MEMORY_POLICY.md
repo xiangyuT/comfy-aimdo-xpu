@@ -81,9 +81,19 @@ continuous VBAR eviction.
 ## Retirement and model boundaries
 
 Windows reclaim cannot create a queue fence at the moment memory is needed and
-then wait for it. Pages are tagged when they become unpinned, and previously
-submitted completion barriers advance retirement epochs. The allocation path
-only compares completed epochs and returns immediately.
+then wait for it. Pages publish per-queue retirement generations when they
+become unpinned. Pressure closes a partial fence batch when necessary, but the
+allocation path only compares completed generations and returns immediately.
+
+Non-blocking two-phase retirement is the Windows default. Unpin publishes the
+actual consumer queue before the page becomes idle. A pressure boundary closes
+any partial fence batch, snapshots completed generations, freezes eligible
+pages, and revalidates their handle, serial, eviction generation, and pin state
+before unmapping. A marker submitted by the current pressure boundary is not
+treated as complete in that same boundary. Setting
+`AIMDO_XPU_ASYNC_VBAR_RECLAIM=0` selects a synchronized model-boundary oracle;
+because it cannot bound pages touched within one activation, it is not a
+product-performance mode.
 
 At `prioritize()`, Windows may use PyTorch's observed peak-minus-current
 reserved memory as a hint for expected native growth. This is speculative:
@@ -148,3 +158,8 @@ python tests\repro_xpu_platform_memory_policy.py
 
 The script creates a lower-priority and an active VBAR, applies controlled
 pressure, and reports residency around the platform policy.
+
+Windows retirement changes must additionally run
+`tests/run_xpu_vbar_resident_growth.py`: the default 16-page/512 MiB test must
+remain bounded at one resident page under deterministic live pressure. This
+capacity gate precedes any ComfyUI workflow benchmark.

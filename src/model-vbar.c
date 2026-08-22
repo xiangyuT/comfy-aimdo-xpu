@@ -93,11 +93,15 @@ static bool vbar_async_reclaim_enabled(void) {
         char value[8];
         DWORD length = GetEnvironmentVariableA(
             "AIMDO_XPU_ASYNC_VBAR_RECLAIM", value, sizeof(value));
-        /* The synchronized owner-boundary implementation is the default
-         * correctness reference. Non-blocking event retirement remains an
-         * explicit opt-in until the real-XPU promotion gates pass. */
-        LONG detected = length > 0 && length < sizeof(value) &&
-                        value[0] == '1';
+        /* Non-blocking two-phase retirement is the product path.  The
+         * synchronized owner-boundary implementation remains available as an
+         * explicit correctness oracle, but cannot be the default: it retains
+         * every page touched inside one model activation and forces WDDM to
+         * page model weights and activations together. */
+        LONG detected = 1;
+        if (length == 1 && value[0] == '0') {
+            detected = 0;
+        }
 
         InterlockedCompareExchange(&cached, detected, -1);
         enabled = InterlockedCompareExchange(&cached, -1, -1);

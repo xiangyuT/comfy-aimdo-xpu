@@ -28,7 +28,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--device", type=int, required=True)
     parser.add_argument(
-        "--mode", choices=("reference", "async"), required=True
+        "--mode", choices=("default", "reference", "async"), required=True
     )
     parser.add_argument("--matrix-size", type=int, default=12288)
     parser.add_argument("--cycles", type=int, default=0)
@@ -157,8 +157,10 @@ def main():
     args = parse_args()
     if sys.platform != "win32":
         raise SystemExit("this oracle targets Windows XPU")
-    if args.mode == "reference":
+    if args.mode == "default":
         os.environ.pop("AIMDO_XPU_ASYNC_VBAR_RECLAIM", None)
+    elif args.mode == "reference":
+        os.environ["AIMDO_XPU_ASYNC_VBAR_RECLAIM"] = "0"
     else:
         os.environ["AIMDO_XPU_ASYNC_VBAR_RECLAIM"] = "1"
 

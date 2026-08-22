@@ -295,7 +295,7 @@ def test_windows_unpin_publishes_queue_token_before_idle_state():
     assert token_snapshot < state_lock < token_publish < idle_publish < state_unlock
 
 
-def test_windows_reference_mode_has_no_retirement_token_or_barrier_path():
+def test_windows_async_mode_is_default_and_reference_has_no_token_path():
     root = Path(__file__).resolve().parents[1]
     source = (root / "src" / "model-vbar.c").read_text(encoding="utf-8")
     dispatch = (root / "src-xpu" / "dispatch.cpp").read_text(
@@ -312,7 +312,8 @@ def test_windows_reference_mode_has_no_retirement_token_or_barrier_path():
     default_mode = source.split(
         "static bool vbar_async_reclaim_enabled", 1
     )[1].split("static inline void vbar_retire_reset", 1)[0]
-    assert "value[0] == '1'" in default_mode
+    assert "LONG detected = 1;" in default_mode
+    assert "length == 1 && value[0] == '0'" in default_mode
 
     assert "std::atomic<bool> g_retire_accepting{false};" in dispatch
     assert "g_retire_accepting.store(false" in dispatch

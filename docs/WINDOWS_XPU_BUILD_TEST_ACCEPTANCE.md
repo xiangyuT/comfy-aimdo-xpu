@@ -98,6 +98,32 @@ will run ComfyUI. Useful focused entry points include:
 python tests\repro_xpu_platform_memory_policy.py
 ```
 
+Retirement changes must first pass both the premature-unmap oracle and the
+same-model resident-growth gate. Run each mode in a fresh process because the
+native mode selection is cached:
+
+```powershell
+<portable>\python_embeded\python.exe -s `
+    tests\run_xpu_vbar_retirement_safety.py `
+    --device <index> --mode default --matrix-size 12288
+<portable>\python_embeded\python.exe -s `
+    tests\run_xpu_vbar_retirement_safety.py `
+    --device <index> --mode async --matrix-size 12288 --cycles 100
+<portable>\python_embeded\python.exe -s `
+    tests\run_xpu_vbar_resident_growth.py `
+    --device <index> --mode default --pages 16
+<portable>\python_embeded\python.exe -s `
+    tests\run_xpu_vbar_resident_growth.py `
+    --device <index> --mode reference --pages 16
+```
+
+The default 16-page capacity gate maps at most 512 MiB. Default/async must
+remain bounded at one resident page in this deterministic pressure window and
+finish at zero; reference is expected to grow from one through sixteen and is
+therefore a correctness oracle, not a product-performance candidate. Do not
+start a workflow benchmark when the default capacity gate or the default
+multi-queue safety oracle fails.
+
 A component reproducer proves only the path it exercises. A memory-policy
 change also requires a real workload that reaches pressure, demonstrated by
 non-zero pressure/reclaim counters in the same run.
@@ -134,6 +160,12 @@ step count, and require all of the following in the same window:
 4. bounded WDDM local/non-local usage relative to the configured reserve;
 5. pressure and reclaim counters proving the changed path executed;
 6. repeated-prompt timing without a systematic regression.
+
+The workflow ladder is strictly staged: deterministic component gates above,
+then a bounded two-step pressure canary, then one full-step-count sample, and
+only then a repeated duration/resolution cycle. A canary that exceeds the
+matched baseline by more than 10% is a promotion failure and must not be
+allowed to continue into the long cycle.
 
 Do not promote a cached execution as a sample. Change the seed or another
 sampler input for every prompt while allowing static loader nodes to remain

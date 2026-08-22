@@ -64,6 +64,13 @@ see examples/example.py
   reclaims only a residual deficit from retirement-proven VBAR pages. Model
   prioritization preserves the active VBAR during speculative reclaim, and
   individual faults apply current pressure when residency really must fall.
+  On Windows, pages publish the actual consuming SYCL queue before becoming
+  idle. Non-blocking two-phase retirement is the default: pressure may unmap a
+  page only after every registered queue marker completes and the page
+  identity is revalidated. `AIMDO_XPU_ASYNC_VBAR_RECLAIM=0` selects the
+  synchronized model-boundary reference oracle; it is diagnostic-only because
+  pages touched within one activation otherwise accumulate until a model
+  switch and can force WDDM paging.
 * On Linux, AIMDO continues to install its XPU pluggable allocator backed by
   `sycl::malloc_device()`. Freed regular allocations are cached per device and
   SYCL queue, with completion barriers protecting reuse.
