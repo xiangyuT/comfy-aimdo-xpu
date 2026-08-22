@@ -60,14 +60,31 @@ def test_xpu_defers_vbar_mutation_out_of_the_allocation_path():
         assert "vbars_free_retired" not in allocation_path
 
 
-def test_windows_streaming_paths_only_publish_reclaim_pressure():
+def test_windows_callback_streaming_path_only_publishes_reclaim_pressure():
     root = Path(__file__).resolve().parents[1]
+    source = (root / "src" / "hostbuf.c").read_text(encoding="utf-8")
 
-    for relative in ("src/hostbuf.c", "src/hostbuf-file-reader.c"):
-        source = (root / relative).read_text(encoding="utf-8")
+    assert "vbars_request_reclaim(deficit);" in source
+    assert "vbars_free_retired(deficit);" not in source
 
-        assert "vbars_request_reclaim(deficit);" in source
-        assert "vbars_free_retired(deficit);" not in source
+
+def test_windows_direct_file_reader_reclaims_before_submitting_h2d():
+    source = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "hostbuf-file-reader.c"
+    ).read_text(encoding="utf-8")
+    windows_path = source.split(
+        "#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))", 2
+    )[2].split("#endif", 1)[0]
+
+    assert "remaining = vbars_free_retired(deficit);" in windows_path
+    assert "if (remaining)" in windows_path
+    assert "vbars_request_reclaim(deficit);" in windows_path
+    assert source.index("remaining = vbars_free_retired(deficit);") < source.index(
+        "CUresult copy_result = cuMemcpyHtoDAsync"
+    )
+    assert "cuCtxSynchronize" not in windows_path
 
 
 def test_windows_owner_boundary_consumes_deferred_reclaim():

@@ -849,9 +849,10 @@ static size_t vbar_free_model_range_synchronized(
 
 /* Reclaim without ever waiting on the compute queue.
  *
- * This runs only from a VBAR/model-owner boundary, never from a native
- * allocation or host-copy callback.  It is still best effort: release every
- * page that is provably idle and skip the rest rather than waiting for one.
+ * This runs only from a VBAR/model-owner boundary or immediately before the
+ * direct file reader submits a host copy. It never runs from a native
+ * allocation or driver callback. It is still best effort: release every page
+ * that is provably idle and skip the rest rather than waiting for one.
  *
  * Two differences from vbars_free_except() matter:
  *

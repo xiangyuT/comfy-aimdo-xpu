@@ -102,15 +102,25 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
             return false;
         }
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-        /* The destination was budgeted and pinned by the preceding VBAR
-         * fault.  A copy callback may observe later pressure, but it must not
-         * unmap other pages while Level Zero is preparing this transfer.
-         * Publish the shortage for the next owner-side fault instead. */
+        /* This direct reader runs on the model-owner call stack, before the
+         * Level Zero copy is submitted.  The preceding VBAR fault has already
+         * mapped and pinned the destination, so a non-blocking scan cannot
+         * select it.  Reclaim other pages whose consumer fences are already
+         * complete now: deferring all of this pressure to the next fault can
+         * deadlock forward progress when the synchronous H2D wait itself is
+         * the operation that cannot complete under residency pressure.
+         *
+         * Never wait here. If the completed set cannot satisfy the shortage,
+         * preserve the request for the next model-owner boundary. */
         if (!aimdo_stream_reclaim_disabled()) {
             ssize_t deficit = budget_deficit(chunk);
 
             if (deficit > 0) {
-                vbars_request_reclaim(deficit);
+                size_t remaining = vbars_free_retired(deficit);
+
+                if (remaining) {
+                    vbars_request_reclaim(deficit);
+                }
             }
         }
 #endif
