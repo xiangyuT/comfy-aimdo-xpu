@@ -80,15 +80,14 @@ def test_windows_direct_file_reader_reclaims_before_submitting_h2d():
 
     assert "fit_deficit = budget_deficit(chunk);" in windows_path
     assert "fit_deficit > 0" in windows_path
-    assert "MAX(fit_deficit, (ssize_t)AIMDO_XPU_WDDM_RECLAIM_FLOOR)" in windows_path
-    assert "remaining_pages = vbars_free_retired(reclaim_target);" in windows_path
-    assert "if (remaining_pages)" in windows_path
-    assert "remaining_pages * (32ULL << 20)" in windows_path
-    assert source.index("remaining_pages = vbars_free_retired(reclaim_target);") < source.index(
+    assert "reclaimed_pages = vbars_free_all_retired();" in windows_path
+    assert "post_reclaim_deficit = budget_deficit(chunk);" in windows_path
+    assert "vbars_request_reclaim(post_reclaim_deficit);" in windows_path
+    assert source.index("reclaimed_pages = vbars_free_all_retired();") < source.index(
         "CUresult copy_result = cuMemcpyHtoDAsync"
     )
     assert '"[AIMDO XPU RECLAIM] op=pre_h2d destination=%p "' in windows_path
-    assert "requested_pages - remaining_pages" in windows_path
+    assert '"post_reclaim_deficit=%lld\\n"' in windows_path
     assert "cuCtxSynchronize" not in windows_path
 
 
@@ -221,6 +220,9 @@ def test_vbar_fault_wddm_retry_margin_is_windows_xpu_only():
     # Windows XPU only; Linux and CUDA keep the original behaviour.
     assert source.count(guard) >= 2
     assert "#define AIMDO_XPU_WDDM_RECLAIM_FLOOR (512ULL << 20)" in platform
+    assert platform.index(guard) < platform.index(
+        "#define AIMDO_XPU_WDDM_RECLAIM_FLOOR"
+    )
     assert "(void)vbars_free_retired(AIMDO_XPU_WDDM_RECLAIM_FLOOR);" in source
     # A fault is already on the execution path that needs the missing page.
     # Waiting for the whole device here can deadlock; a failed non-blocking
@@ -229,10 +231,8 @@ def test_vbar_fault_wddm_retry_margin_is_windows_xpu_only():
         "VBAR Windows XPU retry reclaiming an additional", 1
     )[1].split("#endif", 1)[0]
     assert "vbars_free(AIMDO_XPU_WDDM_RECLAIM_FLOOR)" not in retry
-    for windows_only in ("AIMDO_XPU_WDDM_RECLAIM_FLOOR", "retire_tokens",
-                         "vbars_free_retired"):
-        if windows_only != "AIMDO_XPU_WDDM_RECLAIM_FLOOR":
-            assert windows_only not in source.split(guard, 1)[0]
+    for windows_only in ("retire_tokens", "vbars_free_retired"):
+        assert windows_only not in source.split(guard, 1)[0]
 
 
 def test_non_blocking_reclaim_never_waits_or_moves_the_watermark():
@@ -259,6 +259,21 @@ def test_non_blocking_reclaim_never_waits_or_moves_the_watermark():
     # which turns a momentary spike into a permanently smaller working set.
     assert "watermark--" not in body
     assert "i->watermark =" not in body
+
+
+def test_pressure_flush_reclaims_only_completed_candidates_without_waiting():
+    source = (
+        Path(__file__).resolve().parents[1] / "src" / "model-vbar.c"
+    ).read_text(encoding="utf-8")
+    body = source.split("size_t vbars_free_all_retired(void)", 1)[1]
+    body = body.split("\n}\n", 1)[0]
+
+    assert "aimdo_xpu_retire_snapshot(" in body
+    assert "vbar_freeze_retired_candidates(" in body
+    assert "vbar_commit_candidates(" in body
+    assert "VBAR_EVICTION_BATCH_PAGES" in body
+    assert "cuCtxSynchronize" not in body
+    assert "watermark" not in body
 
 
 def test_windows_vbar_reclaim_serializes_page_state_without_waiting():

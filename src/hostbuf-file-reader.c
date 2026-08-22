@@ -123,42 +123,34 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
          * the operation that cannot complete under residency pressure.
          *
          * An exact allocation-fit deficit is insufficient for WDDM progress:
-         * a 7 MiB deficit was satisfied by releasing one 32 MiB page, but the
-         * following SYCL copy still waited forever in urEventWait. Once a real
-         * shortage exists, use the same bounded safety batch as the physical
-         * VBAR allocation retry. Do not reserve that margin while the copy
-         * still fits, because doing so would churn weights on every H2D.
+         * both 32 MiB and 512 MiB targeted reclaim completed, but the following
+         * SYCL copy still waited forever in urEventWait. Once a real shortage
+         * exists, use caching-allocator OOM semantics and flush every VBAR page
+         * whose recorded consumers are provably complete. Do not do this while
+         * the copy still fits, because that would churn weights on every H2D.
          *
-         * Never wait here. If the completed set cannot satisfy the target,
-         * preserve only the remainder for the next model-owner boundary. */
+         * Never wait here. Re-sample after the flush and preserve only a real
+         * remaining deficit for the next model-owner boundary. */
         if (!aimdo_stream_reclaim_disabled()) {
             ssize_t fit_deficit = budget_deficit(chunk);
-            ssize_t reclaim_target = fit_deficit > 0
-                ? MAX(fit_deficit, (ssize_t)AIMDO_XPU_WDDM_RECLAIM_FLOOR)
-                : 0;
-            size_t requested_pages = 0;
-            size_t remaining_pages = 0;
+            ssize_t post_reclaim_deficit = fit_deficit;
+            size_t reclaimed_pages = 0;
 
-            if (reclaim_target > 0) {
-                requested_pages = ((size_t)reclaim_target + (32ULL << 20) - 1) /
-                                  (32ULL << 20);
-                remaining_pages = vbars_free_retired(reclaim_target);
-
-                if (remaining_pages) {
-                    vbars_request_reclaim(
-                        (ssize_t)(remaining_pages * (32ULL << 20)));
+            if (fit_deficit > 0) {
+                reclaimed_pages = vbars_free_all_retired();
+                post_reclaim_deficit = budget_deficit(chunk);
+                if (post_reclaim_deficit > 0) {
+                    vbars_request_reclaim(post_reclaim_deficit);
                 }
             }
             if (aimdo_stream_reclaim_trace_enabled()) {
                 fprintf(stderr,
                         "[AIMDO XPU RECLAIM] op=pre_h2d destination=%p "
-                        "size=%zu fit_deficit=%lld reclaim_target=%lld "
-                        "requested_pages=%zu "
-                        "reclaimed_pages=%zu remaining_pages=%zu\n",
+                        "size=%zu fit_deficit=%lld reclaimed_pages=%zu "
+                        "post_reclaim_deficit=%lld\n",
                         (void *)(uintptr_t)device_ptr, chunk,
-                        (long long)fit_deficit, (long long)reclaim_target,
-                        requested_pages,
-                        requested_pages - remaining_pages, remaining_pages);
+                        (long long)fit_deficit, reclaimed_pages,
+                        (long long)post_reclaim_deficit);
                 fflush(stderr);
             }
         }

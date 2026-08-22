@@ -916,6 +916,40 @@ static size_t vbars_free_retired_except(ssize_t size,
 size_t vbars_free_retired(ssize_t size) {
     return vbars_free_retired_except(size, NULL);
 }
+
+/* Pressure/OOM recovery follows the same rule as a caching allocator cache
+ * flush: once a real shortage exists, release every block whose recorded
+ * consumers have completed.  Unlike vbars_free_retired(), this is not an
+ * arbitrary byte target.  It still never waits and still fails closed for a
+ * pinned, unknown or incomplete page. */
+size_t vbars_free_all_retired(void) {
+    uint64_t completed[AIMDO_XPU_RETIRE_MAX_QUEUES] = {0};
+    size_t completed_count;
+    size_t freed_total = 0;
+
+    if (!vbar_async_reclaim_enabled()) {
+        return 0;
+    }
+    completed_count = aimdo_xpu_retire_snapshot(
+        completed, AIMDO_XPU_RETIRE_MAX_QUEUES, true);
+    for (;;) {
+        VbarEvictionCandidate candidates[VBAR_EVICTION_BATCH_PAGES];
+        size_t count = vbar_freeze_retired_candidates(
+            VBAR_EVICTION_BATCH_PAGES, completed, completed_count, NULL,
+            candidates, VBAR_EVICTION_BATCH_PAGES);
+        size_t freed;
+
+        if (!count) {
+            break;
+        }
+        freed = vbar_commit_candidates(candidates, count);
+        freed_total += freed;
+        if (!freed) {
+            break;
+        }
+    }
+    return freed_total;
+}
 #endif
 
 static inline size_t move_cursor_to_absent(ModelVBAR *mv, size_t cursor) {

@@ -243,6 +243,7 @@ size_t aimdo_xpu_retire_snapshot(uint64_t *completed, size_t count,
                                  bool force_submit);
 /* model_vbar.c */
 size_t vbars_free_retired(ssize_t size);
+size_t vbars_free_all_retired(void);
 void vbars_request_reclaim(ssize_t size);
 SHARED_EXPORT
 void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
