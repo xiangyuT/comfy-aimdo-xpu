@@ -249,8 +249,17 @@ SHARED_EXPORT
 void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
                        uint64_t stream);
 SHARED_EXPORT
-void vbar_register_consumer_stream(void *devctx, void *vbar, uint64_t offset,
+bool vbar_register_consumer_stream(void *devctx, void *vbar, uint64_t offset,
                                    uint64_t size, uint64_t stream);
+SHARED_EXPORT
+bool vbar_consumer_acquire(void *devctx, void *vbar, uint64_t offset,
+                           uint64_t size, uint32_t kind);
+SHARED_EXPORT
+int vbar_consumer_release(void *devctx, void *vbar, uint64_t offset,
+                          uint64_t size, uint32_t kind, uint64_t stream);
+SHARED_EXPORT
+void vbar_get_page_states(void *devctx, void *vbar, uint64_t *out,
+                          size_t max_pages);
 #endif
 
 /* pyt-cu-alloc.c */

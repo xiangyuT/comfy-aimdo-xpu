@@ -4,6 +4,7 @@ import itertools
 import os
 import sys
 import time
+import weakref
 from contextlib import contextmanager
 
 from . import control
@@ -43,6 +44,17 @@ _consumer_registration_supported = (
     _unpin_stream_supported
     and hasattr(lib, "vbar_register_consumer_stream")
 )
+_consumer_lease_supported = (
+    _consumer_registration_supported
+    and hasattr(lib, "vbar_consumer_acquire")
+    and hasattr(lib, "vbar_consumer_release")
+)
+_page_state_snapshot_supported = (
+    _unpin_stream_supported and hasattr(lib, "vbar_get_page_states")
+)
+_live_vbars = weakref.WeakSet()
+_CONSUMER_HOLD_EXTERNAL = 1
+_CONSUMER_HOLD_CAPTURE = 2
 
 if _unpin_stream_supported:
     lib.vbar_unpin_stream.argtypes = [
@@ -53,6 +65,23 @@ if _consumer_registration_supported:
     lib.vbar_register_consumer_stream.argtypes = [
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
         ctypes.c_uint64,
+    ]
+    lib.vbar_register_consumer_stream.restype = ctypes.c_bool
+if _consumer_lease_supported:
+    lib.vbar_consumer_acquire.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+        ctypes.c_uint32,
+    ]
+    lib.vbar_consumer_acquire.restype = ctypes.c_bool
+    lib.vbar_consumer_release.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
+        ctypes.c_uint32, ctypes.c_uint64,
+    ]
+    lib.vbar_consumer_release.restype = ctypes.c_int
+if _page_state_snapshot_supported:
+    lib.vbar_get_page_states.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t,
     ]
 
 
@@ -223,6 +252,7 @@ class ModelVBAR:
         self.max_size = size
         self.offset = 0
         self.base_addr = lib.vbar_get(self._devctx, self._ptr)
+        _live_vbars.add(self)
         self._prioritized_once = False
 
     def prioritize(self, malloc_async_clamp=None):
@@ -302,12 +332,32 @@ class ModelVBAR:
         # +2, one for misalignment and one for rounding
         signature = (ctypes.c_uint32 * (size // (32 * 1024 ** 2) + 2))()
         res = lib.vbar_fault(self._devctx, self._ptr, offset, size, signature)
-        if res == 1 and _release_native_cache(self.device):
-            # The shortage was at least partly Torch's own dead cache, which
-            # AIMDO has no other way to reclaim. Retry once now that it is
-            # back, rather than streaming this weight from host storage.
-            res = lib.vbar_fault(
-                self._devctx, self._ptr, offset, size, signature)
+        if res == 1:
+            # This is a model-owner boundary, outside the native allocator/UR
+            # callback and therefore the first safe place to join PyTorch's
+            # native stats with AIMDO VBAR/hook state.  Never take this
+            # snapshot from the allocation hook, where Python or allocator
+            # re-entry would violate native ownership.
+            cache_released = _release_native_cache(self.device)
+            if cache_released:
+                # The shortage was at least partly Torch's own dead cache,
+                # which AIMDO has no other way to reclaim. Retry once now that
+                # it is back, rather than streaming this weight from host.
+                res = lib.vbar_fault(
+                    self._devctx, self._ptr, offset, size, signature)
+            try:
+                control.capture_xpu_oom_snapshot(
+                    self.device,
+                    stage=(
+                        "vbar_fault_recovered_after_native_cache"
+                        if res == 0 else "vbar_fault_host_offload"
+                    ),
+                    request_bytes=size,
+                )
+            except Exception:
+                # Diagnostics must never replace the existing recovered or
+                # host-offload OOM result with a snapshot failure.
+                pass
         if res == 0:
             return signature
         elif res == 1:
@@ -320,10 +370,30 @@ class ModelVBAR:
             return False
         offset = alloc - self.base_addr
         queue = _consumer_queue_ptr(self.device, stream)
-        lib.vbar_register_consumer_stream(
+        return bool(lib.vbar_register_consumer_stream(
             self._devctx, self._ptr, offset, size, queue
-        )
-        return bool(queue)
+        ))
+
+    def acquire_consumer(self, alloc, size, kind):
+        if not _consumer_lease_supported:
+            raise RuntimeError(
+                "explicit VBAR consumer leases are unavailable in this build"
+            )
+        offset = alloc - self.base_addr
+        return bool(lib.vbar_consumer_acquire(
+            self._devctx, self._ptr, offset, size, kind
+        ))
+
+    def release_consumer(self, alloc, size, kind, stream=None):
+        if not _consumer_lease_supported:
+            raise RuntimeError(
+                "explicit VBAR consumer leases are unavailable in this build"
+            )
+        offset = alloc - self.base_addr
+        return int(lib.vbar_consumer_release(
+            self._devctx, self._ptr, offset, size, kind,
+            _consumer_queue_ptr(self.device, stream),
+        ))
 
     def unpin(self, alloc, size, stream=None):
         offset = alloc - self.base_addr
@@ -367,6 +437,47 @@ class ModelVBAR:
         lib.vbar_get_residency(self._devctx, self._ptr, buf, nr_pages)
         return list(buf)
 
+    def snapshot(self, include_pages=True):
+        """Return a non-mutating snapshot of this VBAR's ownership state."""
+        states = []
+        nr_pages = self.get_nr_pages()
+        if include_pages and _page_state_snapshot_supported:
+            words = (ctypes.c_uint64 * nr_pages)()
+            lib.vbar_get_page_states(
+                self._devctx, self._ptr, words, nr_pages
+            )
+            for index, raw_value in enumerate(words):
+                value = int(raw_value)
+                states.append({
+                    "page": index,
+                    "mapped": bool(value & 1),
+                    "evicting": bool(value & 2),
+                    "retire_unknown": bool(value & 4),
+                    "mapping_unknown": bool(value & 8),
+                    "pin_count": (value >> 8) & 0xFFFF,
+                    "retire_token_count": (value >> 24) & 0xFF,
+                    "external_consumer_holds": (value >> 32) & 0xFFFF,
+                    "capture_holds": (value >> 48) & 0xFFFF,
+                })
+        elif include_pages:
+            for index, value in enumerate(self.get_residency()):
+                states.append({
+                    "page": index,
+                    "mapped": bool(value & 1),
+                    "pin_count": 1 if value & 2 else 0,
+                })
+        result = {
+            "vbar": int(self._ptr),
+            "device": self.device,
+            "base_addr": self.base_addr,
+            "max_size": self.max_size,
+            "loaded_size": self.loaded_size(),
+            "watermark": self.get_watermark(),
+        }
+        if include_pages:
+            result["pages"] = states
+        return result
+
     def __del__(self):
         ptr = getattr(self, "_ptr", None)
         aimdo_lib = getattr(control, "lib", None)
@@ -380,6 +491,53 @@ class ModelVBAR:
             )
             self._ptr = None
 
+
+class VBARConsumerLease:
+    """Fail-closed ownership for work that can outlive the model pin.
+
+    ``release()`` must run after the final consumer has been submitted.  A
+    capture lease remains active for the lifetime of the captured graph, not
+    merely until capture construction ends; release it only after the graph
+    can no longer replay and its last replay is ordered on ``stream``.
+    """
+
+    def __init__(self, alloc, kind):
+        if alloc is None:
+            raise ValueError("a VBAR allocation is required")
+        self._alloc = alloc
+        self._kind = kind
+        self._active = False
+        vbar, offset, size = alloc
+        if not vbar.acquire_consumer(offset, size, kind):
+            raise RuntimeError("failed to acquire VBAR consumer ownership")
+        self._active = True
+
+    @property
+    def active(self):
+        return self._active
+
+    def release(self, stream=None):
+        if not self._active:
+            raise RuntimeError("VBAR consumer ownership is already released")
+        vbar, offset, size = self._alloc
+        status = vbar.release_consumer(offset, size, self._kind, stream)
+        if status >= 0:
+            self._active = False
+        if status != 1:
+            raise RuntimeError(
+                "VBAR consumer release failed or has no valid completion "
+                "queue; the mapping was kept fail-closed"
+            )
+
+    def abandon(self):
+        """Release the lease as unknown after a partial/failed submission."""
+        if not self._active:
+            return
+        vbar, offset, size = self._alloc
+        status = vbar.release_consumer(offset, size, self._kind, stream=0)
+        if status >= 0:
+            self._active = False
+
 def vbar_fault(alloc):
     caller = sys._getframe(1)
     _trace_vbar("fault", "begin", alloc, caller)
@@ -392,11 +550,58 @@ def vbar_fault(alloc):
     return result
 
 def vbar_register_consumer(alloc, stream=None):
-    """Register an additional post-submission consumer before final unpin."""
+    """Register a submitted consumer while the model pin is still active.
+
+    Custom/external work that may outlive the model pin must use
+    :func:`vbar_external_consumer` instead; its pre-submission lease closes the
+    registration race.
+    """
     if alloc is None:
         return False
     vbar, offset, size = alloc
     return vbar.register_consumer(offset, size, stream)
+
+
+@contextmanager
+def vbar_external_consumer(alloc, stream=None):
+    """Protect a VBAR range around one custom/external kernel submission.
+
+    Enter before submitting work and leave only after every use has been
+    submitted to ``stream``.  Normal exit publishes that queue's completion
+    dependency.  Exceptional exit is deliberately fail-closed because AIMDO
+    cannot know whether the external runtime accepted part of the work.
+    """
+    lease = VBARConsumerLease(alloc, _CONSUMER_HOLD_EXTERNAL)
+    try:
+        yield lease
+    except BaseException:
+        lease.abandon()
+        raise
+    else:
+        lease.release(stream)
+
+
+def vbar_capture_begin(alloc):
+    """Hold a VBAR allocation for a captured graph's complete lifetime.
+
+    The returned lease must remain active across every replay.  Call
+    ``lease.release(stream)`` only after no future replay is possible and the
+    final replay has been submitted to ``stream``.  Ending capture
+    construction alone is not a release boundary.
+    """
+    return VBARConsumerLease(alloc, _CONSUMER_HOLD_CAPTURE)
+
+
+def vbars_snapshot(device=None, include_pages=True):
+    """Snapshot all live VBARs without changing retirement state."""
+    snapshots = []
+    for vbar in list(_live_vbars):
+        if getattr(vbar, "_ptr", None) and (
+            device is None or int(vbar.device) == int(device)
+        ):
+            snapshots.append(vbar.snapshot(include_pages=include_pages))
+    snapshots.sort(key=lambda item: item["base_addr"])
+    return snapshots
 
 
 def vbar_unpin(alloc, stream=None):

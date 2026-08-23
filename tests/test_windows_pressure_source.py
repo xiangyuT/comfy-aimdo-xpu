@@ -398,6 +398,56 @@ def test_windows_explicit_consumer_and_capture_fail_closed_are_exposed():
     assert "return 0" in capture
 
 
+def test_windows_consumer_leases_and_capture_lifetime_block_reclaim():
+    root = Path(__file__).resolve().parents[1]
+    native = (root / "src" / "model-vbar.c").read_text(encoding="utf-8")
+    python = (root / "comfy_aimdo" / "model_vbar.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "uint32_t external_consumer_holds;" in native
+    assert "uint32_t capture_holds;" in native
+    assert "bool vbar_consumer_acquire(" in native
+    assert "int vbar_consumer_release(" in native
+    assert "vbar_consumer_held(rp)" in native
+    assert "if (!consumer_known)" in native
+    assert "if (!rp->capture_holds)" in native
+    for freeze in (
+        "static size_t vbar_freeze_retired_candidates",
+        "static size_t vbar_freeze_reference_candidates",
+        "static size_t vbar_freeze_model_candidates",
+    ):
+        body = native.split(freeze, 1)[1]
+        body = body.split("\n}\n", 1)[0]
+        assert "vbar_consumer_held(rp)" in body
+    commit = native.split("static size_t vbar_commit_candidates", 1)[1]
+    commit = commit.split("static size_t vbar_freeze_retired_candidates", 1)[0]
+    assert "vbar_consumer_held(rp)" in commit
+
+    assert "class VBARConsumerLease:" in python
+    assert "def vbar_external_consumer(alloc, stream=None):" in python
+    assert "def vbar_capture_begin(alloc):" in python
+    assert "construction alone is not a release boundary" in python
+
+
+def test_windows_vbar_snapshot_exposes_ownership_without_mutation():
+    root = Path(__file__).resolve().parents[1]
+    native = (root / "src" / "model-vbar.c").read_text(encoding="utf-8")
+    python = (root / "comfy_aimdo" / "model_vbar.py").read_text(
+        encoding="utf-8"
+    )
+
+    snapshot = native.split("void vbar_get_page_states", 1)[1]
+    snapshot = snapshot.split("uint64_t vbar_free_memory", 1)[0]
+    assert "vbar_state_lock();" in snapshot
+    assert "vbar_state_unlock();" in snapshot
+    assert "external_consumer_holds" in snapshot
+    assert "capture_holds" in snapshot
+    assert "retire_token_count" in snapshot
+    assert "def snapshot(self, include_pages=True):" in python
+    assert "def vbars_snapshot(device=None, include_pages=True):" in python
+
+
 def test_windows_unmap_release_failure_keeps_metadata_truthful():
     source = (
         Path(__file__).resolve().parents[1] / "src" / "model-vbar.c"

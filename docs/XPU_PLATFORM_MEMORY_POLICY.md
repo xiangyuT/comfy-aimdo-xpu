@@ -105,6 +105,56 @@ Individual faults revalidate current pressure and can lower residency when the
 requested pages do not fit. If pressure later clears, a request above the old
 watermark may reopen the range and fault pages normally.
 
+## Explicit consumer and capture ownership
+
+The standard ComfyUI path submits the operator on the current Torch XPU stream
+and unpins immediately after submission. AIMDO registers that current stream
+automatically. A custom or external runtime may submit work to another queue or
+retain the foreign VBAR pointer after the model pin is released; such work must
+use an explicit ownership lease:
+
+```python
+from comfy_aimdo.model_vbar import vbar_external_consumer
+
+with vbar_external_consumer(allocation, stream=consumer_stream):
+    submit_external_kernel(weight_pointer)
+```
+
+The lease is acquired before submission, so pressure cannot unmap the page in
+the interval before queue registration. Normal exit publishes the selected
+queue dependency. Exceptional exit is fail-closed because AIMDO cannot know
+whether an external runtime accepted part of a submission. The older
+`vbar_register_consumer()` one-shot API remains valid only when the model pin
+is still active through post-submission registration.
+
+Graph capture has a longer lifetime than capture construction:
+
+```python
+from comfy_aimdo.model_vbar import vbar_capture_begin
+
+capture_lease = vbar_capture_begin(allocation)
+capture_graph()
+for _ in range(replays):
+    graph.replay()
+# No future replay is permitted; the final replay is already submitted.
+capture_lease.release(final_replay_stream)
+```
+
+While the capture lease is active, a capture-time unpin with no valid event
+does not permanently poison the page; the capture hold itself prevents every
+reclaim path. Release records the final replay queue before removing that hold.
+An invalid release queue converts the page to permanent unknown/fail-closed
+state. Forgetting to release a lease also remains fail-closed at teardown.
+
+`control.get_xpu_memory_snapshot()` keeps ownership domains explicit:
+PyTorch native allocator statistics and optional segment snapshots are under
+`native_allocator`, while VMM counters, UR-hook counters and VBAR page state
+are under `aimdo`. `ModelVBAR.snapshot()` reports pins, queue tokens, external
+holds, capture holds, unknown state and eviction state without changing them.
+Owner-boundary VBAR OOM decisions retain a compact, rate-limited snapshot in
+`control.get_last_xpu_oom_snapshot()`; no Python snapshot is taken from the
+allocator/UR callback.
+
 ## Reserve policy
 
 ComfyUI passes `--reserve-vram` to AIMDO as `simple_vram_headroom`. On Windows,

@@ -71,6 +71,13 @@ see examples/example.py
   synchronized model-boundary reference oracle; it is diagnostic-only because
   pages touched within one activation otherwise accumulate until a model
   switch and can force WDDM paging.
+  Custom or external kernels that can outlive the model pin must use the
+  pre-submission `vbar_external_consumer()` lease; post-submission
+  `vbar_register_consumer()` is valid only while the original model pin is
+  still active. Captured graphs use `vbar_capture_begin()` and keep that lease
+  across every replay. Ending graph construction is not a release boundary.
+  `control.get_xpu_memory_snapshot()` reports native allocator state and the
+  separate foreign VBAR ownership domain side by side.
 * On Linux, AIMDO continues to install its XPU pluggable allocator backed by
   `sycl::malloc_device()`. Freed regular allocations are cached per device and
   SYCL queue, with completion barriers protecting reuse.

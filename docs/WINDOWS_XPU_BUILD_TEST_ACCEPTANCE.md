@@ -110,6 +110,9 @@ native mode selection is cached:
     tests\run_xpu_vbar_retirement_safety.py `
     --device <index> --mode async --matrix-size 12288 --cycles 100
 <portable>\python_embeded\python.exe -s `
+    tests\run_xpu_vbar_consumer_lifecycle.py `
+    --device <index> --matrix-size 12288 --kernel-repeats 8
+<portable>\python_embeded\python.exe -s `
     tests\run_xpu_vbar_resident_growth.py `
     --device <index> --mode default --pages 16
 <portable>\python_embeded\python.exe -s `
@@ -122,7 +125,11 @@ remain bounded at one resident page in this deterministic pressure window and
 finish at zero; reference is expected to grow from one through sixteen and is
 therefore a correctness oracle, not a product-performance candidate. Do not
 start a workflow benchmark when the default capacity gate or the default
-multi-queue safety oracle fails.
+multi-queue safety oracle fails. The consumer-lifecycle oracle uses a real
+external queue and `torch.xpu.XPUGraph`; it must show no unmap while either
+lease is active or its final queue is incomplete, then reclaim after completion
+with all registration, identity, fence-query and shutdown failure counters at
+zero.
 
 A component reproducer proves only the path it exercises. A memory-policy
 change also requires a real workload that reaches pressure, demonstrated by

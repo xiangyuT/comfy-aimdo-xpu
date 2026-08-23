@@ -25,6 +25,12 @@ typedef struct ResidentPage {
      * overflow or a heap allocation in the hot path. */
     uint64_t retire_tokens[AIMDO_XPU_RETIRE_MAX_QUEUES];
     uint64_t eviction_generation;
+    /* Explicit ownership held by custom/external submissions and graph
+     * capture lifetimes.  These are separate from pin_count: pin_count is the
+     * model owner's synchronous lease, while these counters cover GPU work
+     * that can outlive that lease. */
+    uint32_t external_consumer_holds;
+    uint32_t capture_holds;
     uint8_t retire_token_count;
     uint8_t retire_unknown;
     uint8_t mapped;
@@ -113,6 +119,10 @@ static inline void vbar_retire_reset(ResidentPage *rp) {
     rp->retire_unknown = 0;
 }
 
+static inline bool vbar_consumer_held(const ResidentPage *rp) {
+    return rp->external_consumer_holds || rp->capture_holds;
+}
+
 static inline bool vbar_page_is_mapped(const ResidentPage *rp) {
     return rp->handle && rp->mapped == VBAR_MAPPING_MAPPED;
 }
@@ -151,7 +161,7 @@ static inline void vbar_retire_record(ResidentPage *rp, uint64_t token) {
 
 static inline bool vbar_retire_complete(
     const ResidentPage *rp, const uint64_t *completed, size_t count) {
-    if (rp->retire_unknown) {
+    if (rp->retire_unknown || vbar_consumer_held(rp)) {
         return false;
     }
     for (uint8_t index = 0; index < rp->retire_token_count; ++index) {
@@ -449,7 +459,13 @@ static inline bool mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unp
     CUdeviceptr vaddr = mv->vbar + page_nr * VBAR_PAGE_SIZE;
 
     do_free = do_free && vbar_page_is_mapped(rp) &&
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+              (do_unpin || (rp->pin_count == 0 && !rp->evicting &&
+                            !rp->retire_unknown &&
+                            !vbar_consumer_held(rp)));
+#else
               (do_unpin || (rp->pin_count == 0 && !rp->evicting));
+#endif
     if (do_free) {
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
         if (!CHECK_CU_ERROR(cuMemUnmap(vaddr, VBAR_PAGE_SIZE))) {
@@ -643,7 +659,7 @@ static size_t vbar_commit_candidates(VbarEvictionCandidate *candidates,
             continue;
         }
         ResidentPage *rp = &mv->residency_map[candidate->page_nr];
-        if (!rp->evicting || rp->pin_count ||
+        if (!rp->evicting || rp->pin_count || vbar_consumer_held(rp) ||
             !vbar_page_is_mapped(rp) ||
             rp->handle != candidate->handle ||
             rp->serial != candidate->serial ||
@@ -692,7 +708,8 @@ static size_t vbar_freeze_retired_candidates(
         while (count < capacity && count < pages_needed && page_nr > floor) {
             ResidentPage *rp = &mv->residency_map[--page_nr];
 
-            if (!vbar_page_is_mapped(rp) || rp->pin_count || rp->evicting ||
+            if (!vbar_page_is_mapped(rp) || rp->pin_count ||
+                vbar_consumer_held(rp) || rp->evicting ||
                 !vbar_retire_complete(rp, completed, completed_count)) {
                 continue;
             }
@@ -733,7 +750,8 @@ static size_t vbar_freeze_reference_candidates(
 
             /* Unknown includes graph capture and a failed/unregistered queue.
              * Even the reference sync cannot enumerate such a consumer. */
-            if (!vbar_page_is_mapped(rp) || rp->pin_count || rp->evicting ||
+            if (!vbar_page_is_mapped(rp) || rp->pin_count ||
+                vbar_consumer_held(rp) || rp->evicting ||
                 rp->retire_unknown) {
                 continue;
             }
@@ -799,7 +817,8 @@ static size_t vbar_freeze_model_candidates(
                 ResidentPage *rp = &mv->residency_map[--last];
 
                 if (!vbar_page_is_mapped(rp) || rp->pin_count ||
-                    rp->evicting || rp->retire_unknown) {
+                    vbar_consumer_held(rp) || rp->evicting ||
+                    rp->retire_unknown) {
                     continue;
                 }
                 rp->evicting = 1;
@@ -1505,13 +1524,17 @@ static uint64_t vbar_consumer_dependency(uint64_t stream, int device,
 }
 
 SHARED_EXPORT
-void vbar_register_consumer_stream(void *devctx, void *vbar, uint64_t offset,
+bool vbar_register_consumer_stream(void *devctx, void *vbar, uint64_t offset,
                                    uint64_t size, uint64_t stream) {
     ModelVBAR *mv = (ModelVBAR *)vbar;
     bool known;
+    bool registered = true;
     uint64_t retirement_token;
     size_t page_end;
 
+    if (!mv || !size || offset > UINT64_MAX - size) {
+        return false;
+    }
     set_devctx((AimdoContext *)devctx);
     retirement_token = vbar_consumer_dependency(stream, mv->device, &known);
     vbar_state_lock();
@@ -1521,16 +1544,139 @@ void vbar_register_consumer_stream(void *devctx, void *vbar, uint64_t offset,
         ResidentPage *rp = &mv->residency_map[page_nr];
 
         if (!vbar_page_is_mapped(rp) || !rp->pin_count) {
+            registered = false;
             continue;
         }
         vbar_page_cancel_eviction(rp);
         if (!known) {
-            rp->retire_unknown = 1;
+            if (!rp->capture_holds) {
+                rp->retire_unknown = 1;
+            }
         } else if (vbar_async_reclaim_enabled()) {
             vbar_retire_record(rp, retirement_token);
         }
     }
+    if (page_end > mv->nr_pages) {
+        registered = false;
+    }
     vbar_state_unlock();
+    return registered && (known || page_end == VBAR_GET_PAGE_NR(offset));
+}
+
+enum {
+    VBAR_CONSUMER_HOLD_EXTERNAL = 1,
+    VBAR_CONSUMER_HOLD_CAPTURE = 2,
+};
+
+static uint32_t *vbar_consumer_hold_counter(ResidentPage *rp,
+                                            uint32_t kind) {
+    if (kind == VBAR_CONSUMER_HOLD_EXTERNAL) {
+        return &rp->external_consumer_holds;
+    }
+    if (kind == VBAR_CONSUMER_HOLD_CAPTURE) {
+        return &rp->capture_holds;
+    }
+    return NULL;
+}
+
+/* Acquire a fail-closed page lease before a custom/external submission or a
+ * graph capture can observe the VBAR address.  The lease closes the small but
+ * real gap between asynchronous submission and post-submission queue
+ * registration. */
+SHARED_EXPORT
+bool vbar_consumer_acquire(void *devctx, void *vbar, uint64_t offset,
+                           uint64_t size, uint32_t kind) {
+    ModelVBAR *mv = (ModelVBAR *)vbar;
+    size_t first;
+    size_t page_end;
+    bool acquired = false;
+
+    if (!mv || !size || offset > UINT64_MAX - size) {
+        return false;
+    }
+    set_devctx((AimdoContext *)devctx);
+    first = VBAR_GET_PAGE_NR(offset);
+    page_end = VBAR_GET_PAGE_NR_UP(offset + size);
+    vbar_state_lock();
+    if (!mv->closing && page_end <= mv->nr_pages) {
+        acquired = true;
+        for (size_t page_nr = first; page_nr < page_end; ++page_nr) {
+            ResidentPage *rp = &mv->residency_map[page_nr];
+            uint32_t *hold = vbar_consumer_hold_counter(rp, kind);
+
+            if (!hold || !vbar_page_is_mapped(rp) || *hold == UINT32_MAX) {
+                acquired = false;
+                break;
+            }
+        }
+        if (acquired) {
+            for (size_t page_nr = first; page_nr < page_end; ++page_nr) {
+                ResidentPage *rp = &mv->residency_map[page_nr];
+                uint32_t *hold = vbar_consumer_hold_counter(rp, kind);
+
+                vbar_page_cancel_eviction(rp);
+                (*hold)++;
+            }
+        }
+    }
+    vbar_state_unlock();
+    return acquired;
+}
+
+/* Release a lease only after the last consumer/replay has been submitted.
+ * Publishing its queue dependency before decrementing the hold mirrors the
+ * pin/token ordering in vbar_unpin_stream().  A missing queue poisons normal
+ * reclamation rather than guessing that an external consumer is complete. */
+SHARED_EXPORT
+int vbar_consumer_release(void *devctx, void *vbar, uint64_t offset,
+                          uint64_t size, uint32_t kind, uint64_t stream) {
+    ModelVBAR *mv = (ModelVBAR *)vbar;
+    bool consumer_known;
+    bool released = false;
+    uint64_t retirement_token;
+    size_t first;
+    size_t page_end;
+
+    if (!mv || !size || offset > UINT64_MAX - size) {
+        return -1;
+    }
+    set_devctx((AimdoContext *)devctx);
+    retirement_token = vbar_consumer_dependency(
+        stream, mv->device, &consumer_known);
+    first = VBAR_GET_PAGE_NR(offset);
+    page_end = VBAR_GET_PAGE_NR_UP(offset + size);
+    vbar_state_lock();
+    if (page_end <= mv->nr_pages) {
+        released = true;
+        for (size_t page_nr = first; page_nr < page_end; ++page_nr) {
+            ResidentPage *rp = &mv->residency_map[page_nr];
+            uint32_t *hold = vbar_consumer_hold_counter(rp, kind);
+
+            if (!hold || !vbar_page_is_mapped(rp) || !*hold) {
+                released = false;
+                break;
+            }
+        }
+        if (released) {
+            for (size_t page_nr = first; page_nr < page_end; ++page_nr) {
+                ResidentPage *rp = &mv->residency_map[page_nr];
+                uint32_t *hold = vbar_consumer_hold_counter(rp, kind);
+
+                vbar_page_cancel_eviction(rp);
+                if (!consumer_known) {
+                    rp->retire_unknown = 1;
+                } else if (vbar_async_reclaim_enabled()) {
+                    vbar_retire_record(rp, retirement_token);
+                }
+                (*hold)--;
+            }
+        }
+    }
+    vbar_state_unlock();
+    if (!released) {
+        return -1;
+    }
+    return consumer_known ? 1 : 0;
 }
 #endif
 
@@ -1583,7 +1729,9 @@ void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
         if (rp->pin_count) {
             vbar_page_cancel_eviction(rp);
             if (!consumer_known) {
-                rp->retire_unknown = 1;
+                if (!rp->capture_holds) {
+                    rp->retire_unknown = 1;
+                }
             } else if (vbar_async_reclaim_enabled()) {
                 vbar_retire_record(rp, retirement_token);
             }
@@ -1632,7 +1780,8 @@ void vbar_free(void *devctx, void *vbar) {
     vbar_state_lock();
     for (uint64_t page_nr = 0; page_nr < mv->nr_pages; page_nr++) {
         ResidentPage *rp = &mv->residency_map[page_nr];
-        if (rp->pin_count || rp->retire_unknown) {
+        if (rp->pin_count || vbar_consumer_held(rp) ||
+            rp->retire_unknown) {
             log(AIMDO_LOG_ERROR,
                 "%s: VBAR %p page %zu still has an unknown/live consumer; "
                 "keeping its mapping fail-closed\n",
@@ -1650,7 +1799,8 @@ void vbar_free(void *devctx, void *vbar) {
     vbars_dirty = true;
     for (uint64_t page_nr = 0; page_nr < mv->nr_pages; page_nr++) {
         ResidentPage *rp = &mv->residency_map[page_nr];
-        if (rp->pin_count || rp->retire_unknown) {
+        if (rp->pin_count || vbar_consumer_held(rp) ||
+            rp->retire_unknown) {
             log(AIMDO_LOG_ERROR,
                 "%s: VBAR %p page %zu changed during teardown; keeping it "
                 "fail-closed\n",
@@ -1745,6 +1895,50 @@ void vbar_get_residency(void *devctx, void *vbar, uint8_t *out, size_t max_pages
     vbar_state_unlock();
 }
 
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+/* Compact, read-only page ownership snapshot for Python diagnostics.
+ *
+ * bits  0..3  mapped, evicting, retirement unknown, mapping unknown
+ * bits  8..23 pin count (saturated)
+ * bits 24..31 retirement-token count
+ * bits 32..47 external-consumer holds (saturated)
+ * bits 48..63 capture holds (saturated)
+ */
+SHARED_EXPORT
+void vbar_get_page_states(void *devctx, void *vbar, uint64_t *out,
+                          size_t max_pages) {
+    ModelVBAR *mv = (ModelVBAR *)vbar;
+    size_t n;
+
+    if (!mv || !out) {
+        return;
+    }
+    set_devctx((AimdoContext *)devctx);
+    vbar_state_lock();
+    n = mv->nr_pages < max_pages ? mv->nr_pages : max_pages;
+    for (size_t index = 0; index < n; ++index) {
+        ResidentPage *rp = &mv->residency_map[index];
+        uint64_t pin = rp->pin_count > 0xffffu ? 0xffffu : rp->pin_count;
+        uint64_t external = rp->external_consumer_holds > 0xffffu
+            ? 0xffffu : rp->external_consumer_holds;
+        uint64_t capture = rp->capture_holds > 0xffffu
+            ? 0xffffu : rp->capture_holds;
+        uint64_t state =
+            (vbar_page_is_mapped(rp) ? 1ull : 0ull) |
+            (rp->evicting ? 2ull : 0ull) |
+            (rp->retire_unknown ? 4ull : 0ull) |
+            (rp->mapped == VBAR_MAPPING_UNKNOWN ? 8ull : 0ull) |
+            (pin << 8) |
+            ((uint64_t)rp->retire_token_count << 24) |
+            (external << 32) |
+            (capture << 48);
+
+        out[index] = state;
+    }
+    vbar_state_unlock();
+}
+#endif
+
 SHARED_EXPORT
 uint64_t vbar_free_memory(void *devctx, void *vbar, uint64_t size) {
     ModelVBAR *mv = (ModelVBAR *)vbar;
@@ -1775,7 +1969,8 @@ uint64_t vbar_free_memory(void *devctx, void *vbar, uint64_t size) {
            available_pages < pages_to_free) {
         ResidentPage *rp = &mv->residency_map[--target_watermark];
 
-        if (vbar_page_is_mapped(rp) && !rp->pin_count && !rp->evicting &&
+        if (vbar_page_is_mapped(rp) && !rp->pin_count &&
+            !vbar_consumer_held(rp) && !rp->evicting &&
             !rp->retire_unknown) {
             available_pages++;
         }

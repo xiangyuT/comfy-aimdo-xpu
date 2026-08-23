@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 import logging
 import importlib.util
+import time
 
 lib = None
 devctxs = []
@@ -19,6 +20,10 @@ _torch_xpu_memory_stats_original = None
 _torch_xpu_reset_peak_stats_original = None
 _windows_dll_directories = []
 _windows_dll_directory_paths = set()
+_xpu_oom_history = []
+_XPU_OOM_HISTORY_LIMIT = 4
+_XPU_OOM_SNAPSHOT_INTERVAL_SECONDS = 2.0
+_xpu_oom_last_snapshot_monotonic = {}
 
 _LOG_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p)
 _LOG_LEVELS = {
@@ -750,6 +755,122 @@ def empty_xpu_allocator_cache(wait=False):
 
 def get_xpu_allocator_mode():
     return _xpu_allocator_mode
+
+
+def get_xpu_memory_snapshot(
+    device=None, include_native_segments=False, include_vbar_pages=True
+):
+    """Capture native allocator and AIMDO state without changing ownership.
+
+    Windows ``native_hook`` mode deliberately keeps activation/workspace
+    blocks in PyTorch's XPU caching allocator.  VBAR pages remain a separate
+    foreign-allocation domain, so the two snapshots are reported side by side
+    rather than merged into a fictitious native block list.
+    """
+    if implementation != "xpu":
+        return {}
+    import torch
+
+    device_index = _xpu_device_index(device)
+    owner = (
+        "torch_xpu_native"
+        if platform.system() == "Windows" and
+        _xpu_allocator_mode == "native_hook"
+        else "aimdo_xpu_pluggable"
+    )
+    try:
+        native_stats = {
+            str(key): int(value)
+            for key, value in torch.xpu.memory_stats(device_index).items()
+        }
+    except Exception as error:
+        native_stats = {"snapshot_error": str(error)}
+    native_segments = None
+    if include_native_segments:
+        try:
+            native_segments = torch.xpu.memory_snapshot()
+        except Exception as error:
+            native_segments = {"snapshot_error": str(error)}
+    try:
+        from .model_vbar import vbars_snapshot
+
+        vbars = vbars_snapshot(
+            device_index, include_pages=include_vbar_pages
+        )
+    except Exception as error:
+        vbars = [{"snapshot_error": str(error)}]
+    result = {
+        "timestamp": time.time(),
+        "device": device_index,
+        "allocator_owner": owner,
+        "native_allocator": {"stats": native_stats},
+        "aimdo": {
+            "vmm": get_xpu_vmm_stats(),
+            "ur_hook": get_xpu_ur_hook_stats(),
+            "vbars": vbars,
+        },
+    }
+    if include_native_segments:
+        result["native_allocator"]["segments"] = native_segments
+    return result
+
+
+def capture_xpu_oom_snapshot(
+    device=None, *, stage, request_bytes=None, error=None,
+    include_native_segments=False,
+):
+    """Record an owner-boundary OOM snapshot; never called from a hook."""
+    device_index = _xpu_device_index(device)
+    now = time.monotonic()
+    previous_time = _xpu_oom_last_snapshot_monotonic.get(device_index)
+    if (
+        _xpu_oom_history and previous_time is not None and
+        now - previous_time < _XPU_OOM_SNAPSHOT_INTERVAL_SECONDS and
+        _xpu_oom_history[-1].get("device") == device_index
+    ):
+        snapshot = _xpu_oom_history[-1]
+        snapshot["timestamp"] = time.time()
+        snapshot["oom"] = {
+            "stage": str(stage),
+            "request_bytes": (
+                None if request_bytes is None else int(request_bytes)
+            ),
+            "error": None if error is None else str(error),
+            "coalesced_events": int(
+                snapshot.get("oom", {}).get("coalesced_events", 1)
+            ) + 1,
+        }
+        return snapshot
+    snapshot = get_xpu_memory_snapshot(
+        device_index,
+        include_native_segments=include_native_segments,
+        include_vbar_pages=False,
+    )
+    if not snapshot:
+        return snapshot
+    snapshot["oom"] = {
+        "stage": str(stage),
+        "request_bytes": (
+            None if request_bytes is None else int(request_bytes)
+        ),
+        "error": None if error is None else str(error),
+        "coalesced_events": 1,
+    }
+    _xpu_oom_history.append(snapshot)
+    del _xpu_oom_history[:-_XPU_OOM_HISTORY_LIMIT]
+    _xpu_oom_last_snapshot_monotonic[device_index] = now
+    return snapshot
+
+
+def get_last_xpu_oom_snapshot(device=None):
+    """Return the newest recorded OOM snapshot, optionally for one device."""
+    if device is None:
+        return _xpu_oom_history[-1] if _xpu_oom_history else None
+    device_index = _xpu_device_index(device)
+    for snapshot in reversed(_xpu_oom_history):
+        if snapshot.get("device") == device_index:
+            return snapshot
+    return None
 
 
 def _xpu_device_index(device=None):
