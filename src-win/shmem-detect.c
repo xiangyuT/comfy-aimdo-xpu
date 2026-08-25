@@ -104,7 +104,7 @@ fail:
 /* FIXME: This should be 0 if sysmem fallback is disabled by the user */
 #define WDDM_BUDGET_HEADROOM (512 * 1024 * 1024)
 #define CUDA_BUDGET_HEADROOM (192 * 1024 * 1024)
-#define NVML_BUDGET_HEADROOM (768 * 1024 * 1024)
+#define NVML_BUDGET_HEADROOM (512 * 1024 * 1024)
 
 bool poll_budget_deficit(const char **prevailing_deficit_method)
 {
