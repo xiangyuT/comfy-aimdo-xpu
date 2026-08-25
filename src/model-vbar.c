@@ -59,6 +59,17 @@ typedef struct ModelVBAR {
     ResidentPage residency_map[1]; /* Must be last! */
 } ModelVBAR;
 
+/* These public entry points are used before their definitions below. Keep the
+ * declarations platform-neutral: Linux implements stream unpinning as the
+ * synchronous legacy path even though retirement tokens are Windows-only. */
+SHARED_EXPORT
+int aimdo_vbar_describe_range(uint64_t address, uint64_t size, int *mapped,
+                              unsigned *pin, uint64_t *page_index,
+                              uint64_t *unmapped_page, uint64_t *pages_spanned);
+SHARED_EXPORT
+void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
+                       uint64_t stream);
+
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
 static uint64_t vbar_identity_counter;
 
@@ -464,7 +475,7 @@ static inline bool mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unp
                             !rp->retire_unknown &&
                             !vbar_consumer_held(rp)));
 #else
-              (do_unpin || (rp->pin_count == 0 && !rp->evicting));
+              (do_unpin || rp->pin_count == 0);
 #endif
     if (do_free) {
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))

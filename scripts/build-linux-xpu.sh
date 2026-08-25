@@ -72,8 +72,12 @@ OBJECTS+=("$BUILD_DIR/xpu-dispatch.o")
     "$ROOT_DIR/src-xpu/ur-usm-hook.cpp" -I"$UR_INCLUDE_DIR"
 OBJECTS+=("$BUILD_DIR/xpu-ur-usm-hook.o")
 
+# ComfyUI may have loaded the official CUDA AIMDO DSO before OmniXPU
+# prestartup. Keep same-named lifecycle functions inside this XPU DSO from
+# being interposed by that earlier RTLD_GLOBAL object.
 "$CXX" -shared -o "$OUTPUT_PATH" -fsycl -pthread \
     "${OBJECTS[@]}" -lze_loader -ldl \
+    -Wl,-Bsymbolic-functions \
     -Wl,--version-script="$ROOT_DIR/src-xpu/ur-usm-hook.map"
 
 echo "built $OUTPUT_PATH"
