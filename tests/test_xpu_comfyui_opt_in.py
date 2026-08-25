@@ -125,3 +125,78 @@ def test_xpu_allocator_backend_selection(
     assert (result is allocator) is has_allocator
     assert requests == ([{}] if has_allocator else [])
     assert swaps == ([allocator] if global_swaps else [])
+
+
+def test_xpu_memory_snapshot_preserves_native_and_vbar_ownership(
+    monkeypatch,
+):
+    from comfy_aimdo import model_vbar
+
+    torch_module = types.SimpleNamespace(
+        xpu=types.SimpleNamespace(
+            memory_stats=lambda device: {
+                "active_bytes.all.current": 1024,
+                "reserved_bytes.all.current": 2048,
+            },
+            memory_snapshot=lambda: [{"address": 17}],
+        )
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch_module)
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "_xpu_allocator_mode", "native_hook")
+    monkeypatch.setattr(control.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(control, "_xpu_device_index", lambda device=None: 1)
+    monkeypatch.setattr(
+        control, "get_xpu_vmm_stats", lambda: {"unmap_calls": 3}
+    )
+    monkeypatch.setattr(
+        control, "get_xpu_ur_hook_stats", lambda: {"runtime_oom_calls": 1}
+    )
+    monkeypatch.setattr(
+        model_vbar,
+        "vbars_snapshot",
+        lambda device=None, include_pages=True: [
+            {"device": device, "loaded_size": 4096}
+        ],
+    )
+
+    snapshot = control.get_xpu_memory_snapshot(
+        1, include_native_segments=True
+    )
+
+    assert snapshot["allocator_owner"] == "torch_xpu_native"
+    assert snapshot["native_allocator"]["stats"][
+        "reserved_bytes.all.current"
+    ] == 2048
+    assert snapshot["native_allocator"]["segments"] == [{"address": 17}]
+    assert snapshot["aimdo"]["vbars"] == [
+        {"device": 1, "loaded_size": 4096}
+    ]
+    assert snapshot["aimdo"]["vmm"] == {"unmap_calls": 3}
+
+
+def test_xpu_oom_snapshot_records_owner_boundary_stage(monkeypatch):
+    monkeypatch.setattr(control, "_xpu_oom_history", [])
+    monkeypatch.setattr(control, "_xpu_oom_last_snapshot_monotonic", {})
+    monkeypatch.setattr(control, "_xpu_device_index", lambda device=None: 0)
+    monkeypatch.setattr(
+        control,
+        "get_xpu_memory_snapshot",
+        lambda device=None, include_native_segments=False,
+        include_vbar_pages=True: {
+            "device": 0,
+            "allocator_owner": "torch_xpu_native",
+        },
+    )
+
+    snapshot = control.capture_xpu_oom_snapshot(
+        0, stage="vbar_fault_host_offload", request_bytes=33554432
+    )
+
+    assert snapshot["oom"] == {
+        "stage": "vbar_fault_host_offload",
+        "request_bytes": 33554432,
+        "error": None,
+        "coalesced_events": 1,
+    }
+    assert control.get_last_xpu_oom_snapshot() is snapshot

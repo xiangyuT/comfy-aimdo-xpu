@@ -91,6 +91,10 @@ enum XpuStat : size_t {
     kRetireFenceSubmitFailures,
     kRetireForcePolls,
     kRetireTrackedQueues,
+    kRetireQueueRegistrationFailures,
+    kRetireQueueIdentityMismatches,
+    kRetireFenceQueryFailures,
+    kRetireShutdownWaitFailures,
     kXpuStatCount,
 };
 
@@ -146,7 +150,15 @@ struct RetireFence {
 };
 
 struct RetireQueue {
-    sycl::queue *queue = nullptr;
+    /* Keep a SYCL queue copy alive until every fence and every page token that
+     * names this slot has retired.  The Python/Torch stream pointer is only a
+     * lookup hint: it may be destroyed or reused after unpin. */
+    void *source_pointer = nullptr;
+    std::shared_ptr<sycl::queue> queue;
+    int device_id = -1;
+    ze_context_handle_t context = nullptr;
+    ze_device_handle_t device = nullptr;
+    uint64_t incarnation = 0;
     uint64_t open_generation = 1;
     uint64_t retired_generation = 0;
     size_t pending_uses = 0;
@@ -156,6 +168,8 @@ struct RetireQueue {
 RetireQueue g_retire_queues[kMaxTrackedQueues];
 size_t g_retire_queue_count = 0;
 std::atomic<bool> g_retire_tracking_overflow{false};
+std::atomic<bool> g_retire_accepting{false};
+uint64_t g_retire_incarnation_counter = 0;
 
 void increase_torch_bytes(std::unordered_map<int, uint64_t> &current,
                           std::unordered_map<int, uint64_t> &peak,
@@ -203,7 +217,7 @@ void trace_sync(const char *operation, const char *phase, uint64_t call,
 }
 
 extern "C" int aimdo_xpu_current_device(void);
-void aimdo_xpu_note_queue(sycl::queue *queue);
+void aimdo_xpu_note_queue(sycl::queue *queue, int expected_device);
 
 XpuDeviceState *find_device(int id) {
     auto found = std::find_if(
@@ -226,39 +240,84 @@ int device_from_native_handle(uintptr_t native_handle) {
     return found == g_devices.end() ? -1 : found->id;
 }
 
-size_t aimdo_xpu_note_queue_locked(sycl::queue *queue) {
-    if (!queue) {
+size_t aimdo_xpu_note_queue_locked(sycl::queue *queue, int expected_device) {
+    if (!queue || !g_retire_accepting.load(std::memory_order_acquire)) {
         return kMaxTrackedQueues;
     }
-    for (size_t index = 0; index < g_retire_queue_count; ++index) {
-        if (g_retire_queues[index].queue == queue) {
-            return index;
+
+    try {
+        if (queue->get_backend() != sycl::backend::ext_oneapi_level_zero) {
+            g_stats[kRetireQueueIdentityMismatches].fetch_add(
+                1, std::memory_order_relaxed);
+            return kMaxTrackedQueues;
         }
-    }
-    if (g_retire_queue_count >= kMaxTrackedQueues) {
-        // Cannot prove retirement on an untracked queue, so stop advancing
-        // pages that name it rather than guessing from a different queue.
-        if (!g_retire_tracking_overflow.exchange(true, std::memory_order_relaxed)) {
-            std::fprintf(stderr,
-                         "[AIMDO XPU] tracked queue table full (%zu); VBAR "
-                         "pages on additional queues are non-reclaimable\n",
-                         kMaxTrackedQueues);
-            std::fflush(stderr);
+        const ze_context_handle_t context =
+            sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+                queue->get_context());
+        const ze_device_handle_t device =
+            sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+                queue->get_device());
+        XpuDeviceState *state = find_device(expected_device);
+
+        if (!state || state->context != context || state->device != device) {
+            g_stats[kRetireQueueIdentityMismatches].fetch_add(
+                1, std::memory_order_relaxed);
+            return kMaxTrackedQueues;
         }
+
+        for (size_t index = 0; index < g_retire_queue_count; ++index) {
+            RetireQueue &retire_queue = g_retire_queues[index];
+            if (retire_queue.source_pointer == queue && retire_queue.queue &&
+                retire_queue.device_id == expected_device &&
+                retire_queue.context == context &&
+                retire_queue.device == device &&
+                *retire_queue.queue == *queue) {
+                return index;
+            }
+        }
+        if (g_retire_queue_count >= kMaxTrackedQueues) {
+            // Cannot prove retirement on an untracked queue, so stop advancing
+            // pages that name it rather than guessing from a different queue.
+            if (!g_retire_tracking_overflow.exchange(
+                    true, std::memory_order_relaxed)) {
+                std::fprintf(stderr,
+                             "[AIMDO XPU] tracked queue table full (%zu); VBAR "
+                             "pages on additional queues are non-reclaimable\n",
+                             kMaxTrackedQueues);
+                std::fflush(stderr);
+            }
+            return kMaxTrackedQueues;
+        }
+        const size_t index = g_retire_queue_count++;
+        RetireQueue &retire_queue = g_retire_queues[index];
+        if (g_retire_incarnation_counter >=
+            AIMDO_XPU_RETIRE_INCARNATION_MASK) {
+            g_retire_queue_count--;
+            g_stats[kRetireQueueRegistrationFailures].fetch_add(
+                1, std::memory_order_relaxed);
+            return kMaxTrackedQueues;
+        }
+        retire_queue.source_pointer = queue;
+        retire_queue.queue = std::make_shared<sycl::queue>(*queue);
+        retire_queue.device_id = expected_device;
+        retire_queue.context = context;
+        retire_queue.device = device;
+        retire_queue.incarnation = ++g_retire_incarnation_counter;
+        g_stats[kRetireTrackedQueues].store(
+            g_retire_queue_count, std::memory_order_relaxed);
+        return index;
+    } catch (...) {
+        g_stats[kRetireQueueRegistrationFailures].fetch_add(
+            1, std::memory_order_relaxed);
         return kMaxTrackedQueues;
     }
-    const size_t index = g_retire_queue_count++;
-    g_retire_queues[index].queue = queue;
-    g_stats[kRetireTrackedQueues].store(
-        g_retire_queue_count, std::memory_order_relaxed);
-    return index;
 }
 
 /* Register a queue AIMDO has seen.  Page retirement itself is scoped to the
  * queue token returned at unpin, not to this process-wide registry. */
-void aimdo_xpu_note_queue(sycl::queue *queue) {
+void aimdo_xpu_note_queue(sycl::queue *queue, int expected_device) {
     std::lock_guard<std::mutex> guard(g_retire_mutex);
-    (void)aimdo_xpu_note_queue_locked(queue);
+    (void)aimdo_xpu_note_queue_locked(queue, expected_device);
 }
 
 sycl::queue *resolve_queue(CUstream stream) {
@@ -273,12 +332,12 @@ sycl::queue *resolve_queue(CUstream stream) {
             state->queue = queue;
             g_stats[kQueueRebindCalls].fetch_add(1, std::memory_order_relaxed);
         }
-        aimdo_xpu_note_queue(queue);
+        aimdo_xpu_note_queue(queue, state ? state->id : -1);
         return queue;
     }
     auto *state = current_device();
     if (state && state->queue) {
-        aimdo_xpu_note_queue(state->queue);
+        aimdo_xpu_note_queue(state->queue, state->id);
     }
     return state ? state->queue : nullptr;
 }
@@ -333,19 +392,26 @@ CUresult xpu_context_synchronize() {
         g_stats[kContextSyncCalls].fetch_add(1, std::memory_order_relaxed) + 1;
     trace_sync("context", "begin", call, state->queue);
     try {
-        // Callers use this as "all device work has completed" before unmapping
-        // VBAR pages. Torch hands out many queues per device, so waiting only
-        // the current one can release a page still running elsewhere. Wait
-        // every queue AIMDO has seen.
-        state->queue->wait_and_throw();
+        std::vector<sycl::queue> queues;
+
+        /* Copy owned queue handles while holding the registry lock, then wait
+         * after releasing it.  Waiting while holding g_retire_mutex inverted
+         * the retire-lock/VBAR-lock order used by unpin and could deadlock a
+         * model boundary against a concurrent retirement submission. */
+        queues.emplace_back(*state->queue);
         {
             std::lock_guard<std::mutex> guard(g_retire_mutex);
             for (size_t index = 0; index < g_retire_queue_count; ++index) {
-                sycl::queue *queue = g_retire_queues[index].queue;
-                if (queue && queue != state->queue) {
-                    queue->wait_and_throw();
+                const RetireQueue &retire_queue = g_retire_queues[index];
+                if (retire_queue.queue &&
+                    retire_queue.device_id == state->id &&
+                    *retire_queue.queue != *state->queue) {
+                    queues.emplace_back(*retire_queue.queue);
                 }
             }
+        }
+        for (sycl::queue &queue : queues) {
+            queue.wait_and_throw();
         }
         g_stats[kContextSyncCompletions].fetch_add(
             1, std::memory_order_relaxed);
@@ -578,6 +644,14 @@ CUresult xpu_physical_create(CUmemGenericAllocationHandle *handle, size_t size,
             reinterpret_cast<uintptr_t>(physical));
         g_stats[kPhysicalCreateCalls].fetch_add(1, std::memory_order_relaxed);
         g_stats[kPhysicalCreateBytes].fetch_add(size, std::memory_order_relaxed);
+    } else {
+        std::fprintf(
+            stderr,
+            "[AIMDO XPU VMM] zePhysicalMemCreate failed: ze_result=0x%x "
+            "context=%p device=%p size=%zu page_size=%zu\n",
+            static_cast<unsigned int>(result), state->context, state->device,
+            size, page_size);
+        std::fflush(stderr);
     }
     return from_ze(result);
 }
@@ -597,6 +671,20 @@ CUresult xpu_virtual_map(CUdeviceptr pointer, size_t size, size_t offset,
     if (result == ZE_RESULT_SUCCESS) {
         g_stats[kMapCalls].fetch_add(1, std::memory_order_relaxed);
         g_stats[kMapBytes].fetch_add(size, std::memory_order_relaxed);
+    } else {
+        size_t page_size = 0;
+        const ze_result_t query_result = zeVirtualMemQueryPageSize(
+            state->context, state->device, size, &page_size);
+        std::fprintf(
+            stderr,
+            "[AIMDO XPU VMM] zeVirtualMemMap failed: ze_result=0x%x "
+            "context=%p device=%p handle=%p address=%p size=%zu "
+            "offset=%zu page_size=%zu page_query_result=0x%x\n",
+            static_cast<unsigned int>(result), state->context, state->device,
+            reinterpret_cast<void *>(static_cast<uintptr_t>(handle)),
+            reinterpret_cast<void *>(pointer), size, offset, page_size,
+            static_cast<unsigned int>(query_result));
+        std::fflush(stderr);
     }
     return from_ze(result);
 }
@@ -617,6 +705,14 @@ CUresult xpu_virtual_unmap(CUdeviceptr pointer, size_t size) {
     if (result == ZE_RESULT_SUCCESS) {
         g_stats[kUnmapCalls].fetch_add(1, std::memory_order_relaxed);
         g_stats[kUnmapBytes].fetch_add(size, std::memory_order_relaxed);
+    } else {
+        std::fprintf(
+            stderr,
+            "[AIMDO XPU VMM] zeVirtualMemUnmap failed: ze_result=0x%x "
+            "context=%p address=%p size=%zu\n",
+            static_cast<unsigned int>(result), state->context,
+            reinterpret_cast<void *>(pointer), size);
+        std::fflush(stderr);
     }
     return from_ze(result);
 }
@@ -632,6 +728,14 @@ CUresult xpu_physical_release(CUmemGenericAllocationHandle handle) {
             static_cast<uintptr_t>(handle)));
     if (result == ZE_RESULT_SUCCESS) {
         g_stats[kPhysicalReleaseCalls].fetch_add(1, std::memory_order_relaxed);
+    } else {
+        std::fprintf(
+            stderr,
+            "[AIMDO XPU VMM] zePhysicalMemDestroy failed: ze_result=0x%x "
+            "context=%p handle=%p\n",
+            static_cast<unsigned int>(result), state->context,
+            reinterpret_cast<void *>(static_cast<uintptr_t>(handle)));
+        std::fflush(stderr);
     }
     return from_ze(result);
 }
@@ -1099,7 +1203,20 @@ CUresult xpu_device_get_luid(char *luid, unsigned int *node_mask,
 void poll_retire_queue_locked(RetireQueue &retire_queue) {
     for (size_t slot = 0; slot < kRetireFenceSlots; ++slot) {
         RetireFence &fence = retire_queue.fences[slot];
-        if (!fence.valid || !event_is_complete(fence.event)) {
+        if (!fence.valid) {
+            continue;
+        }
+        bool complete = false;
+        try {
+            complete = fence.event.get_info<
+                sycl::info::event::command_execution_status>() ==
+                sycl::info::event_command_status::complete;
+        } catch (...) {
+            g_stats[kRetireFenceQueryFailures].fetch_add(
+                1, std::memory_order_relaxed);
+            continue;
+        }
+        if (!complete) {
             continue;
         }
         retire_queue.retired_generation = std::max(
@@ -1186,23 +1303,41 @@ void aimdo_xpu_record_native_release(size_t size) {
 
 /* Return a token for the actual queue that consumed a VBAR page.  Tokens from
  * the same queue share one generation until a bounded batch is closed. */
-uint64_t aimdo_xpu_retire_token_current(void *queue_pointer) {
+bool aimdo_xpu_register_consumer_queue(void *queue_pointer, int device) {
+    auto *queue = reinterpret_cast<sycl::queue *>(queue_pointer);
+    if (!queue) {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> guard(g_retire_mutex);
+    return aimdo_xpu_note_queue_locked(queue, device) < kMaxTrackedQueues;
+}
+
+uint64_t aimdo_xpu_retire_token_current(void *queue_pointer, int device) {
     auto *queue = reinterpret_cast<sycl::queue *>(queue_pointer);
     if (!queue) {
         return 0;
     }
 
     std::lock_guard<std::mutex> guard(g_retire_mutex);
-    const size_t index = aimdo_xpu_note_queue_locked(queue);
+    const size_t index = aimdo_xpu_note_queue_locked(queue, device);
     if (index >= kMaxTrackedQueues) {
         return 0;
     }
 
     RetireQueue &retire_queue = g_retire_queues[index];
     poll_retire_queue_locked(retire_queue);
+    if (retire_queue.open_generation >
+        AIMDO_XPU_RETIRE_GENERATION_MASK) {
+        g_stats[kRetireFenceSubmitFailures].fetch_add(
+            1, std::memory_order_relaxed);
+        return 0;
+    }
+    const uint64_t stamp =
+        (retire_queue.incarnation << AIMDO_XPU_RETIRE_GENERATION_BITS) |
+        (retire_queue.open_generation & AIMDO_XPU_RETIRE_GENERATION_MASK);
     const uint64_t token =
-        (retire_queue.open_generation <<
-         AIMDO_XPU_RETIRE_TOKEN_QUEUE_BITS) |
+        (stamp << AIMDO_XPU_RETIRE_TOKEN_QUEUE_BITS) |
         (index + 1);
     if (retire_queue.pending_uses < kRetireBatchUses) {
         retire_queue.pending_uses++;
@@ -1235,7 +1370,11 @@ size_t aimdo_xpu_retire_snapshot(uint64_t *completed, size_t count,
             (void)submit_retire_fence_locked(retire_queue);
         }
         if (index < copied) {
-            completed[index] = retire_queue.retired_generation;
+            completed[index] =
+                (retire_queue.incarnation <<
+                 AIMDO_XPU_RETIRE_GENERATION_BITS) |
+                (retire_queue.retired_generation &
+                 AIMDO_XPU_RETIRE_GENERATION_MASK);
         }
     }
     for (size_t index = copied; index < count; ++index) {
@@ -1245,23 +1384,62 @@ size_t aimdo_xpu_retire_snapshot(uint64_t *completed, size_t count,
 }
 
 /* Drop every outstanding fence before the SYCL context is torn down. */
-void aimdo_xpu_retire_reset(void) {
-    std::lock_guard<std::mutex> guard(g_retire_mutex);
-    for (size_t index = 0; index < kMaxTrackedQueues; ++index) {
-        RetireQueue &retire_queue = g_retire_queues[index];
-        for (size_t slot = 0; slot < kRetireFenceSlots; ++slot) {
-            retire_queue.fences[slot].valid = false;
-            retire_queue.fences[slot].event = sycl::event();
-            retire_queue.fences[slot].generation = 0;
+bool aimdo_xpu_retire_reset(void) {
+    std::vector<sycl::queue> queues;
+    bool drained = true;
+
+    /* Prevent a late unpin from creating a token after the teardown snapshot.
+     * Queue copies keep the native handles alive until every submitted use has
+     * drained; event objects are destroyed only after those waits. */
+    g_retire_accepting.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> guard(g_retire_mutex);
+        queues.reserve(g_retire_queue_count);
+        for (size_t index = 0; index < g_retire_queue_count; ++index) {
+            if (g_retire_queues[index].queue) {
+                queues.emplace_back(*g_retire_queues[index].queue);
+            }
         }
-        retire_queue.queue = nullptr;
-        retire_queue.open_generation = 1;
-        retire_queue.retired_generation = 0;
-        retire_queue.pending_uses = 0;
     }
-    g_retire_queue_count = 0;
-    g_retire_tracking_overflow.store(false, std::memory_order_relaxed);
-    g_stats[kRetireTrackedQueues].store(0, std::memory_order_relaxed);
+    for (sycl::queue &queue : queues) {
+        try {
+            queue.wait_and_throw();
+        } catch (...) {
+            /* Keep the old registry and its queue ownership alive. Reusing a
+             * slot after a failed drain could let a new completion satisfy an
+             * old page token. */
+            g_stats[kRetireShutdownWaitFailures].fetch_add(
+                1, std::memory_order_relaxed);
+            drained = false;
+        }
+    }
+    if (!drained) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> guard(g_retire_mutex);
+        for (size_t index = 0; index < kMaxTrackedQueues; ++index) {
+            RetireQueue &retire_queue = g_retire_queues[index];
+            for (size_t slot = 0; slot < kRetireFenceSlots; ++slot) {
+                retire_queue.fences[slot].valid = false;
+                retire_queue.fences[slot].event = sycl::event();
+                retire_queue.fences[slot].generation = 0;
+            }
+            retire_queue.source_pointer = nullptr;
+            retire_queue.queue.reset();
+            retire_queue.device_id = -1;
+            retire_queue.context = nullptr;
+            retire_queue.device = nullptr;
+            retire_queue.incarnation = 0;
+            retire_queue.open_generation = 1;
+            retire_queue.retired_generation = 0;
+            retire_queue.pending_uses = 0;
+        }
+        g_retire_queue_count = 0;
+        g_retire_tracking_overflow.store(false, std::memory_order_relaxed);
+        g_stats[kRetireTrackedQueues].store(0, std::memory_order_relaxed);
+    }
+    return true;
 }
 
 AIMDO_XPU_EXPORT void *xpu_alloc_fn(
@@ -1323,6 +1501,11 @@ AIMDO_XPU_EXPORT bool xpu_set_queues(
     if (!device_ids || !queue_pointers || count == 0) {
         return false;
     }
+    /* A re-init must drain and detach the old queue/context registry before
+     * replacing device identities. */
+    if (!aimdo_xpu_retire_reset()) {
+        return false;
+    }
     try {
         std::lock_guard<std::mutex> guard(g_devices_mutex);
         g_devices.clear();
@@ -1356,6 +1539,7 @@ AIMDO_XPU_EXPORT bool xpu_set_queues(
             g_devices.push_back(
                 XpuDeviceState{device_ids[i], queue, context, device});
         }
+        g_retire_accepting.store(true, std::memory_order_release);
         return true;
     } catch (...) {
         g_devices.clear();
@@ -1562,11 +1746,12 @@ bool aimdo_cuda_runtime_init(void) {
     g_cuda.p_cuEventRecord = xpu_event_record;
     g_cuda.p_cuEventSynchronize = xpu_event_synchronize;
     g_cuda.p_cuDeviceGetLuid = xpu_device_get_luid;
+    g_retire_accepting.store(true, std::memory_order_release);
     return true;
 }
 
 void aimdo_cuda_runtime_cleanup(void) {
-    aimdo_xpu_retire_reset();
+    (void)aimdo_xpu_retire_reset();
     std::memset(&g_cuda, 0, sizeof(g_cuda));
 }
 

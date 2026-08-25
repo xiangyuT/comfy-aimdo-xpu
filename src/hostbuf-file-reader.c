@@ -20,6 +20,18 @@ static bool aimdo_stream_reclaim_disabled(void) {
     }
     return disabled != 0;
 }
+
+static bool aimdo_stream_reclaim_trace_enabled(void) {
+    static int enabled = -1;
+    char value[8];
+
+    if (enabled < 0) {
+        DWORD length = GetEnvironmentVariableA(
+            "AIMDO_XPU_SYNC_TRACE", value, sizeof(value));
+        enabled = length > 0 && length < sizeof(value) && value[0] == '1';
+    }
+    return enabled != 0;
+}
 #endif
 
 static bool hostbuf_file_reader_retire_active(void) {
@@ -102,15 +114,44 @@ bool hostbuf_file_reader_read(int device, uint64_t file_handle, uint64_t file_of
             return false;
         }
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-        /* The destination was budgeted and pinned by the preceding VBAR
-         * fault.  A copy callback may observe later pressure, but it must not
-         * unmap other pages while Level Zero is preparing this transfer.
-         * Publish the shortage for the next owner-side fault instead. */
+        /* This direct reader runs on the model-owner call stack, before the
+         * Level Zero copy is submitted.  The preceding VBAR fault has already
+         * mapped and pinned the destination, so a non-blocking scan cannot
+         * select it.  Reclaim other pages whose consumer fences are already
+         * complete now: deferring all of this pressure to the next fault can
+         * deadlock forward progress when the synchronous H2D wait itself is
+         * the operation that cannot complete under residency pressure.
+         *
+         * An exact allocation-fit deficit is insufficient for WDDM progress:
+         * both 32 MiB and 512 MiB targeted reclaim completed, but the following
+         * SYCL copy still waited forever in urEventWait. Once a real shortage
+         * exists, use caching-allocator OOM semantics and flush every VBAR page
+         * whose recorded consumers are provably complete. Do not do this while
+         * the copy still fits, because that would churn weights on every H2D.
+         *
+         * Never wait here. Re-sample after the flush and preserve only a real
+         * remaining deficit for the next model-owner boundary. */
         if (!aimdo_stream_reclaim_disabled()) {
-            ssize_t deficit = budget_deficit(chunk);
+            ssize_t fit_deficit = budget_deficit(chunk);
+            ssize_t post_reclaim_deficit = fit_deficit;
+            size_t reclaimed_pages = 0;
 
-            if (deficit > 0) {
-                vbars_request_reclaim(deficit);
+            if (fit_deficit > 0) {
+                reclaimed_pages = vbars_free_all_retired();
+                post_reclaim_deficit = budget_deficit(chunk);
+                if (post_reclaim_deficit > 0) {
+                    vbars_request_reclaim(post_reclaim_deficit);
+                }
+            }
+            if (aimdo_stream_reclaim_trace_enabled()) {
+                fprintf(stderr,
+                        "[AIMDO XPU RECLAIM] op=pre_h2d destination=%p "
+                        "size=%zu fit_deficit=%lld reclaimed_pages=%zu "
+                        "post_reclaim_deficit=%lld\n",
+                        (void *)(uintptr_t)device_ptr, chunk,
+                        (long long)fit_deficit, reclaimed_pages,
+                        (long long)post_reclaim_deficit);
+                fflush(stderr);
             }
         }
 #endif

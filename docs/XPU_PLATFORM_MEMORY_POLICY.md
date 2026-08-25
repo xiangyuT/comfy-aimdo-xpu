@@ -81,9 +81,19 @@ continuous VBAR eviction.
 ## Retirement and model boundaries
 
 Windows reclaim cannot create a queue fence at the moment memory is needed and
-then wait for it. Pages are tagged when they become unpinned, and previously
-submitted completion barriers advance retirement epochs. The allocation path
-only compares completed epochs and returns immediately.
+then wait for it. Pages publish per-queue retirement generations when they
+become unpinned. Pressure closes a partial fence batch when necessary, but the
+allocation path only compares completed generations and returns immediately.
+
+Non-blocking two-phase retirement is the Windows default. Unpin publishes the
+actual consumer queue before the page becomes idle. A pressure boundary closes
+any partial fence batch, snapshots completed generations, freezes eligible
+pages, and revalidates their handle, serial, eviction generation, and pin state
+before unmapping. A marker submitted by the current pressure boundary is not
+treated as complete in that same boundary. Setting
+`AIMDO_XPU_ASYNC_VBAR_RECLAIM=0` selects a synchronized model-boundary oracle;
+because it cannot bound pages touched within one activation, it is not a
+product-performance mode.
 
 At `prioritize()`, Windows may use PyTorch's observed peak-minus-current
 reserved memory as a hint for expected native growth. This is speculative:
@@ -94,6 +104,56 @@ permanent streaming ceiling.
 Individual faults revalidate current pressure and can lower residency when the
 requested pages do not fit. If pressure later clears, a request above the old
 watermark may reopen the range and fault pages normally.
+
+## Explicit consumer and capture ownership
+
+The standard ComfyUI path submits the operator on the current Torch XPU stream
+and unpins immediately after submission. AIMDO registers that current stream
+automatically. A custom or external runtime may submit work to another queue or
+retain the foreign VBAR pointer after the model pin is released; such work must
+use an explicit ownership lease:
+
+```python
+from comfy_aimdo.model_vbar import vbar_external_consumer
+
+with vbar_external_consumer(allocation, stream=consumer_stream):
+    submit_external_kernel(weight_pointer)
+```
+
+The lease is acquired before submission, so pressure cannot unmap the page in
+the interval before queue registration. Normal exit publishes the selected
+queue dependency. Exceptional exit is fail-closed because AIMDO cannot know
+whether an external runtime accepted part of a submission. The older
+`vbar_register_consumer()` one-shot API remains valid only when the model pin
+is still active through post-submission registration.
+
+Graph capture has a longer lifetime than capture construction:
+
+```python
+from comfy_aimdo.model_vbar import vbar_capture_begin
+
+capture_lease = vbar_capture_begin(allocation)
+capture_graph()
+for _ in range(replays):
+    graph.replay()
+# No future replay is permitted; the final replay is already submitted.
+capture_lease.release(final_replay_stream)
+```
+
+While the capture lease is active, a capture-time unpin with no valid event
+does not permanently poison the page; the capture hold itself prevents every
+reclaim path. Release records the final replay queue before removing that hold.
+An invalid release queue converts the page to permanent unknown/fail-closed
+state. Forgetting to release a lease also remains fail-closed at teardown.
+
+`control.get_xpu_memory_snapshot()` keeps ownership domains explicit:
+PyTorch native allocator statistics and optional segment snapshots are under
+`native_allocator`, while VMM counters, UR-hook counters and VBAR page state
+are under `aimdo`. `ModelVBAR.snapshot()` reports pins, queue tokens, external
+holds, capture holds, unknown state and eviction state without changing them.
+Owner-boundary VBAR OOM decisions retain a compact, rate-limited snapshot in
+`control.get_last_xpu_oom_snapshot()`; no Python snapshot is taken from the
+allocator/UR callback.
 
 ## Reserve policy
 
@@ -148,3 +208,8 @@ python tests\repro_xpu_platform_memory_policy.py
 
 The script creates a lower-priority and an active VBAR, applies controlled
 pressure, and reports residency around the platform policy.
+
+Windows retirement changes must additionally run
+`tests/run_xpu_vbar_resident_growth.py`: the default 16-page/512 MiB test must
+remain bounded at one resident page under deterministic live pressure. This
+capacity gate precedes any ComfyUI workflow benchmark.

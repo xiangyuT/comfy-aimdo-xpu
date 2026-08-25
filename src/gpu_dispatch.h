@@ -10,6 +10,17 @@
 #define AIMDO_XPU_RETIRE_TOKEN_QUEUE_BITS 7
 #define AIMDO_XPU_RETIRE_TOKEN_QUEUE_MASK \
     ((1ull << AIMDO_XPU_RETIRE_TOKEN_QUEUE_BITS) - 1)
+/* Queue slots may be reused after a complete runtime teardown. Encode a
+ * registry incarnation separately from the per-queue fence generation so an
+ * old page token can never be satisfied by a new queue occupying that slot. */
+#define AIMDO_XPU_RETIRE_GENERATION_BITS 33
+#define AIMDO_XPU_RETIRE_GENERATION_MASK \
+    ((1ull << AIMDO_XPU_RETIRE_GENERATION_BITS) - 1)
+#define AIMDO_XPU_RETIRE_INCARNATION_BITS \
+    (64 - AIMDO_XPU_RETIRE_TOKEN_QUEUE_BITS - \
+     AIMDO_XPU_RETIRE_GENERATION_BITS)
+#define AIMDO_XPU_RETIRE_INCARNATION_MASK \
+    ((1ull << AIMDO_XPU_RETIRE_INCARNATION_BITS) - 1)
 
 typedef CUresult (CUDAAPI *PFN_cuInit)(unsigned int flags);
 typedef CUresult (CUDAAPI *PFN_cuGetProcAddress)(const char *symbol, void **pfn, int cudaVersion,

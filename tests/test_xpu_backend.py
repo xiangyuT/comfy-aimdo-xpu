@@ -266,6 +266,11 @@ def test_torch_allocator_pressure_preserves_active_vbar_priority():
         assert active_vbar.get_residency() == [1, 1]
         del activation
         torch.xpu.empty_cache()
+        # The first non-blocking boundary closes the partial retirement batch.
+        # It must not pretend that the newly submitted marker is already done.
+        active_vbar.prioritize()
+        torch.xpu.synchronize()
+        # The next boundary observes the completed marker and commits reclaim.
         active_vbar.prioritize()
 
     # Both platforms may reclaim a lower-priority model. On Windows this is a
@@ -477,6 +482,13 @@ def test_priority_evicts_the_lowest_vbar_first():
 
     newest = ModelVBAR(32 << 20, device.index)
     newest_allocation = newest.alloc(8 << 20)
+    if sys.platform == "win32":
+        # Enter an explicit owner boundary as product code does. The default
+        # async path first closes the partial fence batch. Complete it outside
+        # AIMDO, then let a second boundary perform non-blocking reclaim.
+        newest.prioritize()
+        torch.xpu.synchronize()
+        newest.prioritize()
     assert newest.fault(newest_allocation[1], newest_allocation[2]) is not None
     newest.unpin(newest_allocation[1], newest_allocation[2])
 

@@ -10,6 +10,13 @@
 typedef int cudaError_t;
 typedef struct CUstream_st *cudaStream_t;
 
+/* WDDM can require substantially more progress residency than the allocation
+ * that first crosses the sampled budget.  Use one shared Windows/XPU floor for
+ * both VBAR allocation retry and synchronous file-to-VBAR copy pressure. */
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+#define AIMDO_XPU_WDDM_RECLAIM_FLOOR (512ULL << 20)
+#endif
+
 #if defined(__HIP_PLATFORM_AMD__) && !defined(_WIN32) && !defined(_WIN64)
 #include <sys/mman.h>
 /* Work around ROCm VMM unmap behavior by reprotecting the range after unmap.
@@ -230,15 +237,29 @@ uint64_t vbars_analyze(void *devctx, bool only_dirty);
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
 /* dispatch.cpp: per-queue retirement tokens for non-blocking reclaim */
-uint64_t aimdo_xpu_retire_token_current(void *queue);
+bool aimdo_xpu_register_consumer_queue(void *queue, int device);
+uint64_t aimdo_xpu_retire_token_current(void *queue, int device);
 size_t aimdo_xpu_retire_snapshot(uint64_t *completed, size_t count,
                                  bool force_submit);
 /* model_vbar.c */
 size_t vbars_free_retired(ssize_t size);
+size_t vbars_free_all_retired(void);
 void vbars_request_reclaim(ssize_t size);
 SHARED_EXPORT
 void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
                        uint64_t stream);
+SHARED_EXPORT
+bool vbar_register_consumer_stream(void *devctx, void *vbar, uint64_t offset,
+                                   uint64_t size, uint64_t stream);
+SHARED_EXPORT
+bool vbar_consumer_acquire(void *devctx, void *vbar, uint64_t offset,
+                           uint64_t size, uint32_t kind);
+SHARED_EXPORT
+int vbar_consumer_release(void *devctx, void *vbar, uint64_t offset,
+                          uint64_t size, uint32_t kind, uint64_t stream);
+SHARED_EXPORT
+void vbar_get_page_states(void *devctx, void *vbar, uint64_t *out,
+                          size_t max_pages);
 #endif
 
 /* pyt-cu-alloc.c */
