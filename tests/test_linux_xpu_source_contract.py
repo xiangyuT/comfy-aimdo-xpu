@@ -4,6 +4,9 @@ from pathlib import Path
 SOURCE = (Path(__file__).parents[1] / "src" / "model-vbar.c").read_text(
     encoding="utf-8"
 )
+BUILD_SCRIPT = (
+    Path(__file__).parents[1] / "scripts" / "build-linux-xpu.sh"
+).read_text(encoding="utf-8")
 
 
 def test_linux_mod1_does_not_read_windows_retirement_fields():
@@ -27,3 +30,7 @@ def test_platform_neutral_entry_points_are_declared_before_first_use():
 
     assert range_declaration < range_wrapper
     assert stream_declaration < stream_wrapper
+
+
+def test_linux_xpu_runtime_binds_its_own_native_functions():
+    assert "-Wl,-Bsymbolic-functions" in BUILD_SCRIPT
