@@ -4,13 +4,13 @@ This project is a pytorch VRAM allocator that implements on-demand offloading of
 
 ## Support:
 
-* **Nvidia CUDA GPUs**
+* **Nvidia CUDA GPUs** and **AMD GPUs** through ROCm/HIP
 * **Intel XPU GPUs on Linux and Windows** through the Level Zero backend
-* **Pytorch 2.8+** for the CUDA backend
+* **PyTorch 2.8+** for the CUDA and ROCm backends
 * A PyTorch XPU build exposing the current stream's SYCL queue for the Intel
   backend. Linux additionally requires
   `torch.xpu.memory.XPUPluggableAllocator`.
-* **Cuda 12.8+** for the Nvidia backend
+* **CUDA 12.8+** (Nvidia) / **ROCm 7+** (AMD)
 * **Windows 11+** / **Linux** as per python ManyLinux support
 
 ---
@@ -157,6 +157,8 @@ directory is `10.0.26100.0`):
 * [Microsoft.Windows.SDK.CPP](https://www.nuget.org/packages/Microsoft.Windows.SDK.CPP/10.0.26100.3916)
 * [Microsoft.Windows.SDK.CPP.x64](https://www.nuget.org/packages/Microsoft.Windows.SDK.CPP.x64/10.0.26100.3916)
 * [Microsoft.Windows.SDK.BuildTools](https://www.nuget.org/packages/Microsoft.Windows.SDK.BuildTools/10.0.26100.3916)
+
+On AMD, the equivalent HIP APIs (`hipMemAddressReserve` -> `hipMemCreate` -> `hipMemMap`, and their converse calls) are used throughout via the same flow.
 
 ## Caveats:
 

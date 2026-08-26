@@ -59,6 +59,51 @@ typedef struct ModelVBAR {
     ResidentPage residency_map[1]; /* Must be last! */
 } ModelVBAR;
 
+static bool vbar_page_count(uint64_t size, size_t *nr_pages) {
+    uint64_t pages;
+
+    if (!nr_pages || size > UINT64_MAX - (VBAR_PAGE_SIZE - 1)) {
+        return false;
+    }
+    pages = (size + VBAR_PAGE_SIZE - 1) / VBAR_PAGE_SIZE;
+    if (pages > SIZE_MAX) {
+        return false;
+    }
+    *nr_pages = (size_t)pages;
+    return true;
+}
+
+static bool vbar_metadata_allocation_size(size_t nr_pages,
+                                          size_t *allocation_size) {
+    if (!allocation_size ||
+        nr_pages > (SIZE_MAX - sizeof(ModelVBAR)) / sizeof(ResidentPage)) {
+        return false;
+    }
+    *allocation_size =
+        sizeof(ModelVBAR) + nr_pages * sizeof(ResidentPage);
+    return true;
+}
+
+static bool vbar_fault_page_range(const ModelVBAR *mv, uint64_t offset,
+                                  uint64_t size, size_t *page_start,
+                                  size_t *page_end) {
+    uint64_t reserved_size;
+
+    if (!mv || !page_start || !page_end ||
+        mv->nr_pages > UINT64_MAX / VBAR_PAGE_SIZE) {
+        return false;
+    }
+    reserved_size = (uint64_t)mv->nr_pages * VBAR_PAGE_SIZE;
+    /* Validate with subtraction before offset+size and page rounding.  An
+     * overflowing end must not wrap into the reservation and make the fault
+     * loop index residency_map outside its allocation. */
+    if (offset > reserved_size || size > reserved_size - offset) {
+        return false;
+    }
+    *page_start = (size_t)(offset / VBAR_PAGE_SIZE);
+    return vbar_page_count(offset + size, page_end);
+}
+
 /* These public entry points are used before their definitions below. Keep the
  * declarations platform-neutral: Linux implements stream unpinning as the
  * synchronous legacy path even though retirement tokens are Windows-only. */
@@ -1051,20 +1096,43 @@ static inline void insert_vbar_last(ModelVBAR *mv) {
 SHARED_EXPORT
 void *vbar_allocate(void *devctx, uint64_t size, int device) {
     ModelVBAR *mv;
+    size_t allocation_size;
+    size_t nr_pages;
 
     set_devctx((AimdoContext *)devctx);
 
     log_reset_shots();
     log(DEBUG, "%s (start): size=%zuM, device=%d\n", __func__, size / M, device);
 
-    size_t nr_pages = VBAR_GET_PAGE_NR_UP(size);
-    size_t nr_pages_max = VBAR_GET_PAGE_NR(vram_capacity);
-    if (nr_pages_max < nr_pages) {
-        nr_pages = nr_pages_max;
+    if (!vbar_page_count(size, &nr_pages)) {
+        log(AIMDO_LOG_ERROR,
+            "VBAR size cannot be rounded safely: %llu bytes\n",
+            (unsigned long long)size);
+        return NULL;
     }
+#if defined(AIMDO_XPU)
+    /* ComfyUI sizes a VBAR as model_size()*10 so the virtual address space
+     * covers the whole logical model (casts can inflate weight size several
+     * times over). Physical residency is still bounded at fault time by
+     * budget_deficit()/reclaim, so capping the VA reservation at physical
+     * VRAM capacity only forced every weight beyond that offset to stream
+     * from host storage on each use. Keep the full reservation. */
+#else
+    {
+        uint64_t nr_pages_max = vram_capacity / VBAR_PAGE_SIZE;
+        if (nr_pages_max < nr_pages) {
+            nr_pages = (size_t)nr_pages_max;
+        }
+    }
+#endif
     size = (uint64_t)nr_pages * VBAR_PAGE_SIZE;
 
-    if (!(mv = calloc(1, sizeof(*mv) + nr_pages * sizeof(mv->residency_map[0])))) {
+    if (!vbar_metadata_allocation_size(nr_pages, &allocation_size)) {
+        log(AIMDO_LOG_ERROR,
+            "VBAR page metadata size overflow: %zu pages\n", nr_pages);
+        return NULL;
+    }
+    if (!(mv = calloc(1, allocation_size))) {
         log(CRITICAL, "Host OOM\n");
         return NULL;
     }
@@ -1243,6 +1311,8 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
                              uint64_t size, uint32_t *signature) {
     ModelVBAR *mv = (ModelVBAR *)vbar;
     int ret = VBAR_FAULT_SUCCESS;
+    size_t page_start;
+    size_t page_end;
     size_t signature_index = 0;
     bool miss_alloc_checked = false;
 
@@ -1254,7 +1324,15 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
     }
 #endif
 
-    size_t page_end = VBAR_GET_PAGE_NR_UP(offset + size);
+    if (!vbar_fault_page_range(
+            mv, offset, size, &page_start, &page_end)) {
+        log(DEBUG,
+            "VBAR fault offset=%llu size=%llu exceeds reservation "
+            "(%zu pages); streaming from host storage\n",
+            (unsigned long long)offset, (unsigned long long)size,
+            mv->nr_pages);
+        return VBAR_FAULT_OOM;
+    }
 
     log(VVERBOSE, "%s (start): offset=%lldk, size=%lldk\n", __func__, (ull)(offset / K), (ull)(size / K));
     vbars_dirty = true;
@@ -1294,7 +1372,7 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
          * below, so it cannot reintroduce an overcommit on its own. */
         size_t absent = 0;
 
-        for (size_t page_nr = VBAR_GET_PAGE_NR(offset); page_nr < page_end; page_nr++) {
+        for (size_t page_nr = page_start; page_nr < page_end; page_nr++) {
             if (!vbar_page_is_mapped(&mv->residency_map[page_nr])) {
                 absent++;
             }
@@ -1312,7 +1390,7 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
 #endif
     }
 
-    for (uint64_t page_nr = VBAR_GET_PAGE_NR(offset); page_nr < page_end; page_nr++) {
+    for (size_t page_nr = page_start; page_nr < page_end; page_nr++) {
         CUresult err = CUDA_ERROR_OUT_OF_MEMORY;
         CUdeviceptr vaddr = mv->vbar + page_nr * VBAR_PAGE_SIZE;
         ResidentPage *rp = &mv->residency_map[page_nr];
@@ -1324,7 +1402,7 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
                 "VBAR page %zu has an indeterminate mapping state\n",
                 (size_t)page_nr);
             vbar_unpin_range(
-                mv, VBAR_GET_PAGE_NR(offset), (size_t)page_nr);
+                mv, page_start, page_nr);
             return VBAR_FAULT_ERROR;
         }
         if (rp->handle && rp->mapped == VBAR_MAPPING_UNMAPPED) {
@@ -1337,7 +1415,7 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
                     "VBAR page %zu has an unrecoverable unmapped physical handle\n",
                     (size_t)page_nr);
                 vbar_unpin_range(
-                    mv, VBAR_GET_PAGE_NR(offset), (size_t)page_nr);
+                    mv, page_start, page_nr);
                 return VBAR_FAULT_ERROR;
             }
         }
@@ -1387,7 +1465,7 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
 
             if (page_end > mv->watermark) {
                 log(DEBUG, "VBAR allocation cancelled due to allocation-check watermark reduction\n");
-                vbar_unpin_range(mv, VBAR_GET_PAGE_NR(offset), page_nr);
+                vbar_unpin_range(mv, page_start, page_nr);
                 return VBAR_FAULT_OOM;
             }
         }
@@ -1408,7 +1486,7 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
 
             if (err != CUDA_ERROR_OUT_OF_MEMORY) {
                 log(AIMDO_LOG_ERROR, "VRAM Allocation failed (non OOM)\n");
-                vbar_unpin_range(mv, VBAR_GET_PAGE_NR(offset), page_nr);
+                vbar_unpin_range(mv, page_start, page_nr);
                 return VBAR_FAULT_ERROR;
             }
             log(DEBUG,
@@ -1421,7 +1499,7 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
 #endif
             if (page_end > mv->watermark) {
                 log(DEBUG, "VBAR allocation cancelled due to backup-free watermark reduction\n");
-                vbar_unpin_range(mv, VBAR_GET_PAGE_NR(offset), page_nr);
+                vbar_unpin_range(mv, page_start, page_nr);
                 return VBAR_FAULT_OOM;
             }
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
@@ -1449,7 +1527,7 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
                     if (page_end > mv->watermark) {
                         log(DEBUG,
                             "VBAR allocation cancelled after Windows XPU retry reclaim\n");
-                        vbar_unpin_range(mv, VBAR_GET_PAGE_NR(offset), page_nr);
+                        vbar_unpin_range(mv, page_start, page_nr);
                         return VBAR_FAULT_OOM;
                     }
                     err = vbar_map_new_page(mv, (size_t)page_nr);
@@ -1465,12 +1543,12 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
                      * path, and skipped the native-cache recovery that only
                      * runs for OOM. */
                     log(INFO, "VRAM Allocation OOM; weight will be offloaded\n");
-                    vbar_unpin_range(mv, VBAR_GET_PAGE_NR(offset), page_nr);
+                    vbar_unpin_range(mv, page_start, page_nr);
                     return VBAR_FAULT_OOM;
                 }
 #endif
                 log(AIMDO_LOG_ERROR, "VRAM Allocation failed\n");
-                vbar_unpin_range(mv, VBAR_GET_PAGE_NR(offset), page_nr);
+                vbar_unpin_range(mv, page_start, page_nr);
                 return VBAR_FAULT_ERROR;
             }
         }

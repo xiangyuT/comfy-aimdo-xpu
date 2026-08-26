@@ -11,7 +11,7 @@ After building `comfy_aimdo/aimdo_xpu.so` and the canonical wheel, run:
 
 ```bash
 python packaging/xpu_runtime_provider/build_wheel.py \
-  --source-wheel dist/comfy_aimdo-0.4.13-cp39-abi3-linux_x86_64.whl \
+  --source-wheel dist/comfy_aimdo-0.4.15-cp39-abi3-linux_x86_64.whl \
   --output-dir dist/provider \
   --source-revision "$(git rev-parse HEAD)" \
   --torch-version 2.13.0+xpu \
