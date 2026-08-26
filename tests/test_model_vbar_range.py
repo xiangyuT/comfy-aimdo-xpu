@@ -59,4 +59,3 @@ def test_vbar_fault_validates_bytes_before_end_addition_or_page_access():
     assert "return VBAR_FAULT_OOM;" in fault.split(
         "if (!vbar_fault_page_range(", 1
     )[1].split("log(VVERBOSE", 1)[0]
-
