@@ -72,6 +72,48 @@ def test_vbar_raw_tensor_hit_evict_and_refault_signature():
     _destroy_vbar(vbar)
 
 
+def test_vbar_fault_range_guard_accepts_exact_end_and_rejects_invalid_edges():
+    from comfy_aimdo.model_vbar import ModelVBAR
+
+    device = torch.device("xpu", torch.xpu.current_device())
+    page_size = 32 << 20
+    vbar = ModelVBAR(page_size, device.index)
+    reserved_size = vbar.get_nr_pages() * page_size
+    assert reserved_size == page_size
+
+    # A one-byte fault ending exactly at the reservation is legal and maps the
+    # final page. The adjacent cross-end and beyond-end ranges must use the
+    # existing host-offload result without entering the driver mapping path.
+    exact_end = vbar.base_addr + reserved_size - 1
+    assert vbar.fault(exact_end, 1) is not None
+    vbar.unpin(exact_end, 1)
+    stats_before = control.get_xpu_vmm_stats()
+
+    invalid_ranges = (
+        (reserved_size, 1),
+        (reserved_size - 1, 2),
+        ((1 << 64) - 1, 2),
+    )
+    for offset, size in invalid_ranges:
+        assert vbar.fault(vbar.base_addr + offset, size) is None
+
+    stats_after = control.get_xpu_vmm_stats()
+    assert stats_after["physical_create_calls"] == stats_before[
+        "physical_create_calls"
+    ]
+    assert stats_after["map_calls"] == stats_before["map_calls"]
+
+    _destroy_vbar(vbar)
+
+
+def test_vbar_allocate_rejects_unrepresentable_page_rounding():
+    from comfy_aimdo.model_vbar import ModelVBAR
+
+    device = torch.device("xpu", torch.xpu.current_device())
+    with pytest.raises(MemoryError, match="VBAR allocation failed"):
+        ModelVBAR((1 << 64) - 1, device.index)
+
+
 @pytest.mark.parametrize(
     "device_arg",
     ["xpu", torch.device("xpu")],
