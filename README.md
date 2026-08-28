@@ -1,15 +1,85 @@
+# AI Model Dynamic Offloader XPU
+
+> [!IMPORTANT]
+> **Experimental Intel XPU fork — limited validation scope**
+>
+> The XPU changes in this fork are developed and performance-tuned for work
+> related to [Intel llm-scaler](https://github.com/intel/llm-scaler), primarily
+> on Ubuntu 24.04 LTS with Intel Arc Pro B70.
+>
+> Other operating systems, GPU models, software environments, workloads, and
+> configurations are outside the validated scope. Their compatibility,
+> correctness, output quality, stability, and performance are not guaranteed.
+>
+> If you have a specific requirement outside the current scope, you may open a
+> relevant issue with the complete environment, expected use case, and a
+> reproducible example. Opening an issue provides a way to document and discuss
+> the request. Whether it can be explored or supported will depend on its
+> relevance, reproducibility, and available capacity. The validated scope will
+> be updated only after any additional support has been implemented and
+> validated.
+>
+> This work is experimental. Ongoing support, maintenance, compatibility
+> updates, and future development depend on available time, capacity, and
+> project priorities.
+
+## Intel XPU integration
+
+This fork adds an Intel XPU backend to
+[Comfy-Org/comfy-aimdo](https://github.com/Comfy-Org/comfy-aimdo), using
+PyTorch XPU, SYCL, and Level Zero for DynamicVRAM model-weight management.
+
+Linux and Windows use different allocator ownership models:
+
+- Linux can install AIMDO's XPU pluggable allocator and manages VBAR storage
+  through SYCL and Level Zero.
+- Windows retains PyTorch's native XPU caching allocator while AIMDO
+  coordinates physical Unified Runtime allocation pressure and manages Level
+  Zero VBAR pages.
+
+Within ComfyUI, installing this package does not enable the XPU allocator by
+itself. DynamicVRAM must be selected explicitly:
+
+```bash
+python main.py --enable-dynamic-vram
+```
+
+Standalone callers can initialize the backend with
+`control.init(implementation="xpu")`. Initialization must occur before the
+first XPU stream or allocation is created.
+
+### Build
+
+Build the Linux backend in an environment containing PyTorch XPU, the oneAPI
+DPC++ compiler, and Level Zero development files:
+
+```bash
+./scripts/build-linux-xpu.sh
+```
+
+For Windows prerequisites and the native build entry point, see
+[Windows XPU build and validation](docs/WINDOWS_XPU_BUILD_TEST_ACCEPTANCE.md).
+
+The [documentation index](docs/README.md) links the maintained allocator
+ownership, pressure, reclaim, runtime-hook, build, and validation contracts.
+
+---
+
+## Upstream documentation
+
+> The following is the original README from
+> [Comfy-Org/comfy-aimdo](https://github.com/Comfy-Org/comfy-aimdo) at revision
+> [`84b79a6c950dfe51f84294fce13232f4de2aa5a1`](https://github.com/Comfy-Org/comfy-aimdo/commit/84b79a6c950dfe51f84294fce13232f4de2aa5a1)
+> (upstream `v0.4.15`), retained unchanged for reference.
+
 # AI Model Dynamic Offloader
 
 This project is a pytorch VRAM allocator that implements on-demand offloading of model weights when the primary pytorch VRAM allocator comes under pressure.
 
 ## Support:
 
-* **Nvidia CUDA GPUs** and **AMD GPUs** through ROCm/HIP
-* **Intel XPU GPUs on Linux and Windows** through the Level Zero backend
-* **PyTorch 2.8+** for the CUDA and ROCm backends
-* A PyTorch XPU build exposing the current stream's SYCL queue for the Intel
-  backend. Linux additionally requires
-  `torch.xpu.memory.XPUPluggableAllocator`.
+* **Nvidia GPUs** (CUDA) **and AMD GPUs** (ROCm/HIP)
+* **PyTorch 2.8+**
 * **CUDA 12.8+** (Nvidia) / **ROCm 7+** (AMD)
 * **Windows 11+** / **Linux** as per python ManyLinux support
 
@@ -52,111 +122,6 @@ see examples/example.py
 
 * VBAR allocation is done with `cuMemAddressReserve()`, faulting with `cuMemCreate()` and `cuMemMap()` and all frees done with appropriate converse APIs.
 * For consistency with VBAR memory management, main pytorch allocator plugin is also implemented with `cuMemAddressReserve` -> `cuMemCreate` -> `cuMemMap`. This also behaves a lot better on Windows systems with System Memory fallback.
-* The Intel XPU backend shares PyTorch's current SYCL queue and Level Zero
-  context, and implements VBAR allocation with `zeVirtualMemReserve()`,
-  `zePhysicalMemCreate()`, `zeVirtualMemMap()`, and their converse APIs.
-* On Windows, PyTorch retains ownership of its native XPU caching allocator.
-  AIMDO's default `native_hook` mode intercepts the Unified Runtime physical
-  USM growth/release boundary with Detours while preserving PyTorch's block
-  splitting, coalescing, stream ordering, retry, statistics, and
-  `empty_cache()` behavior. The hook never waits or performs re-entrant driver
-  memory management. It lets PyTorch release its own cache on retry, then
-  reclaims only a residual deficit from retirement-proven VBAR pages. Model
-  prioritization preserves the active VBAR during speculative reclaim, and
-  individual faults apply current pressure when residency really must fall.
-  On Windows, pages publish the actual consuming SYCL queue before becoming
-  idle. Non-blocking two-phase retirement is the default: pressure may unmap a
-  page only after every registered queue marker completes and the page
-  identity is revalidated. `AIMDO_XPU_ASYNC_VBAR_RECLAIM=0` selects the
-  synchronized model-boundary reference oracle; it is diagnostic-only because
-  pages touched within one activation otherwise accumulate until a model
-  switch and can force WDDM paging.
-  Custom or external kernels that can outlive the model pin must use the
-  pre-submission `vbar_external_consumer()` lease; post-submission
-  `vbar_register_consumer()` is valid only while the original model pin is
-  still active. Captured graphs use `vbar_capture_begin()` and keep that lease
-  across every replay. Ending graph construction is not a release boundary.
-  `control.get_xpu_memory_snapshot()` reports native allocator state and the
-  separate foreign VBAR ownership domain side by side.
-* On Linux, AIMDO continues to install its XPU pluggable allocator backed by
-  `sycl::malloc_device()`. Freed regular allocations are cached per device and
-  SYCL queue, with completion barriers protecting reuse.
-
-The allocator and `--reserve-vram` interaction differs between Linux and
-Windows. See the [documentation index](docs/README.md) and
-[XPU platform memory policy](docs/XPU_PLATFORM_MEMORY_POLICY.md) for the
-maintained contracts and regression entry points.
-
-### Build the Intel XPU backend on Linux
-
-Build in a Linux environment containing PyTorch XPU, the oneAPI DPC++ compiler,
-and Level Zero development files:
-
-```bash
-./scripts/build-linux-xpu.sh
-```
-
-The command creates `comfy_aimdo/aimdo_xpu.so`. Vendor detection selects it
-automatically for a PyTorch build whose version ends in `+xpu`; callers may
-also request `control.init(implementation="xpu")` explicitly. ComfyUI must be
-started with DynamicVRAM enabled so its model patcher creates and faults VBAR
-weights. The XPU allocator must be installed before the first XPU stream or
-allocation is initialized; `control.init()` performs that installation.
-Within ComfyUI, installing this package does not enable the XPU allocator by
-itself: launch ComfyUI with `--enable-dynamic-vram` to opt in. Starting without
-that option, or with `--disable-dynamic-vram`, preserves PyTorch's native XPU
-allocator and the legacy ComfyUI model patcher. Standalone callers can opt in
-programmatically with `control.init(implementation="xpu")`.
-
-### Build the Intel XPU backend on Windows
-
-Install [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
-with the Desktop C++ workload and the
-[Intel oneAPI DPC++/C++ Compiler 2025.3](https://www.intel.com/content/www/us/en/developer/tools/oneapi/dpc-compiler-download.html).
-Obtain Level Zero headers from the official
-[oneapi-src/level-zero](https://github.com/oneapi-src/level-zero) repository,
-then run from an ordinary command prompt:
-
-```bat
-git init build\level-zero-src
-git -C build\level-zero-src remote add origin https://github.com/oneapi-src/level-zero.git
-git -C build\level-zero-src fetch --depth 1 origin 5cc079af8b1e07329922bea1fde954221ebfd0a3
-git -C build\level-zero-src checkout --detach FETCH_HEAD
-scripts\build-windows-xpu.cmd
-```
-
-The command creates `comfy_aimdo\aimdo_xpu.dll`. The build generates a small
-import library for the Level Zero and tracing entry points used by AIMDO; at
-runtime the DLL uses `ze_loader.dll` installed by the Intel graphics driver.
-Set
-`LEVEL_ZERO_INCLUDE` before running the script when the headers are stored
-elsewhere. On Windows, the XPU device LUID is matched to its DXGI adapter so
-AIMDO can use both WDDM local-memory `CurrentUsage` and `Budget` as its sampled
-pressure baseline. This includes driver, SYCL, oneDNN, and other allocations
-that do not pass through AIMDO's own accounting; AIMDO applies its recorded
-allocation delta between rate-limited DXGI samples. Older runtimes without the
-LUID properties fall back to Level Zero free-memory.
-ComfyUI must be launched with `--enable-dynamic-vram` on XPU until
-upstream ComfyUI enables DynamicVRAM by default for that device type.
-On Windows, do not replace Torch's XPU allocator with AIMDO's pluggable
-allocator. The native Unified Runtime hook arbitrates physical USM growth;
-completed tensor blocks remain under Torch's native cache policy and
-`torch.xpu.empty_cache()` remains the native implementation. WDDM non-local
-usage is treated as fallback pressure only after it exceeds a 512 MiB margin,
-so normal runtime bookkeeping does not cause repeated VBAR eviction. Linux
-retains the existing pluggable-allocator and immediate-pressure policy.
-For focused Windows diagnosis, set `AIMDO_XPU_WDDM_TRACE=1` to log DXGI
-local/non-local usage and budgets, and `AIMDO_XPU_ALLOCATION_TRACE=1` to log
-physical Level Zero allocation requests. Both traces are disabled by default.
-
-When the Visual Studio installation does not include the Windows SDK/UCRT, the
-script also recognizes the project-local Microsoft Windows SDK NuGet packages
-`10.0.26100.3916` extracted below `build\windows-sdk-nuget` (their internal SDK
-directory is `10.0.26100.0`):
-
-* [Microsoft.Windows.SDK.CPP](https://www.nuget.org/packages/Microsoft.Windows.SDK.CPP/10.0.26100.3916)
-* [Microsoft.Windows.SDK.CPP.x64](https://www.nuget.org/packages/Microsoft.Windows.SDK.CPP.x64/10.0.26100.3916)
-* [Microsoft.Windows.SDK.BuildTools](https://www.nuget.org/packages/Microsoft.Windows.SDK.BuildTools/10.0.26100.3916)
 
 On AMD, the equivalent HIP APIs (`hipMemAddressReserve` -> `hipMemCreate` -> `hipMemMap`, and their converse calls) are used throughout via the same flow.
 
