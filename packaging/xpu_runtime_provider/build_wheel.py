@@ -43,7 +43,10 @@ def _normalize_distribution(name: str) -> str:
 
 
 def _wheel_component(value: str) -> str:
-    return re.sub(r"[^\w\d.]+", "_", value, flags=re.UNICODE)
+    # Keep the PEP 440 local-version separator: pip rejects wheel filenames
+    # whose version uses "_" in place of "+" (e.g. torch ships
+    # torch-2.14.0+xpu-...whl).
+    return re.sub(r"[^\w\d.+]+", "_", value, flags=re.UNICODE)
 
 
 def _zip_datetime() -> tuple[int, int, int, int, int, int]:
@@ -209,8 +212,8 @@ def build_provider_wheel(
         raise ValueError("source revision must be a lowercase 40-character Git SHA")
     if not torch_version.endswith("+xpu"):
         raise ValueError("torch version must identify an XPU build with +xpu")
-    if xpu_target not in {"bmg", "ptl-h"}:
-        raise ValueError("xpu target must be bmg or ptl-h")
+    if xpu_target not in {"bmg", "ptl-h", "dg2"}:
+        raise ValueError("xpu target must be bmg, ptl-h or dg2")
 
     (
         source_version,
@@ -311,7 +314,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--source-revision", required=True)
     parser.add_argument("--torch-version", required=True)
-    parser.add_argument("--xpu-target", choices=("bmg", "ptl-h"), required=True)
+    parser.add_argument("--xpu-target", choices=("bmg", "ptl-h", "dg2"), required=True)
     return parser.parse_args()
 
 

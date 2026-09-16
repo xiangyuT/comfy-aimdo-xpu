@@ -30,6 +30,12 @@ if errorlevel 1 (
     if errorlevel 1 exit /b 1
 )
 
+rem Ensure the Intel compiler runtime libraries (libircmt.lib) are linkable:
+rem setvars.bat can leave them off LIB, which breaks the icx-cl link step
+rem (LNK1104: cannot open file "libircmt.lib").
+if not defined ONEAPI_COMPILER_ROOT set "ONEAPI_COMPILER_ROOT=%ONEAPI_ROOT%\compiler\latest"
+set "LIB=%ONEAPI_COMPILER_ROOT%\lib;%LIB%"
+
 if not defined WINDOWS_SDK_NUGET set "WINDOWS_SDK_NUGET=%ROOT_DIR%\build\windows-sdk-nuget"
 if not defined WINDOWS_SDK_VERSION set "WINDOWS_SDK_VERSION=10.0.26100.0"
 if exist "%WINDOWS_SDK_NUGET%\microsoft.windows.sdk.cpp\c\Include\%WINDOWS_SDK_VERSION%\ucrt\stddef.h" (
