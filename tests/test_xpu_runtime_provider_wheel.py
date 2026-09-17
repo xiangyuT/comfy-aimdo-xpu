@@ -7,9 +7,11 @@ import io
 import json
 import sys
 import zipfile
+from email.parser import Parser
 from pathlib import Path
 
 import pytest
+from packaging.utils import parse_wheel_filename
 
 
 _BUILDER = (
@@ -37,6 +39,7 @@ def _source_wheel(
     distribution: str = "comfy-aimdo",
     include_native: bool = True,
     version: str = "0.5.3",
+    tag: str = "cp39-abi3-linux_x86_64",
 ) -> Path:
     dist_info = f"comfy_aimdo-{version}.dist-info"
     with zipfile.ZipFile(path, "w") as archive:
@@ -51,7 +54,7 @@ def _source_wheel(
             f"{dist_info}/WHEEL",
             "Wheel-Version: 1.0\n"
             "Root-Is-Purelib: false\n"
-            "Tag: cp39-abi3-linux_x86_64\n",
+            f"Tag: {tag}\n",
         )
         archive.writestr("comfy_aimdo/control.py", "lib = None\n")
         archive.writestr("comfy_aimdo/torch.py", "VALUE = 'xpu'\n")
@@ -184,3 +187,79 @@ def test_provider_wheel_is_reproducible(tmp_path, monkeypatch):
     )
 
     assert first.read_bytes() == second.read_bytes()
+
+
+def test_provider_wheel_records_dg2_target_in_manifest(tmp_path, monkeypatch):
+    monkeypatch.setenv("SOURCE_DATE_EPOCH", "1700000000")
+    builder = _load_builder()
+    source = _source_wheel(
+        tmp_path / "comfy_aimdo-0.5.3-cp39-abi3-win_amd64.whl",
+        tag="cp39-abi3-win_amd64",
+    )
+
+    provider = builder.build_provider_wheel(
+        source_wheel=source,
+        output_directory=tmp_path / "dist",
+        source_revision="d" * 40,
+        torch_version="2.14.0+xpu",
+        xpu_target="dg2",
+    )
+
+    assert provider.name == (
+        "comfy_aimdo_xpu_runtime-0.5.3-cp39-abi3-win_amd64.whl"
+    )
+    with zipfile.ZipFile(provider) as archive:
+        manifest = json.loads(
+            archive.read("comfy_aimdo_xpu_runtime/provider.json")
+        )
+        assert manifest["runtime"] == {
+            "torch_version": "2.14.0+xpu",
+            "torch_build": "xpu",
+            "xpu_targets": ["dg2"],
+            "platforms": ["linux", "win32"],
+        }
+
+
+def test_provider_wheel_local_version_filename_matches_metadata(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("SOURCE_DATE_EPOCH", "1700000000")
+    builder = _load_builder()
+    version = "0.5.3+local"
+    source = _source_wheel(
+        tmp_path / f"comfy_aimdo-{version}-cp39-abi3-win_amd64.whl",
+        version=version,
+        tag="cp39-abi3-win_amd64",
+    )
+
+    provider = builder.build_provider_wheel(
+        source_wheel=source,
+        output_directory=tmp_path / "dist",
+        source_revision="e" * 40,
+        torch_version="2.14.0+xpu",
+        xpu_target="dg2",
+    )
+
+    assert provider.name == (
+        "comfy_aimdo_xpu_runtime-0.5.3+local-cp39-abi3-win_amd64.whl"
+    )
+    parsed_name, parsed_version, _, parsed_tags = parse_wheel_filename(
+        provider.name
+    )
+    assert parsed_name == "comfy-aimdo-xpu-runtime"
+    assert str(parsed_version) == version
+    assert {str(tag) for tag in parsed_tags} == {"cp39-abi3-win_amd64"}
+
+    with zipfile.ZipFile(provider) as archive:
+        metadata_text = archive.read(
+            "comfy_aimdo_xpu_runtime-0.5.3+local.dist-info/METADATA"
+        ).decode("utf-8")
+        metadata = Parser().parsestr(metadata_text)
+        assert metadata["Version"] == version
+        manifest = json.loads(
+            archive.read("comfy_aimdo_xpu_runtime/provider.json")
+        )
+        assert manifest["provider_distribution"]["version"] == version
+        assert manifest["canonical_distribution"]["compatible_versions"] == [
+            version
+        ]
