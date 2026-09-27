@@ -23,6 +23,8 @@ The output contains a lightweight
 canonical version, exact source revision, source-wheel hash, native-library
 hash, supported runtime, and allocator modes. Importing its metadata does not
 import PyTorch or AIMDO.
+The 0.5.3 provider source declares compatibility with official AIMDO 0.5.3
+and 0.5.5; its provider wheel version remains 0.5.3.
 
 ComfyUI-OmniXPU activates this provider only when DynamicVRAM is explicitly
 enabled and the official AIMDO attempt has left no live native or allocator
