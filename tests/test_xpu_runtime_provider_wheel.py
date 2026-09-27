@@ -100,7 +100,7 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
             "name": "comfy-aimdo",
             "compatible_versions": ["0.5.5"],
         }
-        assert manifest["runtime"]["platforms"] == ["linux"]
+        assert manifest["runtime"]["platforms"] == ["linux", "win32"]
         assert manifest["source"]["revision"] == "a" * 40
         assert manifest["source"]["wheel_sha256"] == hashlib.sha256(
             source.read_bytes()
@@ -108,8 +108,11 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
         assert manifest["activation"] == {
             "strategy": "canonical_control_overlay",
             "requires_dynamic_vram": True,
-            "allocator_modes": {"linux": ["global", "native_hook"]},
-            "default_allocator_modes": {"linux": "native_hook"},
+            "allocator_modes": {
+                "linux": ["global", "native_hook"],
+                "win32": ["native_hook"],
+            },
+            "default_allocator_modes": {"linux": "native_hook", "win32": "native_hook"},
         }
         assert manifest["native_artifacts"] == [
             {
