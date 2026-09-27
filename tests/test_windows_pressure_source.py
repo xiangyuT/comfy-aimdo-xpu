@@ -1,6 +1,20 @@
 from pathlib import Path
 
 
+def test_windows_xpu_build_includes_storage_probe():
+    root = Path(__file__).resolve().parents[1]
+    build = (root / "scripts" / "build-windows-xpu.cmd").read_text(encoding="utf-8")
+    native = (root / "src-win" / "disk-id.c").read_text(encoding="utf-8")
+    wrapper = (root / "comfy_aimdo" / "storage.py").read_text(encoding="utf-8")
+
+    assert "disk-id.c" in build
+    assert "win-disk-id.obj" in build
+    assert "cfgmgr32.lib" in build
+    assert "setupapi.lib" in build
+    assert "int aimdo_storage_fast_disk(" in native
+    assert "lib.aimdo_storage_fast_disk" in wrapper
+
+
 def test_wddm_pressure_uses_current_usage_as_sampled_baseline():
     source = (
         Path(__file__).resolve().parents[1] / "src-win" / "shmem-detect.c"
@@ -319,7 +333,7 @@ def test_windows_unpin_publishes_queue_token_before_idle_state():
     source = (
         Path(__file__).resolve().parents[1] / "src" / "model-vbar.c"
     ).read_text(encoding="utf-8")
-    unpin = source.split("void vbar_unpin_stream", 1)[1]
+    unpin = source.rsplit("void vbar_unpin_stream", 1)[1]
     unpin = unpin.split("\n}\n", 1)[0]
 
     token_snapshot = unpin.index("retirement_token = vbar_consumer_dependency(")

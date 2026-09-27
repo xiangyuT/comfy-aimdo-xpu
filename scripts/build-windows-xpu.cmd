@@ -87,7 +87,7 @@ for %%S in (
     if errorlevel 1 exit /b 1
 )
 
-for %%S in (hostbuf-plat.c model-mmap.c thread-plat.c xfer-file-plat.c shmem-detect.c) do (
+for %%S in (hostbuf-plat.c model-mmap.c thread-plat.c xfer-file-plat.c shmem-detect.c disk-id.c) do (
     cl.exe %COMMON_FLAGS% "%ROOT_DIR%\src-win\%%S" /Fo"%BUILD_DIR%\win-%%~nS.obj"
     if errorlevel 1 exit /b 1
 )
@@ -124,13 +124,14 @@ icx-cl.exe /nologo -fsycl /LD /Fe:"%OUTPUT_PATH%" ^
     "%BUILD_DIR%\win-thread-plat.obj" ^
     "%BUILD_DIR%\win-xfer-file-plat.obj" ^
     "%BUILD_DIR%\win-shmem-detect.obj" ^
+    "%BUILD_DIR%\win-disk-id.obj" ^
     "%BUILD_DIR%\xpu-stubs.obj" ^
     "%BUILD_DIR%\xpu-ze-detour.obj" ^
     "%BUILD_DIR%\xpu-ur-usm-detour.obj" ^
     "%BUILD_DIR%\xpu-ze-tracer.obj" ^
     "%BUILD_DIR%\xpu-dispatch.obj" ^
     /link /LIBPATH:"%BUILD_DIR%" /LIBPATH:"%DETOURS_LIB_DIR%" ^
-    ze_loader.lib detours.lib dxgi.lib dxguid.lib onecore.lib
+    ze_loader.lib detours.lib cfgmgr32.lib dxgi.lib dxguid.lib setupapi.lib onecore.lib
 if errorlevel 1 exit /b 1
 
 echo built %OUTPUT_PATH%
