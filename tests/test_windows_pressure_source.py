@@ -333,7 +333,7 @@ def test_windows_unpin_publishes_queue_token_before_idle_state():
     source = (
         Path(__file__).resolve().parents[1] / "src" / "model-vbar.c"
     ).read_text(encoding="utf-8")
-    unpin = source.split("void vbar_unpin_stream", 1)[1]
+    unpin = source.rsplit("void vbar_unpin_stream", 1)[1]
     unpin = unpin.split("\n}\n", 1)[0]
 
     token_snapshot = unpin.index("retirement_token = vbar_consumer_dependency(")
