@@ -7,11 +7,11 @@ library are stored below its private `_vendor` directory. It never installs a
 top-level `comfy_aimdo` file, so the official AIMDO distribution remains
 independently upgradeable.
 
-After building `comfy_aimdo/aimdo_xpu.so` and the canonical wheel, run:
+After building `comfy_aimdo/aimdo_xpu.so` and the canonical 0.5.5 wheel, run:
 
 ```bash
 python packaging/xpu_runtime_provider/build_wheel.py \
-  --source-wheel dist/comfy_aimdo-0.5.3-cp39-abi3-linux_x86_64.whl \
+  --source-wheel dist/comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl \
   --output-dir dist/provider \
   --source-revision "$(git rev-parse HEAD)" \
   --torch-version 2.13.0+xpu \
@@ -22,13 +22,17 @@ The output contains a lightweight
 `comfyui_omnixpu.runtime_providers` entry point and a manifest covering the
 canonical version, exact source revision, source-wheel hash, native-library
 hash, supported runtime, and allocator modes. Importing its metadata does not
-import PyTorch or AIMDO.
-The 0.5.3 provider source declares compatibility with official AIMDO 0.5.3
-and 0.5.5; its provider wheel version remains 0.5.3.
+import PyTorch or AIMDO. The source and provider wheels both use version 0.5.5.
+
+The 0.5.5 XPU provider currently declares Linux support. Windows remains a
+known gap: upstream 0.5.5 adds `storage.fast_disk()` backed by
+`aimdo_storage_fast_disk`, but the XPU Windows DLL and build script do not yet
+provide that symbol. Windows XPU support needs an implementation and a Windows
+build/runtime check before the provider manifest can advertise it.
 
 ComfyUI-OmniXPU activates this provider only when DynamicVRAM is explicitly
 enabled and the official AIMDO attempt has left no live native or allocator
-state. The provider defaults to `native_hook` on Linux and Windows, keeping
+state. The provider defaults to `native_hook` on Linux, keeping
 PyTorch's native XPU allocator. Linux also supports an explicit
 `AIMDO_XPU_ALLOCATOR_MODE=global` override.
 The manifest records supported modes separately from platform defaults.

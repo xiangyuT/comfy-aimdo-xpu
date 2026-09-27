@@ -25,10 +25,7 @@ PROVIDER_PACKAGE = "comfy_aimdo_xpu_runtime"
 PROVIDER_ID = "comfy_aimdo.xpu"
 ENTRY_POINT_GROUP = "comfyui_omnixpu.runtime_providers"
 SOURCE_REPOSITORY = "https://github.com/xiangyuT/comfy-aimdo-xpu.git"
-SUPPORTED_PLATFORMS = ("linux", "win32")
-FORWARD_COMPATIBLE_VERSIONS = {
-    "0.5.3": ("0.5.3", "0.5.5"),
-}
+SUPPORTED_PLATFORMS = ("linux",)
 _REVISION_PATTERN = re.compile(r"[0-9a-f]{40}")
 
 
@@ -169,9 +166,7 @@ def _manifest(
         "provider_package": PROVIDER_PACKAGE,
         "canonical_distribution": {
             "name": CANONICAL_DISTRIBUTION,
-            "compatible_versions": list(
-                FORWARD_COMPATIBLE_VERSIONS.get(source_version, (source_version,))
-            ),
+            "compatible_versions": [source_version],
         },
         "canonical_import": CANONICAL_PACKAGE,
         "source": {
@@ -192,9 +187,8 @@ def _manifest(
             "requires_dynamic_vram": True,
             "allocator_modes": {
                 "linux": ["global", "native_hook"],
-                "win32": ["native_hook"],
             },
-            "default_allocator_modes": {"linux": "native_hook", "win32": "native_hook"},
+            "default_allocator_modes": {"linux": "native_hook"},
         },
         "vendor_root": f"{PROVIDER_PACKAGE}/_vendor",
         "vendored_files": file_hashes,

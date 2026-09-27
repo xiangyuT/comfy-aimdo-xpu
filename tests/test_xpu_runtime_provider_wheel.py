@@ -36,7 +36,7 @@ def _source_wheel(
     *,
     distribution: str = "comfy-aimdo",
     include_native: bool = True,
-    version: str = "0.5.3",
+    version: str = "0.5.5",
 ) -> Path:
     dist_info = f"comfy_aimdo-{version}.dist-info"
     with zipfile.ZipFile(path, "w") as archive:
@@ -67,7 +67,7 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
     monkeypatch.setenv("SOURCE_DATE_EPOCH", "1700000000")
     builder = _load_builder()
     source = _source_wheel(
-        tmp_path / "comfy_aimdo-0.5.3-cp39-abi3-linux_x86_64.whl"
+        tmp_path / "comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl"
     )
 
     provider = builder.build_provider_wheel(
@@ -79,7 +79,7 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
     )
 
     assert provider.name == (
-        "comfy_aimdo_xpu_runtime-0.5.3-cp39-abi3-linux_x86_64.whl"
+        "comfy_aimdo_xpu_runtime-0.5.5-cp39-abi3-linux_x86_64.whl"
     )
     with zipfile.ZipFile(provider) as archive:
         names = set(archive.namelist())
@@ -98,8 +98,9 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
         assert manifest["canonical_import"] == "comfy_aimdo"
         assert manifest["canonical_distribution"] == {
             "name": "comfy-aimdo",
-            "compatible_versions": ["0.5.3", "0.5.5"],
+            "compatible_versions": ["0.5.5"],
         }
+        assert manifest["runtime"]["platforms"] == ["linux"]
         assert manifest["source"]["revision"] == "a" * 40
         assert manifest["source"]["wheel_sha256"] == hashlib.sha256(
             source.read_bytes()
@@ -107,11 +108,8 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
         assert manifest["activation"] == {
             "strategy": "canonical_control_overlay",
             "requires_dynamic_vram": True,
-            "allocator_modes": {
-                "linux": ["global", "native_hook"],
-                "win32": ["native_hook"],
-            },
-            "default_allocator_modes": {"linux": "native_hook", "win32": "native_hook"},
+            "allocator_modes": {"linux": ["global", "native_hook"]},
+            "default_allocator_modes": {"linux": "native_hook"},
         }
         assert manifest["native_artifacts"] == [
             {
@@ -121,12 +119,12 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
         ]
 
         wheel_metadata = archive.read(
-            "comfy_aimdo_xpu_runtime-0.5.3.dist-info/WHEEL"
+            "comfy_aimdo_xpu_runtime-0.5.5.dist-info/WHEEL"
         ).decode()
         assert "Root-Is-Purelib: false" in wheel_metadata
         assert "Tag: cp39-abi3-linux_x86_64" in wheel_metadata
         entry_points = archive.read(
-            "comfy_aimdo_xpu_runtime-0.5.3.dist-info/entry_points.txt"
+            "comfy_aimdo_xpu_runtime-0.5.5.dist-info/entry_points.txt"
         ).decode()
         assert "[comfyui_omnixpu.runtime_providers]" in entry_points
         assert (
@@ -138,7 +136,7 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
             csv.reader(
                 io.StringIO(
                     archive.read(
-                        "comfy_aimdo_xpu_runtime-0.5.3.dist-info/RECORD"
+                    "comfy_aimdo_xpu_runtime-0.5.5.dist-info/RECORD"
                     ).decode()
                 )
             )
@@ -149,7 +147,7 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
 def test_provider_builder_requires_native_xpu_runtime(tmp_path):
     builder = _load_builder()
     source = _source_wheel(
-        tmp_path / "comfy_aimdo-0.5.3-cp39-abi3-linux_x86_64.whl",
+        tmp_path / "comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl",
         include_native=False,
     )
 
@@ -167,7 +165,7 @@ def test_provider_wheel_is_reproducible(tmp_path, monkeypatch):
     monkeypatch.setenv("SOURCE_DATE_EPOCH", "1700000000")
     builder = _load_builder()
     source = _source_wheel(
-        tmp_path / "comfy_aimdo-0.5.3-cp39-abi3-linux_x86_64.whl"
+        tmp_path / "comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl"
     )
     arguments = {
         "source_wheel": source,
