@@ -1,6 +1,20 @@
 from pathlib import Path
 
 
+def test_windows_xpu_build_includes_storage_probe():
+    root = Path(__file__).resolve().parents[1]
+    build = (root / "scripts" / "build-windows-xpu.cmd").read_text(encoding="utf-8")
+    native = (root / "src-win" / "disk-id.c").read_text(encoding="utf-8")
+    wrapper = (root / "comfy_aimdo" / "storage.py").read_text(encoding="utf-8")
+
+    assert "disk-id.c" in build
+    assert "win-disk-id.obj" in build
+    assert "cfgmgr32.lib" in build
+    assert "setupapi.lib" in build
+    assert "int aimdo_storage_fast_disk(" in native
+    assert "lib.aimdo_storage_fast_disk" in wrapper
+
+
 def test_wddm_pressure_uses_current_usage_as_sampled_baseline():
     source = (
         Path(__file__).resolve().parents[1] / "src-win" / "shmem-detect.c"

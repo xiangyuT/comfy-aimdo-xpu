@@ -25,12 +25,11 @@ hash, supported runtime, and allocator modes. Importing its metadata does not
 import PyTorch or AIMDO. The source and provider wheels both use version 0.5.5.
 
 The provider retains its Linux and Windows runtime declarations. Local 0.5.5
-build and install validation covers Linux only. The upstream 0.5.5
-`storage.fast_disk()` API is a known Windows XPU gap: the current XPU DLL and
-build script do not provide its `aimdo_storage_fast_disk` symbol. Importing
-`comfy_aimdo.storage` with the XPU control overlay may therefore fail on
-Windows. That API needs implementation and Windows build/runtime validation;
-the existing Windows allocator route has not been revalidated for 0.5.5.
+build and install validation covers Linux only. The Windows XPU build script
+now includes upstream `disk-id.c` and its required libraries, providing the
+`aimdo_storage_fast_disk` source for `storage.fast_disk()`. A Windows build
+and runtime test are still required before this 0.5.5 API and the existing
+Windows allocator route can be claimed as validated.
 
 ComfyUI-OmniXPU activates this provider only when DynamicVRAM is explicitly
 enabled and the official AIMDO attempt has left no live native or allocator
