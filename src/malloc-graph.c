@@ -1280,3 +1280,14 @@ SHARED_EXPORT void malloc_graph_destroy(void *handle) {
     free_events(g->root.next, g->root.next_count);
     free(g);
 }
+
+/* A built core is not an installed logical-allocation router. */
+SHARED_EXPORT uint32_t malloc_graph_abi_version(void) { return 1; }
+SHARED_EXPORT uint64_t malloc_graph_capabilities(void) { return 1; }
+
+#ifndef AIMDO_SOURCE_REVISION
+#define AIMDO_SOURCE_REVISION "unrecorded"
+#define AIMDO_SOURCE_CONTENT_SHA256 "unrecorded"
+#endif
+SHARED_EXPORT const char *malloc_graph_source_revision(void) { return AIMDO_SOURCE_REVISION; }
+SHARED_EXPORT const char *malloc_graph_source_content_sha256(void) { return AIMDO_SOURCE_CONTENT_SHA256; }

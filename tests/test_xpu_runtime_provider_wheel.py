@@ -5,7 +5,10 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
+import subprocess
 import sys
+import types
 import zipfile
 from pathlib import Path
 
@@ -36,6 +39,7 @@ def _source_wheel(
     *,
     distribution: str = "comfy-aimdo",
     include_native: bool = True,
+    include_compiler_api: bool = False,
     version: str = "0.5.5",
 ) -> Path:
     dist_info = f"comfy_aimdo-{version}.dist-info"
@@ -55,6 +59,9 @@ def _source_wheel(
         )
         archive.writestr("comfy_aimdo/control.py", "lib = None\n")
         archive.writestr("comfy_aimdo/torch.py", "VALUE = 'xpu'\n")
+        if include_compiler_api:
+            for module in ("malloc_graph", "host_buffer", "model_vbar", "vram_buffer"):
+                archive.writestr(f"comfy_aimdo/{module}.py", "VALUE = 'xpu'\n")
         if include_native:
             archive.writestr("comfy_aimdo/aimdo_xpu.so", b"fake-level-zero")
         archive.writestr(f"{dist_info}/RECORD", "")
@@ -81,6 +88,8 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
     assert provider.name == (
         "comfy_aimdo_xpu_runtime-0.5.5-cp39-abi3-linux_x86_64.whl"
     )
+    if os.name == "posix":
+        assert provider.stat().st_mode & 0o777 == 0o644
     with zipfile.ZipFile(provider) as archive:
         names = set(archive.namelist())
         assert not any(name.startswith("comfy_aimdo/") for name in names)
@@ -185,3 +194,42 @@ def test_provider_wheel_is_reproducible(tmp_path, monkeypatch):
     )
 
     assert first.read_bytes() == second.read_bytes()
+
+
+def test_linux_compiler_api_manifest_requires_complete_055_exports(tmp_path, monkeypatch):
+    builder = _load_builder()
+    source = _source_wheel(
+        tmp_path / "comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl",
+        include_compiler_api=True,
+    )
+    monkeypatch.setattr(builder, "shutil", types.SimpleNamespace(which=lambda _: "nm"))
+    monkeypatch.setattr(
+        builder,
+        "subprocess",
+        types.SimpleNamespace(
+            run=lambda command, **kwargs: subprocess.CompletedProcess(
+                command, 0, stdout="\n".join(builder._COMPILER_SYMBOLS)
+            )
+        ),
+    )
+
+    provider = builder.build_provider_wheel(
+        source_wheel=source,
+        output_directory=tmp_path / "dist",
+        source_revision="d" * 40,
+        torch_version="2.13.0+xpu",
+        xpu_target="bmg",
+    )
+    with zipfile.ZipFile(provider) as archive:
+        manifest = json.loads(archive.read("comfy_aimdo_xpu_runtime/provider.json"))
+    assert manifest["canonical_distribution"]["compatible_versions"] == ["0.5.5"]
+    assert manifest["api_compatibility"]["xpu_recording_supported"] is False
+    assert manifest["api_compatibility"]["upstream_reference_revision"] == (
+        "3b8e8c162efeb9470d912609a7a6e7a2b1c693ec"
+    )
+
+    with pytest.raises(RuntimeError, match="reviewed AIMDO 0.5.5"):
+        builder._compiler_api_contract("0.5.2", {
+            "comfy_aimdo/" + module + ".py": b"x"
+            for module in ("control", "torch", "malloc_graph", "host_buffer", "model_vbar", "vram_buffer")
+        } | {"comfy_aimdo/aimdo_xpu.so": b"fake"})

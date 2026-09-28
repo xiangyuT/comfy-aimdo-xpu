@@ -1,7 +1,11 @@
 import contextlib
 import ctypes
+from pathlib import Path
 
 from . import control
+
+if Path(control.__file__).resolve().parent != Path(__file__).resolve().parent:
+    raise ImportError("AIMDO malloc_graph and control must come from the same provider")
 
 
 class MallocGraph:

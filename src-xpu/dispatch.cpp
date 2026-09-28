@@ -9,6 +9,7 @@ extern "C" {
 #else
 #error "Level Zero headers were not found"
 #endif
+#include "vmm-manager.h"
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 #include <sycl/sycl.hpp>
 
@@ -55,6 +56,11 @@ struct XpuDeviceState {
 
 std::mutex g_devices_mutex;
 std::vector<XpuDeviceState> g_devices;
+aimdo_xpu::VmmManager g_vmm;
+
+aimdo_xpu::VmmOwner vmm_owner(const XpuDeviceState &state) {
+    return {state.id, state.context, state.device};
+}
 
 enum XpuStat : size_t {
     kVirtualReserveCalls,
@@ -588,17 +594,16 @@ CUresult xpu_host_unregister(void *) {
     return CUDA_SUCCESS;
 }
 
-CUresult xpu_virtual_reserve(CUdeviceptr *pointer, size_t size, size_t,
-                             CUdeviceptr requested, unsigned long long) {
+CUresult xpu_virtual_reserve(CUdeviceptr *pointer, size_t size, size_t alignment,
+                             CUdeviceptr requested, unsigned long long flags) {
+    std::lock_guard<std::mutex> guard(g_devices_mutex);
     auto *state = current_device();
-    if (!pointer || !state) {
-        return kCudaErrorUnknown;
-    }
-    void *address = reinterpret_cast<void *>(requested);
-    const ze_result_t result = zeVirtualMemReserve(
-        state->context, address, size, &address);
+    if (!pointer || !state) return kCudaErrorUnknown;
+    uintptr_t address = 0;
+    const auto result = g_vmm.reserve(vmm_owner(*state), &address, size,
+                                       alignment, requested, flags);
     if (result == ZE_RESULT_SUCCESS) {
-        *pointer = reinterpret_cast<CUdeviceptr>(address);
+        *pointer = address;
         g_stats[kVirtualReserveCalls].fetch_add(1, std::memory_order_relaxed);
         g_stats[kVirtualReserveBytes].fetch_add(size, std::memory_order_relaxed);
     }
@@ -606,137 +611,82 @@ CUresult xpu_virtual_reserve(CUdeviceptr *pointer, size_t size, size_t,
 }
 
 CUresult xpu_virtual_free(CUdeviceptr pointer, size_t size) {
+    std::lock_guard<std::mutex> guard(g_devices_mutex);
     auto *state = current_device();
-    return state
-               ? from_ze(zeVirtualMemFree(
-                     state->context, reinterpret_cast<void *>(pointer), size))
-               : kCudaErrorUnknown;
+    return state ? from_ze(g_vmm.free(vmm_owner(*state), pointer, size)) : kCudaErrorUnknown;
 }
 
 CUresult xpu_physical_create(CUmemGenericAllocationHandle *handle, size_t size,
                              const CUmemAllocationProp *properties,
-                             unsigned long long) {
-    const int device_id = properties ? properties->location.id
-                                     : aimdo_xpu_current_device();
-    auto *state = find_device(device_id);
-    if (!handle || !state) {
+                             unsigned long long flags) {
+    std::lock_guard<std::mutex> guard(g_devices_mutex);
+    auto *state = current_device();
+    if (!handle || !state || !properties || flags ||
+        properties->type != CU_MEM_ALLOCATION_TYPE_PINNED ||
+        properties->requestedHandleTypes != CU_MEM_HANDLE_TYPE_NONE ||
+        properties->location.type != CU_MEM_LOCATION_TYPE_DEVICE ||
+        properties->location.id != state->id || properties->win32HandleMetaData ||
+        properties->allocFlags.compressionType || properties->allocFlags.gpuDirectRDMACapable ||
+        properties->allocFlags.usage ||
+        std::any_of(std::begin(properties->allocFlags.reserved),
+                    std::end(properties->allocFlags.reserved), [](auto x) { return x != 0; }))
         return kCudaErrorUnknown;
-    }
-
-    size_t page_size = 0;
-    ze_result_t result = zeVirtualMemQueryPageSize(
-        state->context, state->device, size, &page_size);
-    if (result != ZE_RESULT_SUCCESS || !page_size || size % page_size != 0) {
-        return result == ZE_RESULT_SUCCESS ? kCudaErrorUnknown : from_ze(result);
-    }
-
-    ze_physical_mem_desc_t description{
-        ZE_STRUCTURE_TYPE_PHYSICAL_MEM_DESC,
-        nullptr,
-        ZE_PHYSICAL_MEM_FLAG_ALLOCATE_ON_DEVICE,
-        size,
-    };
     ze_physical_mem_handle_t physical = nullptr;
-    result = zePhysicalMemCreate(
-        state->context, state->device, &description, &physical);
+    const auto result = g_vmm.create(vmm_owner(*state), &physical, size);
     if (result == ZE_RESULT_SUCCESS) {
-        *handle = static_cast<CUmemGenericAllocationHandle>(
-            reinterpret_cast<uintptr_t>(physical));
+        *handle = reinterpret_cast<uintptr_t>(physical);
         g_stats[kPhysicalCreateCalls].fetch_add(1, std::memory_order_relaxed);
         g_stats[kPhysicalCreateBytes].fetch_add(size, std::memory_order_relaxed);
-    } else {
-        std::fprintf(
-            stderr,
-            "[AIMDO XPU VMM] zePhysicalMemCreate failed: ze_result=0x%x "
-            "context=%p device=%p size=%zu page_size=%zu\n",
-            static_cast<unsigned int>(result), state->context, state->device,
-            size, page_size);
-        std::fflush(stderr);
     }
     return from_ze(result);
 }
 
 CUresult xpu_virtual_map(CUdeviceptr pointer, size_t size, size_t offset,
                          CUmemGenericAllocationHandle handle,
-                         unsigned long long) {
+                         unsigned long long flags) {
+    std::lock_guard<std::mutex> guard(g_devices_mutex);
     auto *state = current_device();
-    if (!state) {
-        return kCudaErrorUnknown;
-    }
-    const ze_result_t result = zeVirtualMemMap(
-        state->context, reinterpret_cast<void *>(pointer), size,
-        reinterpret_cast<ze_physical_mem_handle_t>(
-            static_cast<uintptr_t>(handle)),
-        offset, ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE);
+    if (!state) return kCudaErrorUnknown;
+    const auto result = g_vmm.map(vmm_owner(*state), pointer, size,
+        reinterpret_cast<ze_physical_mem_handle_t>(static_cast<uintptr_t>(handle)), offset, flags);
     if (result == ZE_RESULT_SUCCESS) {
         g_stats[kMapCalls].fetch_add(1, std::memory_order_relaxed);
         g_stats[kMapBytes].fetch_add(size, std::memory_order_relaxed);
-    } else {
-        size_t page_size = 0;
-        const ze_result_t query_result = zeVirtualMemQueryPageSize(
-            state->context, state->device, size, &page_size);
-        std::fprintf(
-            stderr,
-            "[AIMDO XPU VMM] zeVirtualMemMap failed: ze_result=0x%x "
-            "context=%p device=%p handle=%p address=%p size=%zu "
-            "offset=%zu page_size=%zu page_query_result=0x%x\n",
-            static_cast<unsigned int>(result), state->context, state->device,
-            reinterpret_cast<void *>(static_cast<uintptr_t>(handle)),
-            reinterpret_cast<void *>(pointer), size, offset, page_size,
-            static_cast<unsigned int>(query_result));
-        std::fflush(stderr);
     }
     return from_ze(result);
 }
 
-CUresult xpu_virtual_set_access(CUdeviceptr, size_t,
-                                const CUmemAccessDesc *, size_t) {
-    // Access is selected atomically with zeVirtualMemMap above.
-    return CUDA_SUCCESS;
+CUresult xpu_virtual_set_access(CUdeviceptr pointer, size_t size,
+                                const CUmemAccessDesc *desc, size_t count) {
+    std::lock_guard<std::mutex> guard(g_devices_mutex);
+    auto *state = current_device();
+    if (!state || !desc || count != 1 ||
+        desc->location.type != CU_MEM_LOCATION_TYPE_DEVICE ||
+        desc->location.id != state->id || desc->flags != CU_MEM_ACCESS_FLAGS_PROT_READWRITE)
+        return kCudaErrorUnknown;
+    return from_ze(g_vmm.access(vmm_owner(*state), pointer, size));
 }
 
 CUresult xpu_virtual_unmap(CUdeviceptr pointer, size_t size) {
+    std::lock_guard<std::mutex> guard(g_devices_mutex);
     auto *state = current_device();
-    if (!state) {
-        return kCudaErrorUnknown;
-    }
-    const ze_result_t result = zeVirtualMemUnmap(
-        state->context, reinterpret_cast<void *>(pointer), size);
+    if (!state) return kCudaErrorUnknown;
+    const auto result = g_vmm.unmap(vmm_owner(*state), pointer, size);
     if (result == ZE_RESULT_SUCCESS) {
         g_stats[kUnmapCalls].fetch_add(1, std::memory_order_relaxed);
         g_stats[kUnmapBytes].fetch_add(size, std::memory_order_relaxed);
-    } else {
-        std::fprintf(
-            stderr,
-            "[AIMDO XPU VMM] zeVirtualMemUnmap failed: ze_result=0x%x "
-            "context=%p address=%p size=%zu\n",
-            static_cast<unsigned int>(result), state->context,
-            reinterpret_cast<void *>(pointer), size);
-        std::fflush(stderr);
     }
     return from_ze(result);
 }
 
 CUresult xpu_physical_release(CUmemGenericAllocationHandle handle) {
+    std::lock_guard<std::mutex> guard(g_devices_mutex);
     auto *state = current_device();
-    if (!state) {
-        return kCudaErrorUnknown;
-    }
-    const ze_result_t result = zePhysicalMemDestroy(
-        state->context,
-        reinterpret_cast<ze_physical_mem_handle_t>(
-            static_cast<uintptr_t>(handle)));
-    if (result == ZE_RESULT_SUCCESS) {
+    if (!state) return kCudaErrorUnknown;
+    const auto result = g_vmm.destroy(vmm_owner(*state),
+        reinterpret_cast<ze_physical_mem_handle_t>(static_cast<uintptr_t>(handle)));
+    if (result == ZE_RESULT_SUCCESS)
         g_stats[kPhysicalReleaseCalls].fetch_add(1, std::memory_order_relaxed);
-    } else {
-        std::fprintf(
-            stderr,
-            "[AIMDO XPU VMM] zePhysicalMemDestroy failed: ze_result=0x%x "
-            "context=%p handle=%p\n",
-            static_cast<unsigned int>(result), state->context,
-            reinterpret_cast<void *>(static_cast<uintptr_t>(handle)));
-        std::fflush(stderr);
-    }
     return from_ze(result);
 }
 
@@ -1501,13 +1451,15 @@ AIMDO_XPU_EXPORT bool xpu_set_queues(
     if (!device_ids || !queue_pointers || count == 0) {
         return false;
     }
+    std::lock_guard<std::mutex> device_guard(g_devices_mutex);
+    uint64_t owned[7]{};
+    if (!g_vmm.snapshot(owned, 7) || owned[0] || owned[1] || owned[2]) return false;
     /* A re-init must drain and detach the old queue/context registry before
      * replacing device identities. */
     if (!aimdo_xpu_retire_reset()) {
         return false;
     }
     try {
-        std::lock_guard<std::mutex> guard(g_devices_mutex);
         g_devices.clear();
         for (auto &stat : g_stats) {
             stat.store(0, std::memory_order_relaxed);
@@ -1695,6 +1647,10 @@ aimdo_xpu_needs_small_vbar_copy_workaround(int device) {
 AIMDO_XPU_EXPORT int xpu_device_from_native_handle(
     uintptr_t native_handle) {
     return device_from_native_handle(native_handle);
+}
+
+AIMDO_XPU_EXPORT bool xpu_get_vmm_ownership(uint64_t *values, size_t count) {
+    return g_vmm.snapshot(values, count);
 }
 
 AIMDO_XPU_EXPORT bool xpu_get_vmm_stats(

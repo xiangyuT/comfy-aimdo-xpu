@@ -24,6 +24,77 @@ _xpu_oom_history = []
 _XPU_OOM_HISTORY_LIMIT = 4
 _XPU_OOM_SNAPSHOT_INTERVAL_SECONDS = 2.0
 _xpu_oom_last_snapshot_monotonic = {}
+_memory_compiler_native = None
+
+_MEMORY_COMPILER_SIGNATURES = {
+    "malloc_graph_create": ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool], ctypes.c_void_p),
+    "malloc_graph_push": ([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_bool),
+    "malloc_graph_pause": ([ctypes.c_void_p, ctypes.c_bool, ctypes.c_bool], ctypes.c_bool),
+    "malloc_graph_set_stream": ([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_bool),
+    "malloc_graph_pop": ([ctypes.c_void_p], ctypes.c_int),
+    "malloc_graph_abort": ([ctypes.c_void_p], ctypes.c_bool),
+    "malloc_graph_stat": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_uint64),
+    "malloc_graph_destroy": ([ctypes.c_void_p], None),
+}
+
+
+def _bind_memory_compiler(library, backend):
+    """Validate the whole ABI before installing any allocator callback."""
+    missing = [name for name in _MEMORY_COMPILER_SIGNATURES if not hasattr(library, name)]
+    if missing:
+        if backend == "xpu" and platform.system() == "Linux":
+            raise RuntimeError("AIMDO memory compiler ABI missing: " + ", ".join(missing))
+        return None
+    for name, (arguments, result) in _MEMORY_COMPILER_SIGNATURES.items():
+        function = getattr(library, name)
+        function.argtypes, function.restype = arguments, result
+    abi = flags = None
+    identity = {"source_revision": None, "source_content_sha256": None}
+    if backend == "xpu" or hasattr(library, "malloc_graph_abi_version"):
+        library.malloc_graph_abi_version.argtypes = []
+        library.malloc_graph_abi_version.restype = ctypes.c_uint32
+        library.malloc_graph_capabilities.argtypes = []
+        library.malloc_graph_capabilities.restype = ctypes.c_uint64
+        abi = int(library.malloc_graph_abi_version())
+        flags = int(library.malloc_graph_capabilities())
+        if abi != 1 or flags != 1:
+            raise RuntimeError(f"unsupported AIMDO memory compiler ABI/capabilities: {abi}/{flags}")
+        for field in identity:
+            function = getattr(library, "malloc_graph_" + field)
+            function.argtypes, function.restype = [], ctypes.c_char_p
+            identity[field] = function().decode("ascii")
+    return {"abi_revision": abi, "feature_bits": flags, "symbols_complete": True,
+            "router_available": flags is None and backend in ("cuda", "rocm"), **identity}
+
+
+def get_memory_compiler_capability():
+    """Query support without loading a library or initializing a device.
+
+    ABI/core availability and execution eligibility are independent. The XPU
+    logical-allocation router is not installed in this build.
+    """
+    import hashlib
+
+    native = _memory_compiler_native if lib is not None else None
+    available = bool(native and native["router_available"])
+    reason = ("not_initialized" if lib is None else
+              "logical_allocator_router_unavailable" if native and not available else
+              "native_abi_unavailable" if not native else None)
+    path = Path(lib._name).resolve() if lib is not None else None
+    return {
+        "schema_version": 1, "backend": implementation,
+        "platform": platform.system(), "allocator_mode": _xpu_allocator_mode,
+        "core_built": bool(native), "abi_revision": native["abi_revision"] if native else None,
+        "native_symbols_complete": bool(native),
+        "source_revision": native["source_revision"] if native else None,
+        "source_content_sha256": native["source_content_sha256"] if native else None,
+        "native_path": str(path) if path else None,
+        "native_sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path and path.is_file() else None,
+        "memory_only": available, "available": available, "reason": reason,
+        "logical_allocation_tracking": available,
+        "execution_graph": False, "xpu_consumer_tracking": False,
+    }
+
 
 _LOG_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p)
 _LOG_LEVELS = {
@@ -169,6 +240,7 @@ def init(
     global _torch_xpu_empty_cache_original
     global _torch_xpu_memory_stats_original
     global _torch_xpu_reset_peak_stats_original
+    global _memory_compiler_native
 
     if lib is not None:
         if xpu_allocator_mode is not None:
@@ -240,6 +312,8 @@ def init(
 
     try:
         base_path = Path(__file__).parent.resolve()
+        if implementation == "xpu" and not (base_path / "malloc_graph.py").is_file():
+            raise RuntimeError("AIMDO XPU provider is missing its own malloc_graph module")
         system = platform.system()
         if system == "Windows":
             if implementation == "xpu":
@@ -253,7 +327,10 @@ def init(
             logging.info(f"comfy-aimdo unsupported operating system: {system}")
             logging.info(f"NOTE: comfy-aimdo currently only supports Windows and Linux")
             return False
-        lib = ctypes.CDLL(str(base_path / f"{impl}.{ext}"), mode=mode)
+        candidate_lib = ctypes.CDLL(str(base_path / f"{impl}.{ext}"), mode=mode)
+        compiler_native = _bind_memory_compiler(candidate_lib, implementation)
+        lib = candidate_lib
+        _memory_compiler_native = compiler_native
     except Exception as e:
         logging.info(f"comfy-aimdo failed to load: {e}")
         logging.info(f"NOTE: comfy-aimdo currently only supports Nvidia, AMD, and Intel XPU GPUs")
@@ -486,11 +563,10 @@ def init_devices(device_ids):
 
     if lib is None:
         return False
-    if implementation == "xpu" and not _xpu_allocator_ready:
-        return False
-
     if devctxs:
         logging.warning("comfy-aimdo devices are already initialized, call deinit() first")
+        return False
+    if implementation == "xpu" and not _xpu_allocator_ready:
         return False
 
     requested = []
@@ -600,6 +676,7 @@ def get_simple_vram_headroom():
 
 def deinit():
     global lib, devctxs, _log_callback, _xpu_allocator_ready
+    global _memory_compiler_native
     if lib is not None:
         if implementation == "xpu" and _xpu_allocator_ready:
             if _xpu_allocator_mode == "native_hook":
@@ -625,6 +702,7 @@ def deinit():
         lib.set_log_callback(ctypes.cast(None, _LOG_CALLBACK))
         _log_callback = None
     lib = None
+    _memory_compiler_native = None
     globals()["implementation"] = None
     _xpu_allocator_ready = False
 

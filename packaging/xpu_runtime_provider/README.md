@@ -31,6 +31,23 @@ now includes upstream `disk-id.c` and its required libraries, providing the
 and runtime test are still required before this 0.5.5 API and the existing
 Windows allocator route can be claimed as validated.
 
+For a Linux source wheel containing `malloc_graph.py`, the builder requires the
+complete provider module set and all twelve compiler ABI/provenance exports in
+`aimdo_xpu.so`. This D1 source declares compatibility only with the reviewed
+official `0.5.5` API, imported at
+`3b8e8c162efeb9470d912609a7a6e7a2b1c693ec`. The provider distribution
+keeps the source wheel's existing version. Source revision and native content
+hashes identify development changes independently of that version. Windows
+provider packaging retains its previous exact-version behavior until its native
+compiler build receives separate validation.
+
+`control.get_memory_compiler_capability()` reports the built core separately
+from runtime availability. XPU recording remains unavailable until a logical
+allocation router and its lifetime contract are implemented and validated;
+explicit `record(xpu_stream)` raises an unsupported error. `malloc_graph` and
+`control` must resolve to the same provider directory. A missing local module or
+native ABI prevents Linux XPU initialization before allocator installation.
+
 ComfyUI-OmniXPU activates this provider only when DynamicVRAM is explicitly
 enabled and the official AIMDO attempt has left no live native or allocator
 state. The provider defaults to `native_hook` on Linux and Windows, keeping

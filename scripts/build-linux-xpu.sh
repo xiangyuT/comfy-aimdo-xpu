@@ -3,8 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-BUILD_DIR="$ROOT_DIR/build/xpu"
-OUTPUT_PATH="$ROOT_DIR/comfy_aimdo/aimdo_xpu.so"
+BUILD_DIR="${AIMDO_XPU_BUILD_DIR:-$ROOT_DIR/build/xpu}"
+OUTPUT_PATH="${AIMDO_XPU_OUTPUT_PATH:-$ROOT_DIR/comfy_aimdo/aimdo_xpu.so}"
 CC=${CC:-gcc}
 CXX=${CXX:-icpx}
 UR_INCLUDE_DIR=${UR_INCLUDE_DIR:-}
@@ -20,6 +20,10 @@ fi
 
 mkdir -p "$BUILD_DIR"
 
+# Source identity is independent of owner-controlled distribution versions.
+# Hash tracked and new source inputs; the build tree is ignored by Git.
+python3 "$ROOT_DIR/scripts/write-source-identity.py" "$ROOT_DIR" "$BUILD_DIR/xpu-source-identity.h"
+
 COMMON_SOURCES=(
     control.c
     debug.c
@@ -27,6 +31,9 @@ COMMON_SOURCES=(
     hostbuf-file-reader.c
     hostbuf-prewarm.c
     hostbuf.c
+    malloc-graph.c
+    malloc-rogue.c
+    vmm-ref.c
     model-vbar.c
     pyt-cu-plug-alloc.c
     pyt-cu-plug-alloc-async.c
@@ -45,6 +52,7 @@ for source in "${COMMON_SOURCES[@]}"; do
     object="$BUILD_DIR/${source%.c}.o"
     "$CC" -c -o "$object" -fPIC -O2 -g -pthread -DAIMDO_XPU \
         ${AIMDO_EXTRA_CFLAGS:-} \
+        -include "$BUILD_DIR/xpu-source-identity.h" \
         "$ROOT_DIR/src/$source" -I"$ROOT_DIR/src"
     OBJECTS+=("$object")
 done

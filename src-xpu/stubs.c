@@ -1,23 +1,7 @@
 #include "plat.h"
 
-/* The XPU allocator does not record or replay allocation graphs. Keep the
- * shared allocator/VBAR call sites on their ordinary allocation and
- * synchronization paths without linking the CUDA/HIP memory compiler. */
-bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
-    return false;
-}
-
-bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
-    return false;
-}
-
-bool malloc_graph_sync_paused(void) {
-    return false;
-}
-
-bool free_rogue(CUdeviceptr ptr, int *result) {
-    return false;
-}
+/* The shared memory compiler core supplies its public entry points. XPU
+ * recording remains unavailable until a logical-allocation router exists. */
 
 #if !defined(_WIN32) && !defined(_WIN64)
 bool aimdo_setup_hooks(void) {
