@@ -70,6 +70,13 @@ stage. The checked destroy retains unfinished owners for an owner-thread retry.
 This exercises its recovery contract without claiming a real driver unmap or
 physical-release failure was observed.
 
+For a separate completed-graph Linux diagnostic, the XPU VMM adapter can
+return one OOM or device-lost code at the Level Zero unmap, physical destroy
+or virtual free function-pointer boundary. The core and VMM manager then take
+their normal error path. This tests metadata retention after earlier cleanup
+stages have succeeded; it still does not mean the hardware driver itself
+returned an error or mutated the targeted primitive before failing.
+
 Linux native mode keeps Torch's allocator, statistics and cache-management APIs.
 At model prioritization, Python publishes a cached-byte estimate to the hook.
 A budget deficit uses Torch's cache-release retry only when that estimate is

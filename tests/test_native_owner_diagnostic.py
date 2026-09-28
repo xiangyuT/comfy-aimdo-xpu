@@ -118,6 +118,44 @@ def test_destroy_release_injection_is_owner_thread_and_stage_bound(monkeypatch):
                                native_owner.ctypes.c_uint]
 
 
+def test_driver_release_error_injection_requires_completed_owner_graph(monkeypatch):
+    calls = []
+
+    def arm(handle, stage, error_kind):
+        calls.append((handle.value, stage, error_kind))
+        return (stage, error_kind) == (1, 2)
+
+    def pending():
+        return 3
+
+    library = SimpleNamespace(
+        malloc_graph_test_arm_driver_release=arm,
+        aimdo_xpu_test_pending_vmm_release=pending,
+    )
+    graph = SimpleNamespace(_native_lib=library, _handle=456,
+                            _owner_thread=threading.current_thread())
+    monkeypatch.setattr(native_owner, "_library",
+                        SimpleNamespace(aimdo_full_proxy_is_installed=lambda: True))
+    monkeypatch.setattr(control, "lib", library)
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "get_xpu_allocator_mode", lambda: "native_hook")
+    for stage, kind in ((0, 1), (4, 1), (1, 0), (1, 3), (True, 1), (1, True)):
+        with pytest.raises(ValueError, match="stage must be 1-3"):
+            native_owner.inject_driver_release_error(graph, stage, kind)
+    native_owner.inject_driver_release_error(graph, 1, 2)
+    with pytest.raises(RuntimeError, match="not eligible"):
+        native_owner.inject_driver_release_error(graph, 2, 1)
+    assert native_owner.pending_driver_release_error() == 3
+    graph._owner_thread = threading.Thread()
+    with pytest.raises(RuntimeError, match="requires an owner-thread"):
+        native_owner.inject_driver_release_error(graph, 1, 2)
+    assert calls == [(456, 1, 2), (456, 2, 1)]
+    assert arm.argtypes == [native_owner.ctypes.c_void_p,
+                            native_owner.ctypes.c_uint,
+                            native_owner.ctypes.c_uint]
+    assert pending.restype == native_owner.ctypes.c_uint
+
+
 def test_scoped_raw_owner_diagnostics(monkeypatch):
     def snapshot(values, count):
         assert count == 5

@@ -1077,6 +1077,17 @@ SHARED_EXPORT bool malloc_graph_test_fail_next_destroy_release(void *handle,
     return true;
 }
 
+SHARED_EXPORT bool malloc_graph_test_arm_driver_release(void *handle,
+                                                         unsigned stage,
+                                                         unsigned error_kind) {
+    MallocGraph *g = handle;
+    if (!g || g->owner_thread != &active_graph || !g->complete || g->state ||
+        stage < 1 || stage > 3 || error_kind < 1 || error_kind > 2) {
+        return false;
+    }
+    return aimdo_xpu_test_arm_vmm_release(stage, error_kind);
+}
+
 SHARED_EXPORT bool malloc_graph_free_owned(CUdeviceptr ptr, CUstream owner_stream,
                                            int *result) {
     MallocGraph *g = active_graph;

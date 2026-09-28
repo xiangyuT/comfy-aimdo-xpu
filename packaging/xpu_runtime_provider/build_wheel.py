@@ -48,6 +48,8 @@ _NATIVE_OWNER_CORE_SYMBOLS = (
     "malloc_graph_free_owned", "malloc_graph_test_fail_next_page_creates",
     "malloc_graph_destroy_checked",
     "malloc_graph_test_fail_next_destroy_release",
+    "malloc_graph_test_arm_driver_release",
+    "aimdo_xpu_test_arm_vmm_release", "aimdo_xpu_test_pending_vmm_release",
 )
 
 

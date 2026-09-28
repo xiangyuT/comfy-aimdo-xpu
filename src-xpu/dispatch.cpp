@@ -56,7 +56,43 @@ struct XpuDeviceState {
 
 std::mutex g_devices_mutex;
 std::vector<XpuDeviceState> g_devices;
-aimdo_xpu::VmmManager g_vmm;
+thread_local unsigned g_test_vmm_release_stage = 0;
+thread_local ze_result_t g_test_vmm_release_error =
+    ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
+
+bool take_test_vmm_release_failure(unsigned stage) {
+    if (g_test_vmm_release_stage != stage) return false;
+    g_test_vmm_release_stage = 0;
+    return true;
+}
+
+ze_result_t ZE_APICALL test_virtual_free(ze_context_handle_t context,
+                                        const void *pointer, size_t size) {
+    if (take_test_vmm_release_failure(3)) return g_test_vmm_release_error;
+    return zeVirtualMemFree(context, pointer, size);
+}
+
+ze_result_t ZE_APICALL test_physical_destroy(
+    ze_context_handle_t context, ze_physical_mem_handle_t handle) {
+    if (take_test_vmm_release_failure(2)) return g_test_vmm_release_error;
+    return zePhysicalMemDestroy(context, handle);
+}
+
+ze_result_t ZE_APICALL test_virtual_unmap(ze_context_handle_t context,
+                                         const void *pointer, size_t size) {
+    if (take_test_vmm_release_failure(1)) return g_test_vmm_release_error;
+    return zeVirtualMemUnmap(context, pointer, size);
+}
+
+aimdo_xpu::VmmApi diagnostic_vmm_api() {
+    aimdo_xpu::VmmApi calls;
+    calls.free = test_virtual_free;
+    calls.destroy = test_physical_destroy;
+    calls.unmap = test_virtual_unmap;
+    return calls;
+}
+
+aimdo_xpu::VmmManager g_vmm(diagnostic_vmm_api());
 
 aimdo_xpu::VmmOwner vmm_owner(const XpuDeviceState &state) {
     return {state.id, state.context, state.device};
@@ -1651,6 +1687,20 @@ AIMDO_XPU_EXPORT int xpu_device_from_native_handle(
 
 AIMDO_XPU_EXPORT bool xpu_get_vmm_ownership(uint64_t *values, size_t count) {
     return g_vmm.snapshot(values, count);
+}
+
+AIMDO_XPU_EXPORT bool aimdo_xpu_test_arm_vmm_release(
+    unsigned stage, unsigned error_kind) {
+    if (stage < 1 || stage > 3 || error_kind < 1 || error_kind > 2 ||
+        g_test_vmm_release_stage) return false;
+    g_test_vmm_release_error = error_kind == 1
+        ? ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY : ZE_RESULT_ERROR_DEVICE_LOST;
+    g_test_vmm_release_stage = stage;
+    return true;
+}
+
+AIMDO_XPU_EXPORT unsigned aimdo_xpu_test_pending_vmm_release(void) {
+    return g_test_vmm_release_stage;
 }
 
 AIMDO_XPU_EXPORT bool xpu_get_vmm_stats(
