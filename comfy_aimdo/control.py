@@ -243,6 +243,13 @@ def init(
     global _memory_compiler_native
 
     if lib is not None:
+        if globals()["implementation"] == "xpu":
+            from . import native_owner
+
+            if native_owner.requested() != native_owner.installed():
+                raise RuntimeError(
+                    "native-owner diagnostic installation cannot change after initialization"
+                )
         if xpu_allocator_mode is not None:
             requested_mode = _normalize_xpu_allocator_mode(xpu_allocator_mode)
             if implementation == "xpu" or globals()["implementation"] == "xpu":
@@ -271,6 +278,19 @@ def init(
         requested_xpu_allocator_mode = _normalize_xpu_allocator_mode(
             xpu_allocator_mode
         )
+        from . import native_owner
+
+        native_owner_requested = native_owner.requested()
+        if native_owner_requested and platform.system() != "Linux":
+            raise RuntimeError("native-owner diagnostic is Linux-only")
+        if native_owner_requested and requested_xpu_allocator_mode != "native_hook":
+            raise RuntimeError(
+                "native-owner diagnostic requires the XPU native_hook mode"
+            )
+        if native_owner.installed() and not native_owner_requested:
+            raise RuntimeError(
+                "native-owner diagnostic cannot be disabled in this process"
+            )
     elif xpu_allocator_mode is not None:
         raise ValueError(
             "xpu_allocator_mode is valid only for the XPU implementation"
@@ -518,6 +538,8 @@ def init(
                     torch.xpu.reset_peak_memory_stats = (
                         aimdo_xpu_reset_peak_memory_stats
                     )
+                if native_owner_requested:
+                    native_owner.install(torch)
             elif requested_xpu_allocator_mode != _xpu_allocator_mode:
                 raise RuntimeError(
                     "AIMDO XPU allocator mode cannot change after installation"

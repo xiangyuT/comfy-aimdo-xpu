@@ -40,6 +40,7 @@ def _source_wheel(
     distribution: str = "comfy-aimdo",
     include_native: bool = True,
     include_compiler_api: bool = False,
+    include_native_owner: bool = False,
     version: str = "0.5.5",
 ) -> Path:
     dist_info = f"comfy_aimdo-{version}.dist-info"
@@ -62,6 +63,9 @@ def _source_wheel(
         if include_compiler_api:
             for module in ("malloc_graph", "host_buffer", "model_vbar", "vram_buffer"):
                 archive.writestr(f"comfy_aimdo/{module}.py", "VALUE = 'xpu'\n")
+        if include_native_owner:
+            archive.writestr("comfy_aimdo/native_owner.py", "VALUE = 'diagnostic'\n")
+            archive.writestr("comfy_aimdo/aimdo_xpu_native_owner.so", b"fake-native-owner")
         if include_native:
             archive.writestr("comfy_aimdo/aimdo_xpu.so", b"fake-level-zero")
         archive.writestr(f"{dist_info}/RECORD", "")
@@ -233,3 +237,45 @@ def test_linux_compiler_api_manifest_requires_complete_055_exports(tmp_path, mon
             "comfy_aimdo/" + module + ".py": b"x"
             for module in ("control", "torch", "malloc_graph", "host_buffer", "model_vbar", "vram_buffer")
         } | {"comfy_aimdo/aimdo_xpu.so": b"fake"})
+
+
+def test_torch214_native_owner_sidecar_is_explicit_and_version_bound(tmp_path, monkeypatch):
+    builder = _load_builder()
+    source = _source_wheel(
+        tmp_path / "comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl",
+        include_compiler_api=True, include_native_owner=True,
+    )
+    monkeypatch.setattr(builder, "shutil", types.SimpleNamespace(which=lambda _: "nm"))
+    monkeypatch.setattr(
+        builder, "subprocess",
+        types.SimpleNamespace(run=lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0,
+            stdout="\n".join((*builder._COMPILER_SYMBOLS, *builder._NATIVE_OWNER_SYMBOLS)),
+        )),
+    )
+    provider = builder.build_provider_wheel(
+        source_wheel=source, output_directory=tmp_path / "provider",
+        source_revision="e" * 40, torch_version="2.14.0+xpu", xpu_target="bmg",
+    )
+    with zipfile.ZipFile(provider) as archive:
+        names = set(archive.namelist())
+        manifest = json.loads(archive.read("comfy_aimdo_xpu_runtime/provider.json"))
+    sidecar = "comfy_aimdo_xpu_runtime/_vendor/comfy_aimdo/aimdo_xpu_native_owner.so"
+    diagnostic = manifest["native_owner_diagnostic"]
+    assert sidecar in names
+    assert diagnostic == {
+        "enabled_by_default": False,
+        "environment_flag": "AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC",
+        "torch_version": "2.14.0+xpu",
+        "path": sidecar,
+        "sha256": hashlib.sha256(b"fake-native-owner").hexdigest(),
+    }
+    assert manifest["api_compatibility"]["xpu_recording_supported"] is False
+    assert {item["path"] for item in manifest["native_artifacts"]} == {
+        "comfy_aimdo_xpu_runtime/_vendor/comfy_aimdo/aimdo_xpu.so", sidecar,
+    }
+    with pytest.raises(RuntimeError, match="requires AIMDO 0.5.5 and Torch 2.14.0"):
+        builder.build_provider_wheel(
+            source_wheel=source, output_directory=tmp_path / "wrong-torch",
+            source_revision="e" * 40, torch_version="2.13.0+xpu", xpu_target="bmg",
+        )

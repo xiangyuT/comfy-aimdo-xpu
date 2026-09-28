@@ -89,3 +89,41 @@ OBJECTS+=("$BUILD_DIR/xpu-ur-usm-hook.o")
     -Wl,--version-script="$ROOT_DIR/src-xpu/ur-usm-hook.map"
 
 echo "built $OUTPUT_PATH"
+
+# The Torch-facing D2 owner is a separate, opt-in diagnostic DSO. The normal
+# 0.5.5 XPU build and its public compiler capability remain unchanged.
+NATIVE_OWNER_DIAGNOSTIC=${AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC:-0}
+case "$NATIVE_OWNER_DIAGNOSTIC" in
+    0) ;;
+    1)
+        TORCH_PYTHON=${AIMDO_TORCH_PYTHON:-python3}
+        TORCH_ROOT=$("$TORCH_PYTHON" -c '
+import pathlib
+import torch
+if torch.__version__ != "2.14.0+xpu" or not torch._C._GLIBCXX_USE_CXX11_ABI:
+    raise SystemExit("native-owner diagnostic requires Torch 2.14.0+xpu with CXX11 ABI")
+print(pathlib.Path(torch.__file__).resolve().parent)
+')
+        TORCH_INCLUDE="$TORCH_ROOT/include"
+        TORCH_LIB="$TORCH_ROOT/lib"
+        if [ ! -f "$TORCH_INCLUDE/c10/xpu/XPUCachingAllocator.h" ] || \
+           [ ! -f "$TORCH_LIB/libc10_xpu.so" ]; then
+            echo "Torch 2.14 XPU headers or libc10_xpu.so are missing" >&2
+            exit 1
+        fi
+        NATIVE_OWNER_OUTPUT_PATH="${AIMDO_XPU_NATIVE_OWNER_OUTPUT_PATH:-$ROOT_DIR/comfy_aimdo/aimdo_xpu_native_owner.so}"
+        mkdir -p "$(dirname -- "$NATIVE_OWNER_OUTPUT_PATH")"
+        "$CXX" -std=c++20 -fsycl -shared -fPIC -O2 \
+            -D_GLIBCXX_USE_CXX11_ABI=1 \
+            ${AIMDO_EXTRA_CXXFLAGS:-} \
+            -I"$TORCH_INCLUDE" \
+            "$ROOT_DIR/src-xpu/native-owner-proxy.cpp" \
+            -L"$TORCH_LIB" -lc10_xpu -lc10 -ldl \
+            -o "$NATIVE_OWNER_OUTPUT_PATH"
+        echo "built diagnostic $NATIVE_OWNER_OUTPUT_PATH"
+        ;;
+    *)
+        echo "AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC must be 0 or 1" >&2
+        exit 1
+        ;;
+esac

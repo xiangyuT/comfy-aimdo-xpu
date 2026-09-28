@@ -36,6 +36,11 @@ _COMPILER_SYMBOLS = (
     "malloc_graph_capabilities", "malloc_graph_source_revision",
     "malloc_graph_source_content_sha256",
 )
+_NATIVE_OWNER_SYMBOLS = (
+    "aimdo_full_proxy_torch_version", "aimdo_full_proxy_is_installed",
+    "aimdo_full_proxy_install", "aimdo_full_proxy_compiler_begin",
+    "aimdo_full_proxy_compiler_end", "aimdo_full_proxy_snapshot",
+)
 
 
 def _compiler_api_contract(source_version, files):
@@ -78,6 +83,39 @@ def _compiler_api_contract(source_version, files):
             "canonical_versions": ["0.5.5"],
             "required_modules": sorted(required), "required_native_symbols": list(_COMPILER_SYMBOLS),
             "xpu_recording_supported": False}
+
+
+def _native_owner_diagnostic_contract(source_version, torch_version, files):
+    """Bind the optional D2 sidecar without declaring compiler availability."""
+    native = f"{CANONICAL_PACKAGE}/aimdo_xpu_native_owner.so"
+    if native not in files:
+        return None
+    if source_version != "0.5.5" or torch_version != "2.14.0+xpu":
+        raise RuntimeError("native-owner diagnostic requires AIMDO 0.5.5 and Torch 2.14.0+xpu")
+    if f"{CANONICAL_PACKAGE}/native_owner.py" not in files:
+        raise RuntimeError("native-owner diagnostic Python module is missing")
+    with tempfile.TemporaryDirectory(prefix="aimdo-native-owner-inspect-") as temporary:
+        path = Path(temporary) / "aimdo_xpu_native_owner.so"
+        path.write_bytes(files[native])
+        tool = shutil.which("nm")
+        if tool is None:
+            raise RuntimeError("native-owner export inspection requires nm")
+        inspected = subprocess.run(
+            [tool, "-D", "--defined-only", str(path)],
+            capture_output=True, text=True, check=True,
+        )
+        missing = set(_NATIVE_OWNER_SYMBOLS) - set(inspected.stdout.split())
+        if missing:
+            raise RuntimeError(
+                "native-owner diagnostic is missing exports: " + ", ".join(sorted(missing))
+            )
+    return {
+        "enabled_by_default": False,
+        "environment_flag": "AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC",
+        "torch_version": torch_version,
+        "path": f"{PROVIDER_PACKAGE}/_vendor/{native}",
+        "sha256": _sha256(files[native]),
+    }
 
 
 def _sha256(data: bytes) -> str:
@@ -199,6 +237,7 @@ def _manifest(
     xpu_target: str,
     vendored_files: dict[str, bytes],
     compiler_api: dict | None = None,
+    native_owner_diagnostic: dict | None = None,
 ) -> dict[str, object]:
     file_hashes = {
         name: _sha256(data) for name, data in sorted(vendored_files.items())
@@ -247,6 +286,8 @@ def _manifest(
         "vendored_files": file_hashes,
         "native_artifacts": native_artifacts,
         **({"api_compatibility": compiler_api} if compiler_api else {}),
+        **({"native_owner_diagnostic": native_owner_diagnostic}
+           if native_owner_diagnostic else {}),
     }
 
 
@@ -276,6 +317,9 @@ def build_provider_wheel(
         source_files,
     ) = _source_wheel_contract(source_wheel)
     compiler_api = _compiler_api_contract(source_version, source_files)
+    native_owner_diagnostic = _native_owner_diagnostic_contract(
+        source_version, torch_version, source_files
+    )
     vendored_files = {
         f"{PROVIDER_PACKAGE}/_vendor/{name}": data
         for name, data in source_files.items()
@@ -288,6 +332,7 @@ def build_provider_wheel(
         xpu_target=xpu_target,
         vendored_files=vendored_files,
         compiler_api=compiler_api,
+        native_owner_diagnostic=native_owner_diagnostic,
     )
 
     dist_info = (

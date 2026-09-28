@@ -31,6 +31,35 @@ now includes upstream `disk-id.c` and its required libraries, providing the
 and runtime test are still required before this 0.5.5 API and the existing
 Windows allocator route can be claimed as validated.
 
+For the opt-in Linux B70 Torch 2.14 native-owner diagnostic, build from an
+environment with the exact official `torch==2.14.0+xpu` wheel and oneAPI C++20
+compiler:
+
+```bash
+UR_INCLUDE_DIR=/opt/intel/oneapi/compiler/2026.1/include/unified-runtime \
+AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC=1 \
+AIMDO_TORCH_PYTHON=/opt/venv/bin/python \
+bash scripts/build-linux-xpu.sh
+
+SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COMFY_AIMDO=0.5.5 \
+/opt/venv/bin/python -m build --wheel --no-isolation --outdir dist
+
+python packaging/xpu_runtime_provider/build_wheel.py \
+  --source-wheel dist/comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl \
+  --output-dir dist/provider \
+  --source-revision "$(git rev-parse HEAD)" \
+  --torch-version 2.14.0+xpu \
+  --xpu-target bmg
+```
+
+This adds `aimdo_xpu_native_owner.so` as a second, privately vendored native
+artifact. The manifest binds it to Torch 2.14.0 XPU and marks it disabled by
+default. Only an explicitly set `AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC=1` with Linux
+`native_hook` can install it before XPU initialization. The process-lifetime
+proxy cannot be unloaded or switched off in the same process. This diagnostic
+path does not enable public XPU `record()` or compiler capability; it has not
+passed provider package or ComfyUI acceptance solely by being built.
+
 For a Linux source wheel containing `malloc_graph.py`, the builder requires the
 complete provider module set and all twelve compiler ABI/provenance exports in
 `aimdo_xpu.so`. This D1 source declares compatibility only with the reviewed

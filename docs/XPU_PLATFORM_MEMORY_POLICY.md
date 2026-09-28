@@ -18,6 +18,15 @@ The standalone `control.init()` API retains its Linux `global` default; a direct
 native caller must preload the library and select `native_hook` explicitly.
 Windows does not replace PyTorch's allocator.
 
+An optional Linux Torch 2.14 diagnostic build may install the AIMDO native
+owner proxy before XPU initialization when
+`AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC=1` is explicitly set. Ordinary tensor
+requests still delegate to PyTorch's native cache; selected compiler scopes
+have a separate owner. This process-lifetime experiment does not change the
+default `native_hook` route or public memory-compiler capability. The proxy's
+private C10/XPU ABI, stream and failure contracts need separate validation
+before it can become a supported allocator path.
+
 Linux native mode keeps Torch's allocator, statistics and cache-management APIs.
 At model prioritization, Python publishes a cached-byte estimate to the hook.
 A budget deficit uses Torch's cache-release retry only when that estimate is

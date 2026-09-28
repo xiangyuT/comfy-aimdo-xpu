@@ -7,3 +7,11 @@ The proxy is installed before XPU device initialization in a disposable process.
 The [Torch 2.13 component experiment](https://github.com/xiangyuT/omni-xpu-kernel-tuning/tree/main/experiments/targets/bmg-g31/aimdo-native-compiler-va-proxy-055) remains pinned to the earlier exact source bytes. The [OMIX 0.4.0 / Torch 2.14 component diagnostic](https://github.com/xiangyuT/omni-xpu-kernel-tuning/tree/main/experiments/targets/bmg-g31/aimdo-torch214-native-owner-055) proved that earlier 4,097-byte source on host XPU 0. This branch advances that prototype to selected positive sizes; the [new Torch 2.14 routing and size diagnostic](https://github.com/xiangyuT/omni-xpu-kernel-tuning/tree/main/experiments/targets/bmg-g31/aimdo-torch214-routing-055) binds 1,024, 4,097 and 2,097,169-byte component results to these source bytes. It does not inherit the older source-bound decision. XPU 1 is user-allowed but has no result here.
 
 Current development targets Torch 2.14 C10 allocator registry and the XPU allocator pointer exposed in that exact header, with C++20 compilation. These are not established as a stable product ABI. Selected sizes and one registered consumer case do not establish unregistered stream, abort, pressure, arbitrary tensor shapes, concurrent graphs, ComfyUI caller, public packaging or performance support. No Torch source file or package version is changed by this experiment.
+
+The optional `src-xpu/native-owner-proxy.cpp` sidecar advances this prototype
+into a source/provider wheel diagnostic for Torch 2.14. It is built only with
+`AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC=1` and installed only with
+`AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC=1` before XPU initialization. The public
+compiler capability and `record()` remain unavailable. The historical
+`experiments/linux-native-owner-055/proxy.cpp` bytes stay unchanged so the
+earlier size and lifecycle receipts keep their exact source identity.
