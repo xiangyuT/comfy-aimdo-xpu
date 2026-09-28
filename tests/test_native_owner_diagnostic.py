@@ -61,6 +61,32 @@ def test_diagnostic_graph_requires_installed_proxy(monkeypatch):
         native_owner.record_diagnostic(stream)
 
 
+def test_page_create_oom_injection_is_bounded_and_requires_active_graph(monkeypatch):
+    calls = []
+
+    class Inject:
+        def __call__(self, attempts):
+            calls.append(attempts)
+            return attempts == 1
+
+    inject = Inject()
+    monkeypatch.setattr(native_owner, "_library",
+                        SimpleNamespace(aimdo_full_proxy_is_installed=lambda: True))
+    monkeypatch.setattr(control, "lib",
+                        SimpleNamespace(malloc_graph_test_fail_next_page_creates=inject))
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "get_xpu_allocator_mode", lambda: "native_hook")
+    for value in (0, 3, True, 1.0):
+        with pytest.raises(ValueError, match="must be 1 or 2"):
+            native_owner.inject_page_create_oom_attempts(value)
+    native_owner.inject_page_create_oom_attempts(1)
+    with pytest.raises(RuntimeError, match="no eligible active graph"):
+        native_owner.inject_page_create_oom_attempts(2)
+    assert calls == [1, 2]
+    assert inject.argtypes == [native_owner.ctypes.c_uint]
+    assert inject.restype == native_owner.ctypes.c_bool
+
+
 def test_graph_stream_switch_uses_xpu_queue_pointer(monkeypatch):
     calls = []
     native = SimpleNamespace(

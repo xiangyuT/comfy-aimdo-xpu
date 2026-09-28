@@ -43,6 +43,11 @@ the owner's stream and restore the graph's previous stream. The original
 `malloc_graph_free` keeps its strict current-stream check. Unregistered
 external consumers remain outside this contract.
 
+The opt-in Torch 2.14 diagnostic also exposes a bounded per-graph physical-page
+OOM injection. One failed attempt exercises the existing reclaim/retry path;
+two failed attempts exercise terminal allocation failure and graph abort. This
+hook does not simulate device pressure or establish a production OOM result.
+
 Linux native mode keeps Torch's allocator, statistics and cache-management APIs.
 At model prioritization, Python publishes a cached-byte estimate to the hook.
 A budget deficit uses Torch's cache-release retry only when that estimate is

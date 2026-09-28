@@ -43,7 +43,9 @@ _NATIVE_OWNER_SYMBOLS = (
     "aimdo_full_proxy_compiler_begin",
     "aimdo_full_proxy_compiler_end", "aimdo_full_proxy_snapshot",
 )
-_NATIVE_OWNER_CORE_SYMBOLS = ("malloc_graph_free_owned",)
+_NATIVE_OWNER_CORE_SYMBOLS = (
+    "malloc_graph_free_owned", "malloc_graph_test_fail_next_page_creates",
+)
 
 
 def _compiler_api_contract(source_version, files):

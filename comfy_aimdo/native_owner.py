@@ -110,6 +110,27 @@ def inject_duplicate_compiler_pointer(pointer: int) -> None:
         raise RuntimeError("no active scope or matching live compiler owner")
 
 
+def inject_page_create_oom_attempts(attempts: int) -> None:
+    """Fail one or both physical-page attempts in the active diagnostic graph."""
+    if type(attempts) is not int or attempts not in (1, 2):
+        raise ValueError("page-create OOM attempts must be 1 or 2")
+    if not installed():
+        raise RuntimeError("native-owner diagnostic is not installed")
+    from . import control
+
+    if control.lib is None or control.implementation != "xpu" or \
+            control.get_xpu_allocator_mode() != "native_hook":
+        raise RuntimeError("page-create OOM injection requires XPU native_hook")
+    try:
+        inject = control.lib.malloc_graph_test_fail_next_page_creates
+    except AttributeError as error:
+        raise RuntimeError("page-create OOM diagnostic export is missing") from error
+    inject.argtypes = [ctypes.c_uint]
+    inject.restype = ctypes.c_bool
+    if not inject(attempts):
+        raise RuntimeError("no eligible active graph for page-create OOM injection")
+
+
 def selected_scope(size: int, stream):
     """Route one exact-size tensor request within an active native graph.
 

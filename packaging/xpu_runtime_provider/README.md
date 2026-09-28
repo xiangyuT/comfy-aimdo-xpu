@@ -66,6 +66,10 @@ preserved the previously live owner; callers must not resume normal work.
 The sidecar build also requires the XPU-only `malloc_graph_free_owned` export
 in the matching D1 native library. It is used only after owner and registered
 consumer queues complete; the standard shared-core free API is unchanged.
+Its additional `malloc_graph_test_fail_next_page_creates` export supports a
+bounded, active-graph-only synthetic OOM diagnostic. One rejected page attempt
+exercises retry; two rejected attempts exercise failure propagation. Neither
+case establishes behavior under real device memory pressure.
 
 For a Linux source wheel containing `malloc_graph.py`, the builder requires the
 complete provider module set and all twelve compiler ABI/provenance exports in

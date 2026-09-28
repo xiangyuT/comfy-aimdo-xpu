@@ -121,6 +121,9 @@ typedef struct {
     bool assert_breaks;
     bool handoff_attempted;
     bool aborted;
+#ifdef AIMDO_XPU
+    unsigned test_page_create_oom_attempts;
+#endif
 } MallocGraph;
 
 static _Thread_local MallocGraph *active_graph;
@@ -420,14 +423,24 @@ static bool push_stack(MallocGraph *g, Event *scope, bool recording) {
     return true;
 }
 
+static CUresult alloc_graph_page(MallocGraph *g, PhysicalPage **page) {
+#ifdef AIMDO_XPU
+    if (g->test_page_create_oom_attempts) {
+        g->test_page_create_oom_attempts--;
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+#endif
+    return physical_page_alloc(page, MG_PAGE, g->device);
+}
+
 static CUresult create_page(MallocGraph *g, PhysicalPage **page) {
     CUresult r;
 
     vbars_free(budget_deficit(MG_PAGE));
-    r = physical_page_alloc(page, MG_PAGE, g->device);
+    r = alloc_graph_page(g, page);
     if (r == CUDA_ERROR_OUT_OF_MEMORY) {
         vbars_free(MG_PAGE);
-        r = physical_page_alloc(page, MG_PAGE, g->device);
+        r = alloc_graph_page(g, page);
     }
     return r;
 }
@@ -1041,6 +1054,17 @@ bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
 }
 
 #ifdef AIMDO_XPU
+SHARED_EXPORT bool malloc_graph_test_fail_next_page_creates(unsigned attempts) {
+    MallocGraph *g = active_graph;
+    if (!g || g->owner_thread != &active_graph || g->failed || g->paused ||
+        !g->state || g->test_page_create_oom_attempts ||
+        attempts < 1 || attempts > 2) {
+        return false;
+    }
+    g->test_page_create_oom_attempts = attempts;
+    return true;
+}
+
 SHARED_EXPORT bool malloc_graph_free_owned(CUdeviceptr ptr, CUstream owner_stream,
                                            int *result) {
     MallocGraph *g = active_graph;
