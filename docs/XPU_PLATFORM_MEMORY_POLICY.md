@@ -35,6 +35,14 @@ reports a fatal collision, and requires the process to exit after cleanup.
 Neither rule enables public memory compilation or weakens the ordinary native
 allocator's ownership.
 
+For an explicit XPU stream switch inside a diagnostic memory graph, an owner
+may be released after the graph has switched back to another stream. The
+sidecar waits its allocation queue and each registered consumer, then uses
+the XPU-only `malloc_graph_free_owned` entry point to apply the free event on
+the owner's stream and restore the graph's previous stream. The original
+`malloc_graph_free` keeps its strict current-stream check. Unregistered
+external consumers remain outside this contract.
+
 Linux native mode keeps Torch's allocator, statistics and cache-management APIs.
 At model prioritization, Python publishes a cached-byte estimate to the hook.
 A budget deficit uses Torch's cache-release retry only when that estimate is

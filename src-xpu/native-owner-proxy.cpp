@@ -52,6 +52,7 @@ using CompilerRogue = bool (*)(uint64_t, int *);
 using SetDevice = bool (*)(int);
 CompilerAlloc g_compiler_alloc = nullptr;
 CompilerFree g_compiler_free = nullptr;
+CompilerFree g_compiler_free_owned = nullptr;
 CompilerRogue g_compiler_rogue = nullptr;
 SetDevice g_set_device = nullptr;
 
@@ -90,7 +91,7 @@ Owner::~Owner() {
         custom_queue->ext_oneapi_submit_barrier().wait_and_throw();
         if (kind == Kind::Compiler) {
             if (!g_set_device || !g_set_device(compiler_device) ||
-                !g_compiler_free || !g_compiler_rogue) {
+                !g_compiler_free_owned || !g_compiler_rogue) {
                 g_compiler_failures.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
@@ -98,7 +99,7 @@ Owner::~Owner() {
             const uint64_t pointer = reinterpret_cast<uintptr_t>(custom_pointer);
             bool handled = g_compiler_rogue(pointer, &result);
             if (!handled) {
-                handled = g_compiler_free(pointer,
+                handled = g_compiler_free_owned(pointer,
                     reinterpret_cast<void *>(compiler_stream), &result);
             }
             if (!handled || result != 0) {
@@ -183,8 +184,9 @@ public:
 
     c10::DataPtr allocate(size_t bytes) override {
         if (g_compiler_scope) {
-            if (!bytes || bytes != g_compiler_scope_bytes || !g_compiler_scope_stream ||
-                !g_compiler_alloc || !g_set_device) {
+            if (!bytes) return native_->allocate(0);
+            if ((g_compiler_scope_bytes && bytes != g_compiler_scope_bytes) ||
+                !g_compiler_scope_stream || !g_compiler_alloc || !g_set_device) {
                 throw std::runtime_error("invalid compiler scope allocation request");
             }
             const auto device = c10::xpu::current_device();
@@ -434,7 +436,8 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_scope_en
 
 extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler_begin(
     size_t bytes, uint64_t stream, const char *expected_revision) {
-    if (!g_proxy || g_custom_scope || g_compiler_scope || !bytes ||
+    // Zero selects every positive-size Torch tensor request in this scope.
+    if (!g_proxy || g_custom_scope || g_compiler_scope ||
         !stream || !expected_revision) return false;
     using SourceRevision = const char *(*)();
     auto source = reinterpret_cast<SourceRevision>(
@@ -443,14 +446,17 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler
         dlsym(RTLD_DEFAULT, "malloc_graph_alloc"));
     auto free = reinterpret_cast<CompilerFree>(
         dlsym(RTLD_DEFAULT, "malloc_graph_free"));
+    auto free_owned = reinterpret_cast<CompilerFree>(
+        dlsym(RTLD_DEFAULT, "malloc_graph_free_owned"));
     auto rogue = reinterpret_cast<CompilerRogue>(
         dlsym(RTLD_DEFAULT, "free_rogue"));
     auto set_device = reinterpret_cast<SetDevice>(
         dlsym(RTLD_DEFAULT, "set_devctx_for_device"));
-    if (!source || !alloc || !free || !rogue || !set_device ||
+    if (!source || !alloc || !free || !free_owned || !rogue || !set_device ||
         std::strcmp(source(), expected_revision) != 0) return false;
     g_compiler_alloc = alloc;
     g_compiler_free = free;
+    g_compiler_free_owned = free_owned;
     g_compiler_rogue = rogue;
     g_set_device = set_device;
     g_compiler_scope_bytes = bytes;

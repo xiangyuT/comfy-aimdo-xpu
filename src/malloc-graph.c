@@ -1040,6 +1040,25 @@ bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
     return true;
 }
 
+#ifdef AIMDO_XPU
+SHARED_EXPORT bool malloc_graph_free_owned(CUdeviceptr ptr, CUstream owner_stream,
+                                           int *result) {
+    MallocGraph *g = active_graph;
+    if (!g || g->owner_thread != &active_graph || graph_failed(g) ||
+        g->paused || !owner_stream) {
+        return false;
+    }
+    /* The native-owner sidecar has already waited the allocation queue and
+     * every registered consumer before calling this XPU-only entry point.
+     * Restore graph routing even if the free reports an event mismatch. */
+    CUstream previous = g->stream;
+    g->stream = owner_stream;
+    bool handled = malloc_graph_free(ptr, owner_stream, result);
+    g->stream = previous;
+    return handled;
+}
+#endif
+
 SHARED_EXPORT void *malloc_graph_create(void *devctx, CUstream stream, bool assert_breaks) {
     MallocGraph *g = calloc(1, sizeof(*g));
 

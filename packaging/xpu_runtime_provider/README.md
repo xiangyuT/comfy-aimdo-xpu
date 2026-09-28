@@ -63,6 +63,9 @@ passed provider package or ComfyUI acceptance solely by being built.
 `native_owner.inject_duplicate_compiler_pointer()` exist only for bounded
 error-path diagnostics. The latter is fatal to the process after it has
 preserved the previously live owner; callers must not resume normal work.
+The sidecar build also requires the XPU-only `malloc_graph_free_owned` export
+in the matching D1 native library. It is used only after owner and registered
+consumer queues complete; the standard shared-core free API is unchanged.
 
 For a Linux source wheel containing `malloc_graph.py`, the builder requires the
 complete provider module set and all twelve compiler ABI/provenance exports in

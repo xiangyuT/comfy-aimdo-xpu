@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from comfy_aimdo import control, native_owner
+from comfy_aimdo import control, malloc_graph, native_owner
 
 
 def test_invalid_diagnostic_flag_rejected(monkeypatch):
@@ -42,3 +42,39 @@ def test_process_lifetime_proxy_cannot_be_disabled(monkeypatch):
     with pytest.raises(RuntimeError, match="cannot be disabled in this process"):
         control.init(implementation="xpu", xpu_allocator_mode="native_hook")
     assert control.lib is None
+
+
+def test_unrestricted_scope_still_requires_opt_in_installation(monkeypatch):
+    monkeypatch.setattr(native_owner, "_library", None)
+    stream = SimpleNamespace(sycl_queue=1)
+    with pytest.raises(RuntimeError, match="not installed"):
+        with native_owner.compiler_scope(stream):
+            pytest.fail("uninstalled proxy entered a compiler scope")
+    with pytest.raises(ValueError, match="must be positive"):
+        native_owner.selected_scope(0, stream)
+
+
+def test_diagnostic_graph_requires_installed_proxy(monkeypatch):
+    monkeypatch.setattr(native_owner, "_library", None)
+    stream = SimpleNamespace(device=SimpleNamespace(type="xpu", index=0), sycl_queue=1234)
+    with pytest.raises(RuntimeError, match="not installed"):
+        native_owner.record_diagnostic(stream)
+
+
+def test_graph_stream_switch_uses_xpu_queue_pointer(monkeypatch):
+    calls = []
+    native = SimpleNamespace(
+        malloc_graph_set_stream=lambda handle, queue: calls.append(
+            (handle, queue.value)) or True,
+        malloc_graph_destroy=lambda handle: calls.append(("destroy", handle)),
+    )
+    monkeypatch.setattr(control, "lib", native)
+    monkeypatch.setattr(control, "implementation", "xpu")
+    first = SimpleNamespace(sycl_queue=1234)
+    second = SimpleNamespace(sycl_queue=5678)
+    graph = malloc_graph.MallocGraph(99, first)
+    with graph.use_stream(second):
+        assert graph._stream is second
+    assert graph._stream is first
+    graph.__del__()
+    assert calls == [(99, 5678), (99, 1234), ("destroy", 99)]

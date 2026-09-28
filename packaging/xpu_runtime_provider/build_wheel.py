@@ -43,6 +43,7 @@ _NATIVE_OWNER_SYMBOLS = (
     "aimdo_full_proxy_compiler_begin",
     "aimdo_full_proxy_compiler_end", "aimdo_full_proxy_snapshot",
 )
+_NATIVE_OWNER_CORE_SYMBOLS = ("malloc_graph_free_owned",)
 
 
 def _compiler_api_contract(source_version, files):
@@ -97,20 +98,27 @@ def _native_owner_diagnostic_contract(source_version, torch_version, files):
     if f"{CANONICAL_PACKAGE}/native_owner.py" not in files:
         raise RuntimeError("native-owner diagnostic Python module is missing")
     with tempfile.TemporaryDirectory(prefix="aimdo-native-owner-inspect-") as temporary:
-        path = Path(temporary) / "aimdo_xpu_native_owner.so"
-        path.write_bytes(files[native])
         tool = shutil.which("nm")
         if tool is None:
             raise RuntimeError("native-owner export inspection requires nm")
-        inspected = subprocess.run(
-            [tool, "-D", "--defined-only", str(path)],
-            capture_output=True, text=True, check=True,
-        )
-        missing = set(_NATIVE_OWNER_SYMBOLS) - set(inspected.stdout.split())
-        if missing:
-            raise RuntimeError(
-                "native-owner diagnostic is missing exports: " + ", ".join(sorted(missing))
+        for filename, required in (
+            (native, _NATIVE_OWNER_SYMBOLS),
+            (f"{CANONICAL_PACKAGE}/aimdo_xpu.so", _NATIVE_OWNER_CORE_SYMBOLS),
+        ):
+            if filename not in files:
+                raise RuntimeError("native-owner diagnostic is missing " + filename)
+            path = Path(temporary) / PurePosixPath(filename).name
+            path.write_bytes(files[filename])
+            inspected = subprocess.run(
+                [tool, "-D", "--defined-only", str(path)],
+                capture_output=True, text=True, check=True,
             )
+            missing = set(required) - set(inspected.stdout.split())
+            if missing:
+                raise RuntimeError(
+                    "native-owner diagnostic is missing exports: " +
+                    ", ".join(sorted(missing))
+                )
     return {
         "enabled_by_default": False,
         "environment_flag": "AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC",

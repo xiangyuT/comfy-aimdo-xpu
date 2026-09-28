@@ -15,3 +15,9 @@ into a source/provider wheel diagnostic for Torch 2.14. It is built only with
 compiler capability and `record()` remain unavailable. The historical
 `experiments/linux-native-owner-055/proxy.cpp` bytes stay unchanged so the
 earlier size and lifecycle receipts keep their exact source identity.
+
+The Torch 2.14 sidecar additionally exposes diagnostic `compiler_scope(stream)`
+for all positive-size tensor requests on the selected queue and
+`record_diagnostic(stream)` for a memory-only `MallocGraph`. XPU
+`MallocGraph.use_stream()` passes the SYCL queue. These remain internal test
+paths; public `malloc_graph.record()` still rejects XPU.

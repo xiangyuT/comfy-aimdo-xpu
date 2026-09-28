@@ -110,12 +110,56 @@ def inject_duplicate_compiler_pointer(pointer: int) -> None:
         raise RuntimeError("no active scope or matching live compiler owner")
 
 
-@contextlib.contextmanager
 def selected_scope(size: int, stream):
     """Route one exact-size tensor request within an active native graph.
 
     This limited diagnostic is not the public AIMDO memory compiler API.
     """
+    size = int(size)
+    if size <= 0:
+        raise ValueError("native-owner selected scope size must be positive")
+    return _compiler_scope(size, stream)
+
+
+def compiler_scope(stream):
+    """Route every positive-size Torch tensor request on this stream.
+
+    This is an opt-in D2 diagnostic; public malloc_graph.record() is disabled.
+    """
+    return _compiler_scope(0, stream)
+
+
+def record_diagnostic(stream, assert_graph_breaks: bool = False):
+    """Create a memory-only XPU graph for the opt-in diagnostic route."""
+    if not installed():
+        raise RuntimeError("native-owner diagnostic is not installed")
+    from . import control
+
+    if control.lib is None or control.implementation != "xpu" or \
+            control.get_xpu_allocator_mode() != "native_hook":
+        raise RuntimeError("native-owner graph requires active XPU native_hook")
+    device = getattr(stream, "device", None)
+    if getattr(device, "type", None) != "xpu":
+        raise ValueError("native-owner graph requires an XPU stream")
+    index = device.index
+    if index is None:
+        import torch
+        index = torch.xpu.current_device()
+    stream_pointer = int(stream.sycl_queue)
+    if not stream_pointer:
+        raise ValueError("native-owner graph requires a nonzero XPU queue")
+    handle = control.lib.malloc_graph_create(
+        control.get_devctx(index), ctypes.c_void_p(stream_pointer),
+        bool(assert_graph_breaks),
+    )
+    if not handle:
+        raise RuntimeError("AIMDO native-owner graph creation failed")
+    from .malloc_graph import MallocGraph
+    return MallocGraph(handle, stream)
+
+
+@contextlib.contextmanager
+def _compiler_scope(size: int, stream):
     if not installed():
         raise RuntimeError("native-owner diagnostic is not installed")
     from . import control
@@ -123,9 +167,8 @@ def selected_scope(size: int, stream):
     if control.lib is None or control.implementation != "xpu" or \
             control.get_xpu_allocator_mode() != "native_hook":
         raise RuntimeError("native-owner scope requires active XPU native_hook")
-    size = int(size)
-    if size <= 0:
-        raise ValueError("native-owner scope size must be positive")
+    if size < 0:
+        raise ValueError("native-owner scope size cannot be negative")
     stream_pointer = int(stream.sycl_queue)
     source_revision = control.get_memory_compiler_capability()["source_revision"]
     if not stream_pointer or not source_revision:

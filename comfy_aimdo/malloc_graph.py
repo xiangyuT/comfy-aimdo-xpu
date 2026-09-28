@@ -44,12 +44,16 @@ class MallocGraph:
     @contextlib.contextmanager
     def use_stream(self, stream):
         previous = self._stream
-        self._call(control.lib.malloc_graph_set_stream, ctypes.c_void_p(stream.cuda_stream))
+        pointer = (int(stream.sycl_queue) if control.implementation == "xpu"
+                   else int(stream.cuda_stream))
+        self._call(control.lib.malloc_graph_set_stream, ctypes.c_void_p(pointer))
         self._stream = stream
         try:
             yield
         finally:
-            self._call(control.lib.malloc_graph_set_stream, ctypes.c_void_p(previous.cuda_stream))
+            pointer = (int(previous.sycl_queue) if control.implementation == "xpu"
+                       else int(previous.cuda_stream))
+            self._call(control.lib.malloc_graph_set_stream, ctypes.c_void_p(pointer))
             self._stream = previous
 
     def iterate(self, name=None):

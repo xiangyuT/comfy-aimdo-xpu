@@ -250,7 +250,8 @@ def test_torch214_native_owner_sidecar_is_explicit_and_version_bound(tmp_path, m
         builder, "subprocess",
         types.SimpleNamespace(run=lambda command, **kwargs: subprocess.CompletedProcess(
             command, 0,
-            stdout="\n".join((*builder._COMPILER_SYMBOLS, *builder._NATIVE_OWNER_SYMBOLS)),
+            stdout="\n".join((*builder._COMPILER_SYMBOLS, *builder._NATIVE_OWNER_SYMBOLS,
+                              *builder._NATIVE_OWNER_CORE_SYMBOLS)),
         )),
     )
     provider = builder.build_provider_wheel(
