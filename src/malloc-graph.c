@@ -123,6 +123,7 @@ typedef struct {
     bool aborted;
 #ifdef AIMDO_XPU
     unsigned test_page_create_oom_attempts;
+    unsigned test_destroy_release_stage;
 #endif
 } MallocGraph;
 
@@ -1065,6 +1066,17 @@ SHARED_EXPORT bool malloc_graph_test_fail_next_page_creates(unsigned attempts) {
     return true;
 }
 
+SHARED_EXPORT bool malloc_graph_test_fail_next_destroy_release(void *handle,
+                                                                unsigned stage) {
+    MallocGraph *g = handle;
+    if (!g || g->owner_thread != &active_graph || !g->complete || g->state ||
+        g->test_destroy_release_stage || stage < 1 || stage > 3) {
+        return false;
+    }
+    g->test_destroy_release_stage = stage;
+    return true;
+}
+
 SHARED_EXPORT bool malloc_graph_free_owned(CUdeviceptr ptr, CUstream owner_stream,
                                            int *result) {
     MallocGraph *g = active_graph;
@@ -1324,14 +1336,20 @@ static bool destroy_graph(void *handle) {
 
     for (size_t i = 0; i < g->small_pages; i++) {
         if (g->small_mapped_pages[i]) {
-            if (physical_page_unref(g->small_mapped_pages[i]) == CUDA_SUCCESS) {
+            if (g->test_destroy_release_stage == 1) {
+                g->test_destroy_release_stage = 0;
+                released = false;
+            } else if (physical_page_unref(g->small_mapped_pages[i]) == CUDA_SUCCESS) {
                 g->small_mapped_pages[i] = NULL;
             } else {
                 released = false;
             }
         }
         if (g->small_physical_pages[i]) {
-            if (physical_page_unref(g->small_physical_pages[i]) == CUDA_SUCCESS) {
+            if (g->test_destroy_release_stage == 2) {
+                g->test_destroy_release_stage = 0;
+                released = false;
+            } else if (physical_page_unref(g->small_physical_pages[i]) == CUDA_SUCCESS) {
                 g->small_physical_pages[i] = NULL;
             } else {
                 released = false;
@@ -1339,6 +1357,10 @@ static bool destroy_graph(void *handle) {
         }
     }
     if (!released) return false;
+    if (g->test_destroy_release_stage == 3) {
+        g->test_destroy_release_stage = 0;
+        return false;
+    }
     if (g->base) {
         if (virtual_range_unref(g->base) != CUDA_SUCCESS) return false;
         g->base = NULL;

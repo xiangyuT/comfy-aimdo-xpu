@@ -79,6 +79,9 @@ matching D1 library. A foreign-thread close is queued to the graph's creator;
 deinitialization fails while any graph handle remains live or deferred.
 An escaped compiler tensor or scoped raw workspace must also release its owner
 before deinitialization can clean native state.
+The matching D1 library additionally exposes a completed-graph-only synthetic
+destroy-release failure hook for mapped, physical and virtual owner retry
+diagnostics. It is not a real driver failure or a public allocator API.
 
 For a Linux source wheel containing `malloc_graph.py`, the builder requires the
 complete provider module set and all twelve compiler ABI/provenance exports in

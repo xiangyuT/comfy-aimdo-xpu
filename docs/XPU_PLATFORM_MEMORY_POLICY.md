@@ -64,6 +64,12 @@ It also refuses live native-owner or scoped raw allocations after a graph has
 handed an escaped compiler tensor to rogue ownership; final tensor free must
 finish before native cleanup.
 
+The optional XPU diagnostic can inject one failed graph-destroy release at a
+completed graph's small mapped page, small physical page or virtual-range
+stage. The checked destroy retains unfinished owners for an owner-thread retry.
+This exercises its recovery contract without claiming a real driver unmap or
+physical-release failure was observed.
+
 Linux native mode keeps Torch's allocator, statistics and cache-management APIs.
 At model prioritization, Python publishes a cached-byte estimate to the hook.
 A budget deficit uses Torch's cache-release retry only when that estimate is

@@ -89,6 +89,35 @@ def test_page_create_oom_injection_is_bounded_and_requires_active_graph(monkeypa
     assert inject.restype == native_owner.ctypes.c_bool
 
 
+def test_destroy_release_injection_is_owner_thread_and_stage_bound(monkeypatch):
+    calls = []
+
+    def inject(handle, stage):
+        calls.append((handle.value, stage))
+        return stage == 1
+
+    library = SimpleNamespace(malloc_graph_test_fail_next_destroy_release=inject)
+    graph = SimpleNamespace(_native_lib=library, _handle=123,
+                            _owner_thread=threading.current_thread())
+    monkeypatch.setattr(native_owner, "_library",
+                        SimpleNamespace(aimdo_full_proxy_is_installed=lambda: True))
+    monkeypatch.setattr(control, "lib", library)
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "get_xpu_allocator_mode", lambda: "native_hook")
+    for value in (0, 4, True, 1.0):
+        with pytest.raises(ValueError, match="must be 1, 2 or 3"):
+            native_owner.inject_destroy_release_failure(graph, value)
+    native_owner.inject_destroy_release_failure(graph, 1)
+    with pytest.raises(RuntimeError, match="not eligible"):
+        native_owner.inject_destroy_release_failure(graph, 2)
+    graph._owner_thread = threading.Thread()
+    with pytest.raises(RuntimeError, match="requires an owner-thread"):
+        native_owner.inject_destroy_release_failure(graph, 1)
+    assert calls == [(123, 1), (123, 2)]
+    assert inject.argtypes == [native_owner.ctypes.c_void_p,
+                               native_owner.ctypes.c_uint]
+
+
 def test_scoped_raw_owner_diagnostics(monkeypatch):
     def snapshot(values, count):
         assert count == 5

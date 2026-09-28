@@ -202,6 +202,30 @@ def inject_page_create_oom_attempts(attempts: int) -> None:
         raise RuntimeError("no eligible active graph for page-create OOM injection")
 
 
+def inject_destroy_release_failure(graph, stage: int) -> None:
+    """Reject one mapped, physical or virtual release in a completed XPU graph."""
+    if type(stage) is not int or stage not in (1, 2, 3):
+        raise ValueError("destroy-release stage must be 1, 2 or 3")
+    if not installed():
+        raise RuntimeError("native-owner diagnostic is not installed")
+    from . import control
+
+    if (control.lib is None or control.implementation != "xpu" or
+            control.get_xpu_allocator_mode() != "native_hook" or
+            getattr(graph, "_native_lib", None) is not control.lib or
+            not getattr(graph, "_handle", None) or
+            getattr(graph, "_owner_thread", None) is not threading.current_thread()):
+        raise RuntimeError("destroy-release injection requires an owner-thread XPU graph")
+    try:
+        inject = control.lib.malloc_graph_test_fail_next_destroy_release
+    except AttributeError as error:
+        raise RuntimeError("destroy-release diagnostic export is missing") from error
+    inject.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+    inject.restype = ctypes.c_bool
+    if not inject(ctypes.c_void_p(int(graph._handle)), stage):
+        raise RuntimeError("graph is not eligible for destroy-release injection")
+
+
 def selected_scope(size: int, stream):
     """Route one exact-size tensor request within an active native graph.
 
