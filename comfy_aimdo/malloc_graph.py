@@ -110,7 +110,15 @@ class MallocGraph:
                     self._handle = None
                     return False
                 native_owner.drain_deferred_graphs()
+                if native_owner._destroy_graph_terminal(self._native_lib, handle):
+                    raise RuntimeError(
+                        "terminal AIMDO graph destroy error; process must exit"
+                    )
                 if not native_owner._destroy_graph_checked(self._native_lib, handle):
+                    if native_owner._destroy_graph_terminal(self._native_lib, handle):
+                        raise RuntimeError(
+                            "terminal AIMDO graph destroy error; process must exit"
+                        )
                     raise RuntimeError("AIMDO diagnostic graph destroy failed")
             else:
                 if control.lib is None:

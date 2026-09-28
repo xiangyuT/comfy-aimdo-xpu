@@ -292,6 +292,8 @@ bool malloc_graph_test_fail_next_page_creates(unsigned attempts);
 SHARED_EXPORT
 bool malloc_graph_destroy_checked(void *handle);
 SHARED_EXPORT
+bool malloc_graph_destroy_terminal(void *handle);
+SHARED_EXPORT
 bool malloc_graph_test_fail_next_destroy_release(void *handle, unsigned stage);
 SHARED_EXPORT
 bool malloc_graph_test_arm_driver_release(void *handle, unsigned stage,

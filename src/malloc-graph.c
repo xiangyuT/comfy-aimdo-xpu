@@ -124,6 +124,7 @@ typedef struct {
 #ifdef AIMDO_XPU
     unsigned test_page_create_oom_attempts;
     unsigned test_destroy_release_stage;
+    bool destroy_terminal;
 #endif
 } MallocGraph;
 
@@ -1305,12 +1306,35 @@ static void free_events(Event **events, size_t count) {
     free(events);
 }
 
+#ifdef AIMDO_XPU
+static bool release_graph_page(PhysicalPage **page, MallocGraph *g) {
+    CUresult result = physical_page_unref(*page);
+    if (result == CUDA_SUCCESS) {
+        *page = NULL;
+        return true;
+    }
+    if (result != CUDA_ERROR_OUT_OF_MEMORY) {
+        g->destroy_terminal = true;
+    }
+    return false;
+}
+
+SHARED_EXPORT bool malloc_graph_destroy_terminal(void *handle) {
+    MallocGraph *g = handle;
+    return g && g->owner_thread == &active_graph && g->destroy_terminal;
+}
+#endif
+
 static bool destroy_graph(void *handle) {
     MallocGraph *g = handle;
 
     if (!g || g->owner_thread != &active_graph) {
         return false;
     }
+
+#ifdef AIMDO_XPU
+    if (g->destroy_terminal) return false;
+#endif
 
     if (g->state && !abort_graph(g)) {
         return false;
@@ -1327,9 +1351,8 @@ static bool destroy_graph(void *handle) {
     bool released = true;
     for (size_t i = 0; i < g->va_count; i++) {
         if (g->mapped_pages[i]) {
-            if (physical_page_unref(g->mapped_pages[i]) == CUDA_SUCCESS) {
-                g->mapped_pages[i] = NULL;
-            } else {
+            if (!release_graph_page(&g->mapped_pages[i], g)) {
+                if (g->destroy_terminal) return false;
                 released = false;
             }
         }
@@ -1337,9 +1360,8 @@ static bool destroy_graph(void *handle) {
 
     for (size_t i = 0; i < g->phys_count; i++) {
         if (g->physical_pages[i]) {
-            if (physical_page_unref(g->physical_pages[i]) == CUDA_SUCCESS) {
-                g->physical_pages[i] = NULL;
-            } else {
+            if (!release_graph_page(&g->physical_pages[i], g)) {
+                if (g->destroy_terminal) return false;
                 released = false;
             }
         }
@@ -1350,9 +1372,8 @@ static bool destroy_graph(void *handle) {
             if (g->test_destroy_release_stage == 1) {
                 g->test_destroy_release_stage = 0;
                 released = false;
-            } else if (physical_page_unref(g->small_mapped_pages[i]) == CUDA_SUCCESS) {
-                g->small_mapped_pages[i] = NULL;
-            } else {
+            } else if (!release_graph_page(&g->small_mapped_pages[i], g)) {
+                if (g->destroy_terminal) return false;
                 released = false;
             }
         }
@@ -1360,9 +1381,8 @@ static bool destroy_graph(void *handle) {
             if (g->test_destroy_release_stage == 2) {
                 g->test_destroy_release_stage = 0;
                 released = false;
-            } else if (physical_page_unref(g->small_physical_pages[i]) == CUDA_SUCCESS) {
-                g->small_physical_pages[i] = NULL;
-            } else {
+            } else if (!release_graph_page(&g->small_physical_pages[i], g)) {
+                if (g->destroy_terminal) return false;
                 released = false;
             }
         }
@@ -1373,11 +1393,19 @@ static bool destroy_graph(void *handle) {
         return false;
     }
     if (g->base) {
-        if (virtual_range_unref(g->base) != CUDA_SUCCESS) return false;
+        CUresult result = virtual_range_unref(g->base);
+        if (result != CUDA_SUCCESS) {
+            if (result != CUDA_ERROR_OUT_OF_MEMORY) g->destroy_terminal = true;
+            return false;
+        }
         g->base = NULL;
     }
     if (g->small_base) {
-        if (virtual_range_unref(g->small_base) != CUDA_SUCCESS) return false;
+        CUresult result = virtual_range_unref(g->small_base);
+        if (result != CUDA_SUCCESS) {
+            if (result != CUDA_ERROR_OUT_OF_MEMORY) g->destroy_terminal = true;
+            return false;
+        }
         g->small_base = NULL;
     }
 #else

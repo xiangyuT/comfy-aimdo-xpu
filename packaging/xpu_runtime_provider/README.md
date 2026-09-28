@@ -84,7 +84,11 @@ destroy-release failure hook for mapped, physical and virtual owner retry
 diagnostics. It is not a real driver failure or a public allocator API.
 The Linux diagnostic can separately inject one error return through the XPU
 VMM adapter's Level Zero release function pointers. OOM and device-lost codes
-exercise the normal VMM/core retry path while the actual driver stays healthy.
+exercise the normal VMM/core error propagation while the actual driver stays
+healthy.
+The checked XPU destroy reports a terminal state for generic/device-loss
+release errors: the graph handle remains owned and no second native release is
+attempted in that process. OOM-style failures retain the retry route.
 
 For a Linux source wheel containing `malloc_graph.py`, the builder requires the
 complete provider module set and all twelve compiler ABI/provenance exports in

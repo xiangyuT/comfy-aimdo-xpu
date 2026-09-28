@@ -30,6 +30,24 @@ def _destroy_graph_checked(library, handle: int) -> bool:
     return bool(destroy(ctypes.c_void_p(int(handle))))
 
 
+def _destroy_graph_terminal(library, handle: int) -> bool:
+    terminal = getattr(library, "malloc_graph_destroy_terminal", None)
+    if terminal is None:
+        return False
+    terminal.argtypes = [ctypes.c_void_p]
+    terminal.restype = ctypes.c_bool
+    return bool(terminal(ctypes.c_void_p(int(handle))))
+
+
+def graph_destroy_terminal(graph) -> bool:
+    """Report whether an owner-thread diagnostic graph must exit the process."""
+    if not installed() or not getattr(graph, "_handle", None):
+        raise RuntimeError("native-owner diagnostic graph is not live")
+    if getattr(graph, "_owner_thread", None) is not threading.current_thread():
+        raise RuntimeError("graph destroy status requires the owner thread")
+    return _destroy_graph_terminal(graph._native_lib, graph._handle)
+
+
 def _register_graph(graph) -> None:
     with _graph_lock:
         _live_graphs.add(graph)
@@ -46,13 +64,20 @@ def drain_deferred_graphs() -> int:
     with _graph_lock:
         pending = _deferred_graphs.pop(owner, [])
     for index, (library, handle) in enumerate(pending):
+        terminal = False
         try:
-            if _destroy_graph_checked(library, handle):
+            terminal = _destroy_graph_terminal(library, handle)
+            if not terminal and _destroy_graph_checked(library, handle):
                 continue
+            terminal = terminal or _destroy_graph_terminal(library, handle)
         except Exception:
             pass
         with _graph_lock:
             _deferred_graphs.setdefault(owner, []).extend(pending[index:])
+        if terminal:
+            raise RuntimeError(
+                "terminal AIMDO graph destroy error; process must exit"
+            )
         raise RuntimeError("deferred AIMDO graph destroy failed on owner thread")
     return len(pending)
 

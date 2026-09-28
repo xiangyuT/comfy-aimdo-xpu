@@ -76,6 +76,11 @@ or virtual free function-pointer boundary. The core and VMM manager then take
 their normal error path. This tests metadata retention after earlier cleanup
 stages have succeeded; it still does not mean the hardware driver itself
 returned an error or mutated the targeted primitive before failing.
+An OOM-style release error may be retried with retained graph ownership. A
+generic or device-loss release error marks that diagnostic graph terminal:
+subsequent close calls do not re-enter native release, and deinitialization
+continues to refuse the live handle until process exit. The driver state after
+a real device loss is not assumed recoverable.
 
 Linux native mode keeps Torch's allocator, statistics and cache-management APIs.
 At model prioritization, Python publishes a cached-byte estimate to the hook.

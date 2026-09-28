@@ -219,6 +219,53 @@ def test_failed_checked_graph_close_keeps_handle_for_retry(monkeypatch):
     assert graph._handle is None
 
 
+def test_terminal_graph_close_preserves_handle_without_second_native_release(monkeypatch):
+    monkeypatch.setattr(native_owner, "_deferred_graphs", {})
+    calls = []
+
+    def destroy(handle):
+        calls.append(handle.value)
+        return False
+
+    def terminal(handle):
+        assert handle.value == 777
+        return bool(calls)
+
+    graph = malloc_graph.MallocGraph(
+        777, None, owner_thread=threading.current_thread(),
+        native_lib=SimpleNamespace(malloc_graph_destroy_checked=destroy,
+                                   malloc_graph_destroy_terminal=terminal),
+    )
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="terminal.*process must exit"):
+            graph.close()
+        assert graph._handle == 777
+    assert calls == [777]
+    graph._handle = None  # The fake native handle has no resource to release.
+
+
+def test_terminal_deferred_destroy_is_retained_without_native_retry(monkeypatch):
+    monkeypatch.setattr(native_owner, "_graph_lock", threading.Lock())
+    monkeypatch.setattr(native_owner, "_deferred_graphs", {})
+    calls = []
+
+    def destroy(handle):
+        calls.append(handle.value)
+        return False
+
+    def terminal(handle):
+        assert handle.value == 888
+        return True
+
+    library = SimpleNamespace(malloc_graph_destroy_checked=destroy,
+                              malloc_graph_destroy_terminal=terminal)
+    native_owner._defer_graph_destroy(threading.current_thread(), library, 888)
+    with pytest.raises(RuntimeError, match="terminal.*process must exit"):
+        native_owner.drain_deferred_graphs()
+    assert calls == []
+    assert native_owner.graph_ownership_snapshot()["deferred"] == 1
+
+
 def test_deinit_rejects_live_diagnostic_graph_before_native_cleanup(monkeypatch):
     library = SimpleNamespace()
     monkeypatch.setattr(control, "lib", library)
