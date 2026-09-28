@@ -97,6 +97,11 @@ the original graph thread. The owner drains pending tensor frees before graph
 pop, abort or destroy. Pending owners count as live at deinitialization; a
 failed owner-thread free blocks further graph work and requires process exit.
 This does not detect an unregistered asynchronous consumer.
+The proxy also tracks whether a native compiler owner thread has exited while
+its deferred-free queue is nonempty. This is independent of Python graph-object
+tracking: an unclaimed owner cannot be adopted by a later thread with a reused
+thread ID. New graph work and deinitialization fail closed until process exit,
+even when Python no longer has a graph handle to inspect.
 
 Linux native mode keeps Torch's allocator, statistics and cache-management APIs.
 At model prioritization, Python publishes a cached-byte estimate to the hook.

@@ -278,12 +278,34 @@ def test_deferred_compiler_free_drains_before_graph_destroy(monkeypatch):
         aimdo_full_proxy_is_installed=lambda: True,
         aimdo_full_proxy_drain_deferred_frees=lambda: calls.append(("tensor", 1)) or True,
         aimdo_full_proxy_deferred_free_count=lambda: 1,
+        aimdo_full_proxy_dead_deferred_free_count=lambda: 0,
     )
     monkeypatch.setattr(native_owner, "_library", proxy)
     native_owner._defer_graph_destroy(threading.current_thread(), library, 123)
     assert native_owner.pending_compiler_frees() == 1
     assert native_owner.drain_deferred_graphs() == 1
     assert calls == [("tensor", 1), ("graph", 123)]
+
+
+def test_dead_native_owner_blocks_work_without_python_graph_handle(monkeypatch):
+    monkeypatch.setattr(native_owner, "_graph_lock", threading.Lock())
+    monkeypatch.setattr(native_owner, "_live_graphs", weakref.WeakSet())
+    monkeypatch.setattr(native_owner, "_deferred_graphs", {})
+    fake = SimpleNamespace(
+        aimdo_full_proxy_is_installed=lambda: True,
+        aimdo_full_proxy_dead_deferred_free_count=lambda: 1,
+        aimdo_full_proxy_drain_deferred_frees=lambda: pytest.fail(
+            "dead native owner was drained by a different thread"),
+    )
+    monkeypatch.setattr(native_owner, "_library", fake)
+    assert native_owner.dead_owner_graphs() == 0
+    assert native_owner.dead_pending_compiler_frees() == 1
+    with pytest.raises(RuntimeError, match="owner thread exited; process must exit"):
+        native_owner.drain_deferred_graphs()
+    monkeypatch.setattr(control, "lib", SimpleNamespace())
+    monkeypatch.setattr(control, "implementation", "xpu")
+    with pytest.raises(RuntimeError, match="owner thread exited; process must exit"):
+        control.deinit()
 
 
 def test_failed_deferred_compiler_free_blocks_graph_destroy(monkeypatch):

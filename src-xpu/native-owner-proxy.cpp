@@ -26,6 +26,13 @@
 namespace {
 
 uint64_t current_thread_token();
+struct ThreadState {
+    explicit ThreadState(uint64_t value) : token(value) {}
+    uint64_t token;
+    std::atomic<bool> alive{true};
+    std::atomic<uint64_t> pending{0};
+};
+std::shared_ptr<ThreadState> current_thread_state();
 
 struct Owner {
     explicit Owner(c10::DataPtr &&value) : kind(Kind::Native), native(std::move(value)) {}
@@ -36,7 +43,8 @@ struct Owner {
           uint64_t stream, int device)
         : kind(Kind::Compiler), custom_pointer(reinterpret_cast<void *>(pointer)),
           custom_bytes(bytes), custom_queue(queue), compiler_stream(stream),
-          compiler_device(device), creator_token(current_thread_token()) {}
+          compiler_device(device), creator_state(current_thread_state()),
+          creator_token(creator_state->token) {}
     ~Owner();
     bool wait_consumers();
     enum class Kind { Native, Custom, Compiler } kind;
@@ -49,6 +57,7 @@ struct Owner {
     bool accounted = false;
     uint64_t compiler_stream = 0;
     int compiler_device = -1;
+    std::shared_ptr<ThreadState> creator_state;
     uint64_t creator_token = 0;
     bool fenced = false;
 };
@@ -80,6 +89,24 @@ using DeferredFrees =
 DeferredFrees *g_deferred_frees = new DeferredFrees(); // Never drain on process teardown.
 std::atomic<uint64_t> g_deferred_free_count{0};
 std::atomic<bool> g_compiler_terminal{false};
+struct ThreadExitGuard {
+    std::shared_ptr<ThreadState> state;
+    ~ThreadExitGuard() {
+        if (!state) return;
+        state->alive.store(false);
+        if (state->pending.load()) {
+            g_compiler_terminal.store(true, std::memory_order_release);
+        }
+    }
+};
+thread_local ThreadExitGuard g_thread_exit_guard;
+std::shared_ptr<ThreadState> current_thread_state() {
+    if (!g_thread_exit_guard.state) {
+        g_thread_exit_guard.state =
+            std::make_shared<ThreadState>(current_thread_token());
+    }
+    return g_thread_exit_guard.state;
+}
 std::mutex g_scoped_raw_mutex;
 std::unordered_map<void *, ScopedRaw> g_scoped_raw;
 std::atomic<uint64_t> g_allocations{0};
@@ -225,6 +252,10 @@ void proxy_delete(void *pointer) {
                     std::lock_guard<std::mutex> guard(g_deferred_mutex);
                     (*g_deferred_frees)[owner->creator_token].push_back(owner);
                     g_deferred_free_count.fetch_add(1, std::memory_order_relaxed);
+                    owner->creator_state->pending.fetch_add(1);
+                    if (!owner->creator_state->alive.load()) {
+                        g_compiler_terminal.store(true, std::memory_order_release);
+                    }
                 } catch (...) {
                     terminalize_compiler_owner(owner);
                 }
@@ -527,6 +558,7 @@ aimdo_full_proxy_drain_deferred_frees() {
                 found->second.pop_front();
                 if (found->second.empty()) g_deferred_frees->erase(found);
                 g_deferred_free_count.fetch_sub(1, std::memory_order_relaxed);
+                owner->creator_state->pending.fetch_sub(1);
             }
             const uint64_t failures =
                 g_compiler_failures.load(std::memory_order_acquire);
@@ -546,6 +578,19 @@ aimdo_full_proxy_drain_deferred_frees() {
 extern "C" __attribute__((visibility("default"))) uint64_t
 aimdo_full_proxy_deferred_free_count() {
     return g_deferred_free_count.load(std::memory_order_acquire);
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t
+aimdo_full_proxy_dead_deferred_free_count() {
+    uint64_t count = 0;
+    std::lock_guard<std::mutex> guard(g_deferred_mutex);
+    for (const auto &[token, pending] : *g_deferred_frees) {
+        (void)token;
+        for (const auto &owner : pending) {
+            count += !owner->creator_state->alive.load();
+        }
+    }
+    return count;
 }
 
 extern "C" __attribute__((visibility("default"))) bool

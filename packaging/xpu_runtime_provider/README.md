@@ -101,6 +101,10 @@ free to the original graph thread. Graph operations drain those frees before
 pop/abort/destroy; deinitialization counts outstanding deferred owners as live.
 A failed deferred free is terminal, while unregistered consumers remain outside
 the diagnostic contract.
+The sidecar's unique native thread identity marks a pending owner terminal if
+its original thread exits. The Python guard checks this state before later
+graph work or deinitialization, including when no Python graph handle remains.
+No other thread drains that queue; process exit is required.
 
 For a Linux source wheel containing `malloc_graph.py`, the builder requires the
 complete provider module set and all twelve compiler ABI/provenance exports in
