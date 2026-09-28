@@ -1282,15 +1282,15 @@ static void free_events(Event **events, size_t count) {
     free(events);
 }
 
-SHARED_EXPORT void malloc_graph_destroy(void *handle) {
+static bool destroy_graph(void *handle) {
     MallocGraph *g = handle;
 
     if (!g || g->owner_thread != &active_graph) {
-        return;
+        return false;
     }
 
     if (g->state && !abort_graph(g)) {
-        return;
+        return false;
     }
 
     while (g->state) {
@@ -1299,6 +1299,55 @@ SHARED_EXPORT void malloc_graph_destroy(void *handle) {
         free(state);
     }
 
+#ifdef AIMDO_XPU
+    /* Keep failed releases reachable for a later retry on the owner thread. */
+    bool released = true;
+    for (size_t i = 0; i < g->va_count; i++) {
+        if (g->mapped_pages[i]) {
+            if (physical_page_unref(g->mapped_pages[i]) == CUDA_SUCCESS) {
+                g->mapped_pages[i] = NULL;
+            } else {
+                released = false;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < g->phys_count; i++) {
+        if (g->physical_pages[i]) {
+            if (physical_page_unref(g->physical_pages[i]) == CUDA_SUCCESS) {
+                g->physical_pages[i] = NULL;
+            } else {
+                released = false;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < g->small_pages; i++) {
+        if (g->small_mapped_pages[i]) {
+            if (physical_page_unref(g->small_mapped_pages[i]) == CUDA_SUCCESS) {
+                g->small_mapped_pages[i] = NULL;
+            } else {
+                released = false;
+            }
+        }
+        if (g->small_physical_pages[i]) {
+            if (physical_page_unref(g->small_physical_pages[i]) == CUDA_SUCCESS) {
+                g->small_physical_pages[i] = NULL;
+            } else {
+                released = false;
+            }
+        }
+    }
+    if (!released) return false;
+    if (g->base) {
+        if (virtual_range_unref(g->base) != CUDA_SUCCESS) return false;
+        g->base = NULL;
+    }
+    if (g->small_base) {
+        if (virtual_range_unref(g->small_base) != CUDA_SUCCESS) return false;
+        g->small_base = NULL;
+    }
+#else
     for (size_t i = 0; i < g->va_count; i++) {
         if (g->mapped_pages[i]) {
             physical_page_unref(g->mapped_pages[i]);
@@ -1316,13 +1365,25 @@ SHARED_EXPORT void malloc_graph_destroy(void *handle) {
 
     virtual_range_unref(g->base);
     virtual_range_unref(g->small_base);
+#endif
     free_small_ranges(g->root.small_snapshot);
     free_small_ranges(g->small_ranges);
     free_small_ranges(g->small_unusable);
     free(g->root.snapshot);
     free_events(g->root.next, g->root.next_count);
     free(g);
+    return true;
 }
+
+SHARED_EXPORT void malloc_graph_destroy(void *handle) {
+    (void)destroy_graph(handle);
+}
+
+#ifdef AIMDO_XPU
+SHARED_EXPORT bool malloc_graph_destroy_checked(void *handle) {
+    return destroy_graph(handle);
+}
+#endif
 
 /* A built core is not an installed logical-allocation router. */
 SHARED_EXPORT uint32_t malloc_graph_abi_version(void) { return 1; }

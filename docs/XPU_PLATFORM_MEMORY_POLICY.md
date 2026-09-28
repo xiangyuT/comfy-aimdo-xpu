@@ -55,6 +55,15 @@ to Torch's native allocator and tracks their release separately from compiler
 compiler-owner query so operator probes can detect output routing gaps. This
 path does not make unregistered consumers or arbitrary operators supported.
 
+For the optional Torch 2.14 diagnostic graph, native destruction now reports
+whether the owner thread actually released its graph. A close requested from
+another Python thread is retained for the creator thread to drain; AIMDO
+deinitialization refuses outstanding graph handles. This does not make active
+graph cancellation or arbitrary cross-thread consumers public functionality.
+It also refuses live native-owner or scoped raw allocations after a graph has
+handed an escaped compiler tensor to rogue ownership; final tensor free must
+finish before native cleanup.
+
 Linux native mode keeps Torch's allocator, statistics and cache-management APIs.
 At model prioritization, Python publishes a cached-byte estimate to the hook.
 A budget deficit uses Torch's cache-release retry only when that estimate is

@@ -11,11 +11,59 @@ import ctypes
 import os
 from pathlib import Path
 import platform
+import threading
+import weakref
 
 
 _TORCH_VERSION = "2.14.0+xpu"
 _ENVIRONMENT_FLAG = "AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC"
 _library = None
+_graph_lock = threading.Lock()
+_live_graphs = weakref.WeakSet()
+_deferred_graphs = {}
+
+
+def _destroy_graph_checked(library, handle: int) -> bool:
+    destroy = library.malloc_graph_destroy_checked
+    destroy.argtypes = [ctypes.c_void_p]
+    destroy.restype = ctypes.c_bool
+    return bool(destroy(ctypes.c_void_p(int(handle))))
+
+
+def _register_graph(graph) -> None:
+    with _graph_lock:
+        _live_graphs.add(graph)
+
+
+def _defer_graph_destroy(owner: threading.Thread, library, handle: int) -> None:
+    with _graph_lock:
+        _deferred_graphs.setdefault(owner, []).append((library, int(handle)))
+
+
+def drain_deferred_graphs() -> int:
+    """Complete queued graph closes on their original Python owner thread."""
+    owner = threading.current_thread()
+    with _graph_lock:
+        pending = _deferred_graphs.pop(owner, [])
+    for index, (library, handle) in enumerate(pending):
+        try:
+            if _destroy_graph_checked(library, handle):
+                continue
+        except Exception:
+            pass
+        with _graph_lock:
+            _deferred_graphs.setdefault(owner, []).extend(pending[index:])
+        raise RuntimeError("deferred AIMDO graph destroy failed on owner thread")
+    return len(pending)
+
+
+def graph_ownership_snapshot() -> dict[str, int]:
+    """Count live diagnostic graph handles and deferred owner-thread closes."""
+    with _graph_lock:
+        return {
+            "live": sum(bool(getattr(graph, "_handle", None)) for graph in _live_graphs),
+            "deferred": sum(map(len, _deferred_graphs.values())),
+        }
 
 
 def requested() -> bool:
@@ -182,6 +230,9 @@ def record_diagnostic(stream, assert_graph_breaks: bool = False):
     if control.lib is None or control.implementation != "xpu" or \
             control.get_xpu_allocator_mode() != "native_hook":
         raise RuntimeError("native-owner graph requires active XPU native_hook")
+    drain_deferred_graphs()
+    if not hasattr(control.lib, "malloc_graph_destroy_checked"):
+        raise RuntimeError("native-owner checked graph destroy export is missing")
     device = getattr(stream, "device", None)
     if getattr(device, "type", None) != "xpu":
         raise ValueError("native-owner graph requires an XPU stream")
@@ -199,7 +250,20 @@ def record_diagnostic(stream, assert_graph_breaks: bool = False):
     if not handle:
         raise RuntimeError("AIMDO native-owner graph creation failed")
     from .malloc_graph import MallocGraph
-    return MallocGraph(handle, stream)
+    graph = None
+    try:
+        graph = MallocGraph(
+            handle, stream, owner_thread=threading.current_thread(),
+            native_lib=control.lib,
+        )
+        _register_graph(graph)
+    except BaseException:
+        if graph is not None:
+            graph._handle = None
+        if not _destroy_graph_checked(control.lib, handle):
+            _defer_graph_destroy(threading.current_thread(), control.lib, handle)
+        raise
+    return graph
 
 
 @contextlib.contextmanager

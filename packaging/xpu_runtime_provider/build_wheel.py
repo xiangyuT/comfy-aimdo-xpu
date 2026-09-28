@@ -46,6 +46,7 @@ _NATIVE_OWNER_SYMBOLS = (
 )
 _NATIVE_OWNER_CORE_SYMBOLS = (
     "malloc_graph_free_owned", "malloc_graph_test_fail_next_page_creates",
+    "malloc_graph_destroy_checked",
 )
 
 

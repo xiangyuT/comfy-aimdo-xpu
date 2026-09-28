@@ -74,6 +74,11 @@ The sidecar also exposes diagnostic scoped-raw counters and a live
 compiler-owner query. Backend `raw_alloc` workspaces used inside an opt-in
 compiler scope remain owned by Torch's native allocator; the compiler owns
 only positive-size tensor requests served through its `DataPtr` route.
+The diagnostic graph also requires `malloc_graph_destroy_checked` from its
+matching D1 library. A foreign-thread close is queued to the graph's creator;
+deinitialization fails while any graph handle remains live or deferred.
+An escaped compiler tensor or scoped raw workspace must also release its owner
+before deinitialization can clean native state.
 
 For a Linux source wheel containing `malloc_graph.py`, the builder requires the
 complete provider module set and all twelve compiler ABI/provenance exports in

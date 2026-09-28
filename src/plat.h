@@ -289,6 +289,8 @@ SHARED_EXPORT
 bool malloc_graph_free_owned(CUdeviceptr ptr, CUstream owner_stream, int *result);
 SHARED_EXPORT
 bool malloc_graph_test_fail_next_page_creates(unsigned attempts);
+SHARED_EXPORT
+bool malloc_graph_destroy_checked(void *handle);
 #endif
 bool malloc_graph_sync_paused(void);
 

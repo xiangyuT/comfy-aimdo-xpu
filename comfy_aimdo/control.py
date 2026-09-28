@@ -700,6 +700,21 @@ def deinit():
     global lib, devctxs, _log_callback, _xpu_allocator_ready
     global _memory_compiler_native
     if lib is not None:
+        if implementation == "xpu":
+            from . import native_owner
+
+            if native_owner.installed():
+                native_owner.drain_deferred_graphs()
+                graphs = native_owner.graph_ownership_snapshot()
+                if graphs["live"] or graphs["deferred"]:
+                    raise RuntimeError(
+                        "cannot deinitialize AIMDO while diagnostic graphs remain live"
+                    )
+                if (native_owner.snapshot()[0]
+                        or native_owner.scoped_raw_snapshot()[0]):
+                    raise RuntimeError(
+                        "cannot deinitialize AIMDO while native-owner allocations remain live"
+                    )
         if implementation == "xpu" and _xpu_allocator_ready:
             if _xpu_allocator_mode == "native_hook":
                 import torch

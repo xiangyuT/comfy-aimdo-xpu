@@ -1,6 +1,8 @@
 """Fail-closed admission for the opt-in Torch 2.14 native-owner sidecar."""
 
+import threading
 from types import SimpleNamespace
+import weakref
 
 import pytest
 
@@ -103,6 +105,81 @@ def test_scoped_raw_owner_diagnostics(monkeypatch):
     assert native_owner.scoped_raw_snapshot() == [0, 2, 2, 0, 0]
     assert native_owner.is_compiler_owner(0x1234)
     assert not native_owner.is_compiler_owner(0x5678)
+
+
+def test_foreign_thread_graph_close_is_drained_by_owner(monkeypatch):
+    monkeypatch.setattr(native_owner, "_graph_lock", threading.Lock())
+    monkeypatch.setattr(native_owner, "_live_graphs", weakref.WeakSet())
+    monkeypatch.setattr(native_owner, "_deferred_graphs", {})
+    owner = threading.current_thread()
+    calls = []
+
+    def destroy(handle):
+        calls.append((threading.current_thread(), handle.value))
+        return True
+
+    library = SimpleNamespace(malloc_graph_destroy_checked=destroy)
+    graph = malloc_graph.MallocGraph(99, None, owner_thread=owner, native_lib=library)
+    native_owner._register_graph(graph)
+    results = []
+    worker = threading.Thread(target=lambda: results.append(graph.close()))
+    worker.start()
+    worker.join()
+    assert results == [False]
+    assert calls == []
+    assert native_owner.graph_ownership_snapshot() == {"live": 0, "deferred": 1}
+    assert native_owner.drain_deferred_graphs() == 1
+    assert calls == [(owner, 99)]
+    assert native_owner.graph_ownership_snapshot() == {"live": 0, "deferred": 0}
+
+
+def test_failed_checked_graph_close_keeps_handle_for_retry(monkeypatch):
+    monkeypatch.setattr(native_owner, "_deferred_graphs", {})
+    outcomes = iter((False, True))
+
+    def destroy(handle):
+        assert handle.value == 123
+        return next(outcomes)
+
+    graph = malloc_graph.MallocGraph(
+        123, None, owner_thread=threading.current_thread(),
+        native_lib=SimpleNamespace(malloc_graph_destroy_checked=destroy),
+    )
+    with pytest.raises(RuntimeError, match="graph destroy failed"):
+        graph.close()
+    assert graph._handle == 123
+    assert graph.close() is True
+    assert graph._handle is None
+
+
+def test_deinit_rejects_live_diagnostic_graph_before_native_cleanup(monkeypatch):
+    library = SimpleNamespace()
+    monkeypatch.setattr(control, "lib", library)
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "_xpu_allocator_ready", False)
+    monkeypatch.setattr(native_owner, "installed", lambda: True)
+    monkeypatch.setattr(native_owner, "drain_deferred_graphs", lambda: 0)
+    monkeypatch.setattr(native_owner, "graph_ownership_snapshot",
+                        lambda: {"live": 1, "deferred": 0})
+    with pytest.raises(RuntimeError, match="diagnostic graphs remain live"):
+        control.deinit()
+    assert control.lib is library
+
+
+def test_deinit_rejects_rogue_native_owner_after_graph_close(monkeypatch):
+    library = SimpleNamespace()
+    monkeypatch.setattr(control, "lib", library)
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "_xpu_allocator_ready", False)
+    monkeypatch.setattr(native_owner, "installed", lambda: True)
+    monkeypatch.setattr(native_owner, "drain_deferred_graphs", lambda: 0)
+    monkeypatch.setattr(native_owner, "graph_ownership_snapshot",
+                        lambda: {"live": 0, "deferred": 0})
+    monkeypatch.setattr(native_owner, "snapshot", lambda: [1] + [0] * 16)
+    monkeypatch.setattr(native_owner, "scoped_raw_snapshot", lambda: [0] * 5)
+    with pytest.raises(RuntimeError, match="native-owner allocations remain live"):
+        control.deinit()
+    assert control.lib is library
 
 
 def test_graph_stream_switch_uses_xpu_queue_pointer(monkeypatch):
