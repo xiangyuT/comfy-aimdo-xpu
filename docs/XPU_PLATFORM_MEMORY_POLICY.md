@@ -50,6 +50,12 @@ entering later cannot repair work that was already unregistered. Torch's
 explicit stream registration or an equivalent caller-managed completion wait
 is required before compiler backing may be reused. This diagnostic helper does
 not discover arbitrary hidden consumers or enable public graph recording.
+Concurrent diagnostic graph threads bind the sidecar's D1 native entry points
+through one immutable function table. The first valid scope publishes that
+table atomically; later scopes require byte-identical function addresses and
+the expected source revision before routing allocations. Owner destructors
+load only the published table, so a concurrent scope cannot rewrite the
+functions used by an in-flight free.
 
 The opt-in Torch 2.14 diagnostic also exposes a bounded per-graph physical-page
 OOM injection. One failed attempt exercises the existing reclaim/retry path;

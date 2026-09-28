@@ -71,11 +71,15 @@ using CompilerAlloc = bool (*)(uint64_t *, size_t, void *);
 using CompilerFree = bool (*)(uint64_t, void *, int *);
 using CompilerRogue = bool (*)(uint64_t, int *);
 using SetDevice = bool (*)(int);
-CompilerAlloc g_compiler_alloc = nullptr;
-CompilerFree g_compiler_free = nullptr;
-CompilerFree g_compiler_free_owned = nullptr;
-CompilerRogue g_compiler_rogue = nullptr;
-SetDevice g_set_device = nullptr;
+struct CompilerFunctions {
+    CompilerAlloc alloc;
+    CompilerFree free;
+    CompilerFree free_owned;
+    CompilerRogue rogue;
+    SetDevice set_device;
+};
+std::mutex g_compiler_binding_mutex;
+std::atomic<const CompilerFunctions *> g_compiler_functions{nullptr};
 
 std::mutex g_owner_mutex;
 std::unordered_map<void *, std::shared_ptr<Owner>> g_owners;
@@ -165,17 +169,20 @@ Owner::~Owner() {
     }
     try {
         if (kind == Kind::Compiler) {
-            if (!g_set_device || !g_set_device(compiler_device) ||
-                !g_compiler_free_owned || !g_compiler_rogue) {
+            const auto *functions =
+                g_compiler_functions.load(std::memory_order_acquire);
+            if (!functions || !functions->set_device ||
+                !functions->set_device(compiler_device) ||
+                !functions->free_owned || !functions->rogue) {
                 g_compiler_failures.fetch_add(1, std::memory_order_relaxed);
                 g_compiler_terminal.store(true, std::memory_order_release);
                 return;
             }
             int result = -1;
             const uint64_t pointer = reinterpret_cast<uintptr_t>(custom_pointer);
-            bool handled = g_compiler_rogue(pointer, &result);
+            bool handled = functions->rogue(pointer, &result);
             if (!handled) {
-                handled = g_compiler_free_owned(pointer,
+                handled = functions->free_owned(pointer,
                     reinterpret_cast<void *>(compiler_stream), &result);
             }
             if (!handled || result != 0) {
@@ -228,13 +235,17 @@ void proxy_delete(void *pointer) {
     }
     if (owner->kind == Owner::Kind::Compiler &&
         owner->creator_token != current_thread_token()) {
+        const auto *functions =
+            g_compiler_functions.load(std::memory_order_acquire);
         if (g_compiler_terminal.load(std::memory_order_acquire) ||
-            !owner->wait_consumers() || !g_set_device ||
-            !g_set_device(owner->compiler_device) || !g_compiler_rogue) {
+            !owner->wait_consumers() || !functions ||
+            !functions->set_device ||
+            !functions->set_device(owner->compiler_device) ||
+            !functions->rogue) {
             terminalize_compiler_owner(owner);
         } else {
             int result = -1;
-            bool handled = g_compiler_rogue(
+            bool handled = functions->rogue(
                 reinterpret_cast<uintptr_t>(pointer), &result);
             if (handled) {
                 if (result == 0) {
@@ -376,14 +387,18 @@ public:
                     "terminal compiler owner error; process must exit");
             }
             if (!bytes) return native_->allocate(0);
+            const auto *functions =
+                g_compiler_functions.load(std::memory_order_acquire);
             if ((g_compiler_scope_bytes && bytes != g_compiler_scope_bytes) ||
-                !g_compiler_scope_stream || !g_compiler_alloc || !g_set_device) {
+                !g_compiler_scope_stream || !functions ||
+                !functions->alloc || !functions->set_device) {
                 throw std::runtime_error("invalid compiler scope allocation request");
             }
             const auto device = c10::xpu::current_device();
             sycl::queue queue = c10::xpu::getCurrentXPUStream(device).queue();
             auto *supplied = reinterpret_cast<sycl::queue *>(g_compiler_scope_stream);
-            if (!supplied || *supplied != queue || !g_set_device(device)) {
+            if (!supplied || *supplied != queue ||
+                !functions->set_device(device)) {
                 throw std::runtime_error("compiler queue or device differs");
             }
             uint64_t address = 0;
@@ -392,7 +407,7 @@ public:
             if (synthetic_duplicate) {
                 address = reinterpret_cast<uintptr_t>(synthetic_duplicate);
             } else {
-                if (!g_compiler_alloc(&address, bytes,
+                if (!functions->alloc(&address, bytes,
                                       reinterpret_cast<void *>(g_compiler_scope_stream)) ||
                     !address) {
                     throw std::runtime_error("AIMDO compiler allocation was not handled");
@@ -405,7 +420,7 @@ public:
             } catch (...) {
                 if (!synthetic_duplicate) {
                     int status = -1;
-                    (void)g_compiler_free(address,
+                    (void)functions->free(address,
                         reinterpret_cast<void *>(g_compiler_scope_stream), &status);
                 }
                 throw;
@@ -720,11 +735,22 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler
         dlsym(RTLD_DEFAULT, "set_devctx_for_device"));
     if (!source || !alloc || !free || !free_owned || !rogue || !set_device ||
         std::strcmp(source(), expected_revision) != 0) return false;
-    g_compiler_alloc = alloc;
-    g_compiler_free = free;
-    g_compiler_free_owned = free_owned;
-    g_compiler_rogue = rogue;
-    g_set_device = set_device;
+    {
+        std::lock_guard<std::mutex> guard(g_compiler_binding_mutex);
+        const auto *bound =
+            g_compiler_functions.load(std::memory_order_acquire);
+        if (bound) {
+            if (bound->alloc != alloc || bound->free != free ||
+                bound->free_owned != free_owned || bound->rogue != rogue ||
+                bound->set_device != set_device) return false;
+        } else {
+            auto *created = new (std::nothrow) CompilerFunctions{
+                alloc, free, free_owned, rogue, set_device};
+            if (!created) return false;
+            // The table is immutable and retained for the sidecar's lifetime.
+            g_compiler_functions.store(created, std::memory_order_release);
+        }
+    }
     g_compiler_scope_bytes = bytes;
     g_compiler_scope_stream = stream;
     g_compiler_scope = true;

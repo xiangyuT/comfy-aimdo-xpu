@@ -70,6 +70,10 @@ The opt-in Python `native_owner.consumer_scope(tensor, stream)` verifies a live
 compiler-owned tensor on the same indexed XPU device and registers the stream
 before yielding to queued work. It is a caller contract, not automatic
 tracking: previously queued unregistered work remains outside the guarantee.
+The Torch 2.14 sidecar publishes its D1 function pointers once as an immutable
+table. Later compiler scopes verify the same native addresses and source
+revision; concurrent graph threads do not overwrite pointers read by tensor
+allocation or final release.
 Its additional `malloc_graph_test_fail_next_page_creates` export supports a
 bounded, active-graph-only synthetic OOM diagnostic. One rejected page attempt
 exercises retry; two rejected attempts exercise failure propagation. Neither
