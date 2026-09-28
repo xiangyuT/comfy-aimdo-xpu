@@ -6,7 +6,7 @@ import subprocess
 import types
 
 import pytest
-from comfy_aimdo import control, malloc_graph
+from comfy_aimdo import control, malloc_graph, native_owner
 
 
 class Function:
@@ -80,11 +80,64 @@ def test_core_build_does_not_claim_xpu_execution(monkeypatch):
 
 
 def test_capability_query_before_init_is_read_only(monkeypatch):
+    monkeypatch.setattr(control.platform, "system", lambda: "Linux")
     monkeypatch.setattr(control, "lib", None)
+    monkeypatch.setattr(native_owner, "installed", lambda: False)
     monkeypatch.setattr(control.ctypes, "CDLL", lambda *a, **k: pytest.fail("read-only capability loaded a DSO"))
     capability = control.get_memory_compiler_capability()
     assert capability["reason"] == "not_initialized"
     assert not capability["core_built"] and not capability["available"]
+    assert capability["native_owner_diagnostic"] == {
+        "installed": False, "active": False, "entrypoint": None,
+        "consumer_contract": None, "public_available": False,
+        "reason": "not_installed",
+    }
+
+
+def test_native_owner_diagnostic_capability_is_separate_from_public_record(monkeypatch):
+    native = library()
+    native._name = "/no-library-loaded-by-this-fixture"
+    monkeypatch.setattr(control.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(control, "lib", native)
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "_memory_compiler_native",
+                        control._bind_memory_compiler(native, "xpu"))
+    monkeypatch.setattr(control, "_xpu_allocator_mode", "native_hook")
+    monkeypatch.setattr(control, "_xpu_allocator_ready", True)
+    monkeypatch.setattr(native_owner, "installed", lambda: True)
+    capability = control.get_memory_compiler_capability()
+    assert capability["native_owner_diagnostic"] == {
+        "installed": True, "active": True,
+        "entrypoint": "native_owner.record_diagnostic",
+        "consumer_contract": "explicit_record_stream",
+        "public_available": False, "reason": "opt_in_component_only",
+    }
+    assert not capability["available"] and not capability["memory_only"]
+    assert not capability["xpu_consumer_tracking"]
+    stream = types.SimpleNamespace(device=types.SimpleNamespace(type="xpu", index=0))
+    with pytest.raises(NotImplementedError, match="not yet supported on XPU"):
+        malloc_graph.record(stream)
+    assert not native.malloc_graph_create.calls
+    monkeypatch.setattr(control, "_xpu_allocator_ready", False)
+    diagnostic = control.get_memory_compiler_capability()["native_owner_diagnostic"]
+    assert diagnostic["installed"] and not diagnostic["active"]
+    assert diagnostic["entrypoint"] is None and diagnostic["consumer_contract"] is None
+    assert diagnostic["reason"] == "installed_context_inactive"
+    monkeypatch.setattr(control, "_xpu_allocator_ready", True)
+    monkeypatch.setattr(control, "lib", None)
+    diagnostic = control.get_memory_compiler_capability()["native_owner_diagnostic"]
+    assert diagnostic["installed"] and not diagnostic["active"]
+    assert diagnostic["reason"] == "installed_context_inactive"
+
+
+def test_non_linux_capability_does_not_query_native_owner(monkeypatch):
+    monkeypatch.setattr(control.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(control, "lib", None)
+    monkeypatch.setattr(native_owner, "installed",
+                        lambda: pytest.fail("Windows queried Linux native-owner sidecar"))
+    diagnostic = control.get_memory_compiler_capability()["native_owner_diagnostic"]
+    assert diagnostic["installed"] is False and diagnostic["active"] is False
+    assert diagnostic["public_available"] is False and diagnostic["reason"] == "linux_only"
 
 
 def test_legacy_cuda_abi_preserves_stream_and_pointer_contract(monkeypatch):

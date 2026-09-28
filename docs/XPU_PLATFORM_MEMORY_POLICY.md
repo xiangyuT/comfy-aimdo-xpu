@@ -26,6 +26,13 @@ have a separate owner. This process-lifetime experiment does not change the
 default `native_hook` route or public memory-compiler capability. The proxy's
 private C10/XPU ABI, stream and failure contracts need separate validation
 before it can become a supported allocator path.
+The read-only `get_memory_compiler_capability()` query reports this path under
+`native_owner_diagnostic`: process installation, active `native_hook` context,
+its opt-in graph entry point and explicit `record_stream` consumer contract are
+separate from public `available=false` and `xpu_consumer_tracking=false`.
+After `deinit()`, the process-lifetime proxy can remain installed while the
+diagnostic context is inactive. This status query loads no new DSO and performs
+no XPU allocation.
 
 The diagnostic sidecar treats a failed owner-map insertion after a fresh
 compiler allocation as a rollback: the unregistered owner releases that new

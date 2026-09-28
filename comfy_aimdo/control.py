@@ -75,15 +75,30 @@ def get_memory_compiler_capability():
     """
     import hashlib
 
+    system = platform.system()
     native = _memory_compiler_native if lib is not None else None
     available = bool(native and native["router_available"])
     reason = ("not_initialized" if lib is None else
               "logical_allocator_router_unavailable" if native and not available else
               "native_abi_unavailable" if not native else None)
     path = Path(lib._name).resolve() if lib is not None else None
+    diagnostic_installed = False
+    if system == "Linux":
+        from . import native_owner
+
+        diagnostic_installed = native_owner.installed()
+    diagnostic_active = bool(
+        diagnostic_installed and lib is not None and implementation == "xpu"
+        and _xpu_allocator_mode == "native_hook" and _xpu_allocator_ready
+    )
+    diagnostic_reason = (
+        "opt_in_component_only" if diagnostic_active else
+        "installed_context_inactive" if diagnostic_installed else
+        "not_installed" if system == "Linux" else "linux_only"
+    )
     return {
         "schema_version": 1, "backend": implementation,
-        "platform": platform.system(), "allocator_mode": _xpu_allocator_mode,
+        "platform": system, "allocator_mode": _xpu_allocator_mode,
         "core_built": bool(native), "abi_revision": native["abi_revision"] if native else None,
         "native_symbols_complete": bool(native),
         "source_revision": native["source_revision"] if native else None,
@@ -93,6 +108,12 @@ def get_memory_compiler_capability():
         "memory_only": available, "available": available, "reason": reason,
         "logical_allocation_tracking": available,
         "execution_graph": False, "xpu_consumer_tracking": False,
+        "native_owner_diagnostic": {
+            "installed": diagnostic_installed, "active": diagnostic_active,
+            "entrypoint": "native_owner.record_diagnostic" if diagnostic_active else None,
+            "consumer_contract": "explicit_record_stream" if diagnostic_active else None,
+            "public_available": False, "reason": diagnostic_reason,
+        },
     }
 
 

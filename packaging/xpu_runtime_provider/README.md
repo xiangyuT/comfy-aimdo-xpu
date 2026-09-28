@@ -131,6 +131,11 @@ explicit `record(xpu_stream)` raises an unsupported error. `malloc_graph` and
 `control` must resolve to the same provider directory. A missing local module or
 native ABI prevents Linux XPU initialization before allocator installation.
 
+The additive `native_owner_diagnostic` field reports whether the private proxy
+is installed and active, and names its explicit `record_stream` caller contract.
+It never makes public `available` true, including after an opt-in install.
+The query remains read-only before initialization and after `deinit()`.
+
 ComfyUI-OmniXPU activates this provider only when DynamicVRAM is explicitly
 enabled and the official AIMDO attempt has left no live native or allocator
 state. The provider defaults to `native_hook` on Linux and Windows, keeping
