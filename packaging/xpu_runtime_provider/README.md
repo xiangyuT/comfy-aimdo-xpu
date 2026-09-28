@@ -77,6 +77,9 @@ only positive-size tensor requests served through its `DataPtr` route.
 The diagnostic graph also requires `malloc_graph_destroy_checked` from its
 matching D1 library. A foreign-thread close is queued to the graph's creator;
 deinitialization fails while any graph handle remains live or deferred.
+The creator's later `close()` or repeated `abort()` on that graph drains the
+queued close before returning; cleanup failures still propagate and retain
+native ownership.
 An escaped compiler tensor or scoped raw workspace must also release its owner
 before deinitialization can clean native state.
 The matching D1 library additionally exposes a completed-graph-only synthetic

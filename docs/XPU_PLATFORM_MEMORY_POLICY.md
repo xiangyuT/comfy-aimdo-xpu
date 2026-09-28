@@ -60,6 +60,11 @@ whether the owner thread actually released its graph. A close requested from
 another Python thread is retained for the creator thread to drain; AIMDO
 deinitialization refuses outstanding graph handles. This does not make active
 graph cancellation or arbitrary cross-thread consumers public functionality.
+If that creator later calls `close()` or repeats `abort()` on the same Python
+graph object, it first drains its queued native close. A different graph method
+also drains the queue before reporting that the object is closed. An owner-side
+cleanup failure remains visible and retains the queued handle for retry or
+process exit.
 It also refuses live native-owner or scoped raw allocations after a graph has
 handed an escaped compiler tensor to rogue ownership; final tensor free must
 finish before native cleanup.

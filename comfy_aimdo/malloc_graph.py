@@ -19,13 +19,13 @@ class MallocGraph:
         self._lifecycle_lock = threading.RLock()
 
     def _check_owner(self):
-        if not self._handle:
-            raise RuntimeError("AIMDO memory graph is closed")
         if self._owner_thread is not None:
             if threading.current_thread() is not self._owner_thread:
                 raise RuntimeError("AIMDO diagnostic graph requires its owner thread")
             from . import native_owner
             native_owner.drain_deferred_graphs()
+        if not self._handle:
+            raise RuntimeError("AIMDO memory graph is closed")
 
     def _call(self, function, *args):
         with self._lifecycle_lock:
@@ -47,8 +47,14 @@ class MallocGraph:
         return broken
 
     def abort(self):
-        self._call(control.lib.malloc_graph_abort)
-        self._scopes.clear()
+        with self._lifecycle_lock:
+            if self._owner_thread is threading.current_thread() and not self._handle:
+                from . import native_owner
+                native_owner.drain_deferred_graphs()
+                self._scopes.clear()
+                return
+            self._call(control.lib.malloc_graph_abort)
+            self._scopes.clear()
 
     def pause(self, sync=False):
         self._call(control.lib.malloc_graph_pause, True, sync)
@@ -99,6 +105,9 @@ class MallocGraph:
         with self._lifecycle_lock:
             handle = self._handle
             if not handle:
+                if self._owner_thread is threading.current_thread():
+                    from . import native_owner
+                    native_owner.drain_deferred_graphs()
                 return True
             if self._owner_thread is not None:
                 from . import native_owner

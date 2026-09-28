@@ -200,6 +200,73 @@ def test_foreign_thread_graph_close_is_drained_by_owner(monkeypatch):
     assert native_owner.graph_ownership_snapshot() == {"live": 0, "deferred": 0}
 
 
+@pytest.mark.parametrize("owner_action", ("close", "abort", "pop"))
+def test_owner_cleanup_after_foreign_close_drains_queued_handle(monkeypatch, owner_action):
+    monkeypatch.setattr(native_owner, "_graph_lock", threading.Lock())
+    monkeypatch.setattr(native_owner, "_live_graphs", weakref.WeakSet())
+    monkeypatch.setattr(native_owner, "_deferred_graphs", {})
+    owner = threading.current_thread()
+    released = []
+
+    def destroy(handle):
+        released.append((threading.current_thread(), handle.value))
+        return True
+
+    library = SimpleNamespace(
+        malloc_graph_destroy_checked=destroy,
+        malloc_graph_abort=lambda handle: pytest.fail("closed handle was aborted"),
+        malloc_graph_pop=lambda handle: pytest.fail("closed handle was popped"),
+    )
+    monkeypatch.setattr(control, "lib", library)
+    graph = malloc_graph.MallocGraph(4321, None, owner_thread=owner, native_lib=library)
+    native_owner._register_graph(graph)
+    graph._scopes.append("cancelled")
+    worker = threading.Thread(target=graph.close)
+    worker.start()
+    worker.join()
+    assert native_owner.graph_ownership_snapshot() == {"live": 0, "deferred": 1}
+    assert released == []
+
+    if owner_action == "pop":
+        with pytest.raises(RuntimeError, match="graph is closed"):
+            graph.pop()
+    elif owner_action == "abort":
+        assert graph.abort() is None
+    else:
+        assert graph.close() is True
+    assert released == [(owner, 4321)]
+    assert native_owner.graph_ownership_snapshot() == {"live": 0, "deferred": 0}
+    if owner_action == "abort":
+        assert graph._scopes == []
+
+
+def test_owner_close_retry_retains_failed_deferred_graph(monkeypatch):
+    monkeypatch.setattr(native_owner, "_graph_lock", threading.Lock())
+    monkeypatch.setattr(native_owner, "_live_graphs", weakref.WeakSet())
+    monkeypatch.setattr(native_owner, "_deferred_graphs", {})
+    owner = threading.current_thread()
+    calls = []
+
+    def destroy(handle):
+        calls.append((threading.current_thread(), handle.value))
+        return len(calls) == 2
+
+    graph = malloc_graph.MallocGraph(
+        8765, None, owner_thread=owner,
+        native_lib=SimpleNamespace(malloc_graph_destroy_checked=destroy),
+    )
+    native_owner._register_graph(graph)
+    worker = threading.Thread(target=graph.close)
+    worker.start()
+    worker.join()
+    with pytest.raises(RuntimeError, match="deferred AIMDO graph destroy failed"):
+        graph.close()
+    assert native_owner.graph_ownership_snapshot() == {"live": 0, "deferred": 1}
+    assert graph.close() is True
+    assert calls == [(owner, 8765), (owner, 8765)]
+    assert native_owner.graph_ownership_snapshot() == {"live": 0, "deferred": 0}
+
+
 def test_dead_owner_close_is_terminal_without_duplicate_queue_entry(monkeypatch):
     monkeypatch.setattr(native_owner, "_graph_lock", threading.Lock())
     monkeypatch.setattr(native_owner, "_live_graphs", weakref.WeakSet())
