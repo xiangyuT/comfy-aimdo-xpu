@@ -18,6 +18,8 @@ import weakref
 _TORCH_VERSION = "2.14.0+xpu"
 _ENVIRONMENT_FLAG = "AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC"
 _library = None
+_scope_context = threading.local()
+_scope_terminal = False
 _graph_lock = threading.Lock()
 _live_graphs = weakref.WeakSet()
 _deferred_graphs = {}
@@ -75,6 +77,8 @@ def dead_owner_graphs() -> int:
 
 def drain_deferred_graphs() -> int:
     """Complete queued tensor frees before graph closes on their owner thread."""
+    if _scope_terminal:
+        raise RuntimeError("native-owner compiler scope failed; process must exit")
     if dead_owner_graphs():
         raise RuntimeError(_DEAD_OWNER_ERROR)
     dead_frees = getattr(_library, "aimdo_full_proxy_dead_deferred_free_count", None)
@@ -351,6 +355,48 @@ def compiler_scope(stream):
 
 
 @contextlib.contextmanager
+def suspend_compiler_scope():
+    """Route allocations through native Torch while an owner scope is suspended.
+
+    This is private diagnostic state for a caller that pauses its memory graph.
+    The caller must resume that graph before this context exits. Nested
+    suspensions are allowed; nested compiler scopes remain unsupported.
+    """
+    global _scope_terminal
+    if _scope_terminal:
+        raise RuntimeError("native-owner compiler scope failed; process must exit")
+    state = getattr(_scope_context, "active", None)
+    if state is None or state["failed"]:
+        raise RuntimeError("suspension requires an active native-owner compiler scope")
+    if state["suspend_depth"] == 0:
+        if not _library.aimdo_full_proxy_compiler_end():
+            state["failed"] = True
+            _scope_terminal = True
+            raise RuntimeError("native-owner compiler suspension failed; process must exit")
+        state["native_active"] = False
+    state["suspend_depth"] += 1
+    try:
+        yield
+    finally:
+        state["suspend_depth"] -= 1
+        if state["suspend_depth"] == 0:
+            if _scope_terminal:
+                state["failed"] = True
+                raise RuntimeError("native-owner compiler scope failed; process must exit")
+            if getattr(_scope_context, "active", None) is not state:
+                state["failed"] = True
+                _scope_terminal = True
+                raise RuntimeError("native-owner compiler owner scope exited; process must exit")
+            if not _library.aimdo_full_proxy_compiler_begin(
+                state["size"], state["stream"], state["source_revision"]
+            ):
+                state["failed"] = True
+                _scope_terminal = True
+                raise RuntimeError("native-owner compiler resume failed; process must exit")
+            state["native_active"] = True
+
+
+@contextlib.contextmanager
 def consumer_scope(tensor, stream):
     """Register a compiler tensor before queued work on another XPU stream.
 
@@ -426,6 +472,11 @@ def record_diagnostic(stream, assert_graph_breaks: bool = False):
 
 @contextlib.contextmanager
 def _compiler_scope(size: int, stream):
+    global _scope_terminal
+    if _scope_terminal:
+        raise RuntimeError("native-owner compiler scope failed; process must exit")
+    if getattr(_scope_context, "active", None) is not None:
+        raise RuntimeError("nested native-owner compiler scopes are unsupported")
     if not installed():
         raise RuntimeError("native-owner diagnostic is not installed")
     drain_deferred_graphs()
@@ -440,12 +491,22 @@ def _compiler_scope(size: int, stream):
     source_revision = control.get_memory_compiler_capability()["source_revision"]
     if not stream_pointer or not source_revision:
         raise RuntimeError("native-owner scope lacks stream or D1 source identity")
+    revision_bytes = source_revision.encode("ascii")
     if not _library.aimdo_full_proxy_compiler_begin(
-        size, stream_pointer, source_revision.encode("ascii")
+        size, stream_pointer, revision_bytes
     ):
         raise RuntimeError("native-owner compiler scope could not start")
+    state = {"size": size, "stream": stream_pointer,
+             "source_revision": revision_bytes, "suspend_depth": 0,
+             "native_active": True, "failed": False}
+    _scope_context.active = state
     try:
         yield
     finally:
+        _scope_context.active = None
+        if state["failed"] or state["suspend_depth"] or not state["native_active"]:
+            _scope_terminal = True
+            raise RuntimeError("native-owner compiler scope lost; process must exit")
         if not _library.aimdo_full_proxy_compiler_end():
-            raise RuntimeError("native-owner compiler scope could not end")
+            _scope_terminal = True
+            raise RuntimeError("native-owner compiler scope could not end; process must exit")

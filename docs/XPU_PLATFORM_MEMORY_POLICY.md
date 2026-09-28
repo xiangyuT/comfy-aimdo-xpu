@@ -34,6 +34,13 @@ After `deinit()`, the process-lifetime proxy can remain installed while the
 diagnostic context is inactive. This status query loads no new DSO and performs
 no XPU allocation.
 
+For the opt-in diagnostic, a caller that pauses a graph can temporarily route
+ordinary tensor allocations through Torch's native allocator with
+`native_owner.suspend_compiler_scope()`. The caller must resume the graph before
+leaving that context; nested suspensions are supported, while nested compiler
+scopes are rejected. A failed native scope transition is process-terminal.
+This is a private caller building block, not automatic ComfyUI integration.
+
 The diagnostic sidecar treats a failed owner-map insertion after a fresh
 compiler allocation as a rollback: the unregistered owner releases that new
 allocation. A duplicate live compiler VA is different. Releasing the rejected

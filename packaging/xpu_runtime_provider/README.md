@@ -70,6 +70,12 @@ The opt-in Python `native_owner.consumer_scope(tensor, stream)` verifies a live
 compiler-owned tensor on the same indexed XPU device and registers the stream
 before yielding to queued work. It is a caller contract, not automatic
 tracking: previously queued unregistered work remains outside the guarantee.
+The private `native_owner.suspend_compiler_scope()` context temporarily sends
+allocations through Torch's ordinary XPU allocator while a caller pauses its
+diagnostic graph. The caller resumes the graph before leaving the context;
+nested suspensions are supported, nested compiler scopes are rejected, and a
+failed native scope transition requires process exit. ComfyUI caller wiring
+remains a separate gate.
 The Torch 2.14 sidecar publishes its D1 function pointers once as an immutable
 table. Later compiler scopes verify the same native addresses and source
 revision; concurrent graph threads do not overwrite pointers read by tensor

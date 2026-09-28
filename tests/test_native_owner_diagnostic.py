@@ -58,6 +58,102 @@ def test_unrestricted_scope_still_requires_opt_in_installation(monkeypatch):
         native_owner.selected_scope(0, stream)
 
 
+def test_compiler_scope_suspension_restores_native_binding_after_nested_pause(monkeypatch):
+    calls = []
+    fake = SimpleNamespace(
+        aimdo_full_proxy_is_installed=lambda: True,
+        aimdo_full_proxy_compiler_begin=lambda size, stream, revision: (
+            calls.append(("begin", size, stream, revision)) or True),
+        aimdo_full_proxy_compiler_end=lambda: calls.append(("end",)) or True,
+    )
+    monkeypatch.setattr(native_owner, "_library", fake)
+    monkeypatch.setattr(native_owner, "_scope_context", threading.local())
+    monkeypatch.setattr(native_owner, "_scope_terminal", False)
+    monkeypatch.setattr(native_owner, "drain_deferred_graphs", lambda: 0)
+    monkeypatch.setattr(control, "lib", SimpleNamespace())
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "get_xpu_allocator_mode", lambda: "native_hook")
+    monkeypatch.setattr(control, "get_memory_compiler_capability",
+                        lambda: {"source_revision": "exact-source"})
+    stream = SimpleNamespace(sycl_queue=456)
+    with pytest.raises(RuntimeError, match="requires an active"):
+        with native_owner.suspend_compiler_scope():
+            pytest.fail("suspended without a compiler scope")
+    with native_owner.compiler_scope(stream):
+        with native_owner.suspend_compiler_scope():
+            with native_owner.suspend_compiler_scope():
+                with pytest.raises(RuntimeError, match="nested native-owner"):
+                    with native_owner.compiler_scope(stream):
+                        pytest.fail("nested compiler scope entered")
+        with pytest.raises(RuntimeError, match="nested native-owner"):
+            with native_owner.compiler_scope(stream):
+                pytest.fail("nested compiler scope entered")
+    assert calls == [("begin", 0, 456, b"exact-source"), ("end",),
+                     ("begin", 0, 456, b"exact-source"), ("end",)]
+    assert native_owner._scope_terminal is False
+
+
+def test_compiler_scope_suspension_exception_restores_route(monkeypatch):
+    calls = []
+    fake = SimpleNamespace(
+        aimdo_full_proxy_is_installed=lambda: True,
+        aimdo_full_proxy_compiler_begin=lambda *args: calls.append(("begin", *args)) or True,
+        aimdo_full_proxy_compiler_end=lambda: calls.append(("end",)) or True,
+    )
+    monkeypatch.setattr(native_owner, "_library", fake)
+    monkeypatch.setattr(native_owner, "_scope_context", threading.local())
+    monkeypatch.setattr(native_owner, "_scope_terminal", False)
+    monkeypatch.setattr(native_owner, "drain_deferred_graphs", lambda: 0)
+    monkeypatch.setattr(control, "lib", SimpleNamespace())
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "get_xpu_allocator_mode", lambda: "native_hook")
+    monkeypatch.setattr(control, "get_memory_compiler_capability",
+                        lambda: {"source_revision": "exact-source"})
+    with pytest.raises(KeyError, match="cancel"):
+        with native_owner.selected_scope(4097, SimpleNamespace(sycl_queue=456)):
+            with native_owner.suspend_compiler_scope():
+                raise KeyError("cancel")
+    assert calls == [("begin", 4097, 456, b"exact-source"), ("end",),
+                     ("begin", 4097, 456, b"exact-source"), ("end",)]
+    assert native_owner._scope_terminal is False
+
+
+def test_failed_compiler_scope_resume_is_process_terminal(monkeypatch):
+    calls = []
+    real_drain = native_owner.drain_deferred_graphs
+
+    def begin(*args):
+        calls.append("begin")
+        return len(calls) == 1
+
+    fake = SimpleNamespace(
+        aimdo_full_proxy_is_installed=lambda: True,
+        aimdo_full_proxy_compiler_begin=begin,
+        aimdo_full_proxy_compiler_end=lambda: calls.append("end") or True,
+    )
+    monkeypatch.setattr(native_owner, "_library", fake)
+    monkeypatch.setattr(native_owner, "_scope_context", threading.local())
+    monkeypatch.setattr(native_owner, "_scope_terminal", False)
+    monkeypatch.setattr(native_owner, "drain_deferred_graphs", lambda: 0)
+    monkeypatch.setattr(control, "lib", SimpleNamespace())
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "get_xpu_allocator_mode", lambda: "native_hook")
+    monkeypatch.setattr(control, "get_memory_compiler_capability",
+                        lambda: {"source_revision": "exact-source"})
+    stream = SimpleNamespace(sycl_queue=456)
+    with pytest.raises(RuntimeError, match="process must exit"):
+        with native_owner.compiler_scope(stream):
+            with native_owner.suspend_compiler_scope():
+                pass
+    assert calls == ["begin", "end", "begin"]
+    assert native_owner._scope_terminal is True
+    with pytest.raises(RuntimeError, match="process must exit"):
+        with native_owner.compiler_scope(stream):
+            pytest.fail("terminal proxy scope was reused")
+    with pytest.raises(RuntimeError, match="process must exit"):
+        real_drain()
+
+
 def test_consumer_scope_registers_before_work_and_restores_stream(monkeypatch):
     calls = []
 
