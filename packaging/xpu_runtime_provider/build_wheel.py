@@ -38,7 +38,9 @@ _COMPILER_SYMBOLS = (
 )
 _NATIVE_OWNER_SYMBOLS = (
     "aimdo_full_proxy_torch_version", "aimdo_full_proxy_is_installed",
-    "aimdo_full_proxy_install", "aimdo_full_proxy_compiler_begin",
+    "aimdo_full_proxy_install", "aimdo_full_proxy_test_fail_next_compiler_owner_insert",
+    "aimdo_full_proxy_test_duplicate_next_compiler_pointer",
+    "aimdo_full_proxy_compiler_begin",
     "aimdo_full_proxy_compiler_end", "aimdo_full_proxy_snapshot",
 )
 

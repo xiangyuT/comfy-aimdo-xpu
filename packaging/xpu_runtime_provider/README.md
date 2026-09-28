@@ -59,6 +59,10 @@ default. Only an explicitly set `AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC=1` with Linux
 proxy cannot be unloaded or switched off in the same process. This diagnostic
 path does not enable public XPU `record()` or compiler capability; it has not
 passed provider package or ComfyUI acceptance solely by being built.
+`native_owner.inject_next_compiler_owner_insert_failure()` and
+`native_owner.inject_duplicate_compiler_pointer()` exist only for bounded
+error-path diagnostics. The latter is fatal to the process after it has
+preserved the previously live owner; callers must not resume normal work.
 
 For a Linux source wheel containing `malloc_graph.py`, the builder requires the
 complete provider module set and all twelve compiler ABI/provenance exports in

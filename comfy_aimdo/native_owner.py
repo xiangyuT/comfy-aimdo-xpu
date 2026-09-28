@@ -55,6 +55,12 @@ def install(torch_module) -> None:
     library.aimdo_full_proxy_is_installed.restype = ctypes.c_bool
     library.aimdo_full_proxy_install.argtypes = []
     library.aimdo_full_proxy_install.restype = ctypes.c_bool
+    library.aimdo_full_proxy_test_fail_next_compiler_owner_insert.argtypes = []
+    library.aimdo_full_proxy_test_fail_next_compiler_owner_insert.restype = ctypes.c_bool
+    library.aimdo_full_proxy_test_duplicate_next_compiler_pointer.argtypes = [
+        ctypes.c_void_p,
+    ]
+    library.aimdo_full_proxy_test_duplicate_next_compiler_pointer.restype = ctypes.c_bool
     library.aimdo_full_proxy_compiler_begin.argtypes = [
         ctypes.c_size_t, ctypes.c_uint64, ctypes.c_char_p,
     ]
@@ -84,6 +90,24 @@ def snapshot() -> list[int]:
     if not _library.aimdo_full_proxy_snapshot(values, len(values)):
         raise RuntimeError("native-owner diagnostic snapshot failed")
     return list(map(int, values))
+
+
+def inject_next_compiler_owner_insert_failure() -> None:
+    """Diagnostic-only fault injection within an active selected scope."""
+    if not installed():
+        raise RuntimeError("native-owner diagnostic is not installed")
+    if not _library.aimdo_full_proxy_test_fail_next_compiler_owner_insert():
+        raise RuntimeError("no active compiler scope for owner-insert injection")
+
+
+def inject_duplicate_compiler_pointer(pointer: int) -> None:
+    """Diagnostic-only collision with one currently live compiler owner."""
+    if not installed():
+        raise RuntimeError("native-owner diagnostic is not installed")
+    if not _library.aimdo_full_proxy_test_duplicate_next_compiler_pointer(
+        ctypes.c_void_p(int(pointer))
+    ):
+        raise RuntimeError("no active scope or matching live compiler owner")
 
 
 @contextlib.contextmanager

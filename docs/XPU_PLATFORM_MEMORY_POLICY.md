@@ -27,6 +27,14 @@ default `native_hook` route or public memory-compiler capability. The proxy's
 private C10/XPU ABI, stream and failure contracts need separate validation
 before it can become a supported allocator path.
 
+The diagnostic sidecar treats a failed owner-map insertion after a fresh
+compiler allocation as a rollback: the unregistered owner releases that new
+allocation. A duplicate live compiler VA is different. Releasing the rejected
+claim could free the existing tensor, so the sidecar preserves the old owner,
+reports a fatal collision, and requires the process to exit after cleanup.
+Neither rule enables public memory compilation or weakens the ordinary native
+allocator's ownership.
+
 Linux native mode keeps Torch's allocator, statistics and cache-management APIs.
 At model prioritization, Python publishes a cached-byte estimate to the hook.
 A budget deficit uses Torch's cache-release retry only when that estimate is

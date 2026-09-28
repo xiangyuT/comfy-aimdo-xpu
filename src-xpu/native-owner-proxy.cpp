@@ -78,6 +78,8 @@ thread_local size_t g_custom_scope_bytes = 0;
 thread_local bool g_compiler_scope = false;
 thread_local size_t g_compiler_scope_bytes = 0;
 thread_local uint64_t g_compiler_scope_stream = 0;
+thread_local bool g_fail_next_compiler_owner_insert = false;
+thread_local void *g_duplicate_next_compiler_pointer = nullptr;
 
 Owner::~Owner() {
     if (kind == Kind::Native || !custom_pointer || !custom_queue) return;
@@ -192,26 +194,44 @@ public:
                 throw std::runtime_error("compiler queue or device differs");
             }
             uint64_t address = 0;
-            if (!g_compiler_alloc(&address, bytes,
-                                  reinterpret_cast<void *>(g_compiler_scope_stream)) ||
-                !address) {
-                throw std::runtime_error("AIMDO compiler allocation was not handled");
+            void *synthetic_duplicate = std::exchange(
+                g_duplicate_next_compiler_pointer, nullptr);
+            if (synthetic_duplicate) {
+                address = reinterpret_cast<uintptr_t>(synthetic_duplicate);
+            } else {
+                if (!g_compiler_alloc(&address, bytes,
+                                      reinterpret_cast<void *>(g_compiler_scope_stream)) ||
+                    !address) {
+                    throw std::runtime_error("AIMDO compiler allocation was not handled");
+                }
             }
             std::shared_ptr<Owner> owner;
             try {
                 owner = std::make_shared<Owner>(address, bytes, queue,
                                                 g_compiler_scope_stream, device);
             } catch (...) {
-                int status = -1;
-                (void)g_compiler_free(address,
-                    reinterpret_cast<void *>(g_compiler_scope_stream), &status);
+                if (!synthetic_duplicate) {
+                    int status = -1;
+                    (void)g_compiler_free(address,
+                        reinterpret_cast<void *>(g_compiler_scope_stream), &status);
+                }
                 throw;
             }
             void *pointer = reinterpret_cast<void *>(address);
+            // Exercise the same unwind/owner rollback as an emplace failure.
+            if (std::exchange(g_fail_next_compiler_owner_insert, false)) {
+                throw std::bad_alloc();
+            }
             {
                 std::lock_guard<std::mutex> guard(g_owner_mutex);
                 if (!g_owners.emplace(pointer, owner).second) {
-                    throw std::runtime_error("duplicate compiler owner pointer");
+                    // Another live owner has this VA. Releasing the new owner
+                    // could free the old tensor, so leak the ambiguous claim
+                    // and require the process to exit.
+                    owner->custom_pointer = nullptr;
+                    g_compiler_failures.fetch_add(1, std::memory_order_relaxed);
+                    throw std::runtime_error(
+                        "duplicate compiler owner pointer; process must exit");
                 }
             }
             g_compiler_live_bytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -239,7 +259,10 @@ public:
             {
                 std::lock_guard<std::mutex> guard(g_owner_mutex);
                 if (!g_owners.emplace(pointer, owner).second) {
-                    throw std::runtime_error("duplicate custom owner pointer");
+                    owner->custom_pointer = nullptr;
+                    g_custom_failures.fetch_add(1, std::memory_order_relaxed);
+                    throw std::runtime_error(
+                        "duplicate custom owner pointer; process must exit");
                 }
             }
             g_custom_live_bytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -257,7 +280,9 @@ public:
         {
             std::lock_guard<std::mutex> guard(g_owner_mutex);
             if (!g_owners.emplace(pointer, owner).second) {
-                throw std::runtime_error("duplicate native owner pointer");
+                (void)owner->native.release_context();
+                throw std::runtime_error(
+                    "duplicate native owner pointer; process must exit");
             }
         }
         g_allocations.fetch_add(1, std::memory_order_relaxed);
@@ -322,6 +347,30 @@ aimdo_full_proxy_torch_version() {
 extern "C" __attribute__((visibility("default"))) bool
 aimdo_full_proxy_is_installed() {
     return g_proxy != nullptr;
+}
+
+extern "C" __attribute__((visibility("default"))) bool
+aimdo_full_proxy_test_fail_next_compiler_owner_insert() {
+    if (!g_proxy || !g_compiler_scope || g_fail_next_compiler_owner_insert) {
+        return false;
+    }
+    g_fail_next_compiler_owner_insert = true;
+    return true;
+}
+
+extern "C" __attribute__((visibility("default"))) bool
+aimdo_full_proxy_test_duplicate_next_compiler_pointer(void *pointer) {
+    if (!g_proxy || !g_compiler_scope || !pointer ||
+        g_duplicate_next_compiler_pointer || g_fail_next_compiler_owner_insert) {
+        return false;
+    }
+    std::lock_guard<std::mutex> guard(g_owner_mutex);
+    const auto found = g_owners.find(pointer);
+    if (found == g_owners.end() || found->second->kind != Owner::Kind::Compiler) {
+        return false;
+    }
+    g_duplicate_next_compiler_pointer = pointer;
+    return true;
 }
 
 extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_install() {
@@ -412,6 +461,8 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler
 
 extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler_end() {
     if (!g_compiler_scope) return false;
+    g_fail_next_compiler_owner_insert = false;
+    g_duplicate_next_compiler_pointer = nullptr;
     g_compiler_scope = false;
     g_compiler_scope_bytes = 0;
     g_compiler_scope_stream = 0;
