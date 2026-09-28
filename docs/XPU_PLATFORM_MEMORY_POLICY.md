@@ -48,6 +48,13 @@ OOM injection. One failed attempt exercises the existing reclaim/retry path;
 two failed attempts exercise terminal allocation failure and graph abort. This
 hook does not simulate device pressure or establish a production OOM result.
 
+Some Torch XPU operators request temporary buffers through `raw_alloc` while a
+diagnostic compiler scope is active. The optional proxy delegates those buffers
+to Torch's native allocator and tracks their release separately from compiler
+`DataPtr` owners. The diagnostic exposes the scoped raw count and an exact live
+compiler-owner query so operator probes can detect output routing gaps. This
+path does not make unregistered consumers or arbitrary operators supported.
+
 Linux native mode keeps Torch's allocator, statistics and cache-management APIs.
 At model prioritization, Python publishes a cached-byte estimate to the hook.
 A budget deficit uses Torch's cache-release retry only when that estimate is

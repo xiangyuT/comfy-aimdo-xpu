@@ -87,6 +87,24 @@ def test_page_create_oom_injection_is_bounded_and_requires_active_graph(monkeypa
     assert inject.restype == native_owner.ctypes.c_bool
 
 
+def test_scoped_raw_owner_diagnostics(monkeypatch):
+    def snapshot(values, count):
+        assert count == 5
+        for index, value in enumerate((0, 2, 2, 0, 0)):
+            values[index] = value
+        return True
+
+    fake = SimpleNamespace(
+        aimdo_full_proxy_is_installed=lambda: True,
+        aimdo_full_proxy_scoped_raw_snapshot=snapshot,
+        aimdo_full_proxy_is_compiler_owner=lambda pointer: pointer.value == 0x1234,
+    )
+    monkeypatch.setattr(native_owner, "_library", fake)
+    assert native_owner.scoped_raw_snapshot() == [0, 2, 2, 0, 0]
+    assert native_owner.is_compiler_owner(0x1234)
+    assert not native_owner.is_compiler_owner(0x5678)
+
+
 def test_graph_stream_switch_uses_xpu_queue_pointer(monkeypatch):
     calls = []
     native = SimpleNamespace(

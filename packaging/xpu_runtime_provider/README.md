@@ -70,6 +70,10 @@ Its additional `malloc_graph_test_fail_next_page_creates` export supports a
 bounded, active-graph-only synthetic OOM diagnostic. One rejected page attempt
 exercises retry; two rejected attempts exercise failure propagation. Neither
 case establishes behavior under real device memory pressure.
+The sidecar also exposes diagnostic scoped-raw counters and a live
+compiler-owner query. Backend `raw_alloc` workspaces used inside an opt-in
+compiler scope remain owned by Torch's native allocator; the compiler owns
+only positive-size tensor requests served through its `DataPtr` route.
 
 For a Linux source wheel containing `malloc_graph.py`, the builder requires the
 complete provider module set and all twelve compiler ABI/provenance exports in

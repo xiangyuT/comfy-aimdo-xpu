@@ -46,6 +46,11 @@ struct Owner {
     int compiler_device = -1;
 };
 
+struct ScopedRaw {
+    size_t bytes;
+    bool deleting = false;
+};
+
 using CompilerAlloc = bool (*)(uint64_t *, size_t, void *);
 using CompilerFree = bool (*)(uint64_t, void *, int *);
 using CompilerRogue = bool (*)(uint64_t, int *);
@@ -58,6 +63,8 @@ SetDevice g_set_device = nullptr;
 
 std::mutex g_owner_mutex;
 std::unordered_map<void *, std::shared_ptr<Owner>> g_owners;
+std::mutex g_scoped_raw_mutex;
+std::unordered_map<void *, ScopedRaw> g_scoped_raw;
 std::atomic<uint64_t> g_allocations{0};
 std::atomic<uint64_t> g_releases{0};
 std::atomic<uint64_t> g_record_stream{0};
@@ -74,6 +81,10 @@ std::atomic<uint64_t> g_compiler_releases{0};
 std::atomic<uint64_t> g_compiler_record_stream{0};
 std::atomic<uint64_t> g_compiler_failures{0};
 std::atomic<uint64_t> g_compiler_live_bytes{0};
+std::atomic<uint64_t> g_scoped_raw_allocations{0};
+std::atomic<uint64_t> g_scoped_raw_releases{0};
+std::atomic<uint64_t> g_scoped_raw_failures{0};
+std::atomic<uint64_t> g_scoped_raw_live_bytes{0};
 thread_local bool g_custom_scope = false;
 thread_local size_t g_custom_scope_bytes = 0;
 thread_local bool g_compiler_scope = false;
@@ -161,11 +172,40 @@ public:
         return native_->getMemoryInfo(device);
     }
     void *raw_alloc(size_t bytes) override {
-        if (g_custom_scope || g_compiler_scope) {
-            throw std::runtime_error("raw allocation is unsupported inside compiler scope");
+        if (g_custom_scope) {
+            throw std::runtime_error("raw allocation is unsupported inside custom scope");
         }
+        void *pointer = nullptr;
+        try {
+            pointer = native_->raw_alloc(bytes);
+        } catch (...) {
+            if (g_compiler_scope) {
+                g_scoped_raw_failures.fetch_add(1, std::memory_order_relaxed);
+            }
+            throw;
+        }
+        if (!pointer) return pointer;
         g_raw_allocations.fetch_add(1, std::memory_order_relaxed);
-        return native_->raw_alloc(bytes);
+        if (g_compiler_scope) {
+            bool inserted = false;
+            try {
+                std::lock_guard<std::mutex> guard(g_scoped_raw_mutex);
+                inserted = g_scoped_raw.emplace(pointer, ScopedRaw{bytes}).second;
+            } catch (...) {
+                g_scoped_raw_failures.fetch_add(1, std::memory_order_relaxed);
+                native_->raw_delete(pointer);
+                g_raw_releases.fetch_add(1, std::memory_order_relaxed);
+                throw;
+            }
+            if (!inserted) {
+                g_scoped_raw_failures.fetch_add(1, std::memory_order_relaxed);
+                throw std::runtime_error(
+                    "duplicate scoped raw pointer; process must exit");
+            }
+            g_scoped_raw_allocations.fetch_add(1, std::memory_order_relaxed);
+            g_scoped_raw_live_bytes.fetch_add(bytes, std::memory_order_relaxed);
+        }
+        return pointer;
     }
     void raw_delete(void *pointer) override {
         if (!pointer) return;
@@ -174,10 +214,39 @@ public:
             std::lock_guard<std::mutex> guard(g_owner_mutex);
             tracked = g_owners.find(pointer) != g_owners.end();
         }
+        size_t scoped_bytes = 0;
+        bool scoped = false;
+        {
+            std::lock_guard<std::mutex> guard(g_scoped_raw_mutex);
+            const auto found = g_scoped_raw.find(pointer);
+            if (found != g_scoped_raw.end()) {
+                if (found->second.deleting || tracked) {
+                    g_scoped_raw_failures.fetch_add(1, std::memory_order_relaxed);
+                    throw std::runtime_error(
+                        "ambiguous scoped raw release; process must exit");
+                }
+                found->second.deleting = true;
+                scoped_bytes = found->second.bytes;
+                scoped = true;
+            }
+        }
         if (tracked) {
             proxy_delete(pointer);
         } else {
-            native_->raw_delete(pointer);
+            try {
+                native_->raw_delete(pointer);
+            } catch (...) {
+                if (scoped) {
+                    g_scoped_raw_failures.fetch_add(1, std::memory_order_relaxed);
+                }
+                throw;
+            }
+            if (scoped) {
+                std::lock_guard<std::mutex> guard(g_scoped_raw_mutex);
+                g_scoped_raw.erase(pointer);
+                g_scoped_raw_releases.fetch_add(1, std::memory_order_relaxed);
+                g_scoped_raw_live_bytes.fetch_sub(scoped_bytes, std::memory_order_relaxed);
+            }
         }
         g_raw_releases.fetch_add(1, std::memory_order_relaxed);
     }
@@ -417,6 +486,28 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_snapshot
     values[15] = g_compiler_failures.load(std::memory_order_relaxed);
     values[16] = g_compiler_live_bytes.load(std::memory_order_relaxed);
     return true;
+}
+
+extern "C" __attribute__((visibility("default"))) bool
+aimdo_full_proxy_scoped_raw_snapshot(uint64_t *values, size_t count) {
+    if (!g_proxy || !values || count != 5) return false;
+    {
+        std::lock_guard<std::mutex> guard(g_scoped_raw_mutex);
+        values[0] = g_scoped_raw.size();
+    }
+    values[1] = g_scoped_raw_allocations.load(std::memory_order_relaxed);
+    values[2] = g_scoped_raw_releases.load(std::memory_order_relaxed);
+    values[3] = g_scoped_raw_failures.load(std::memory_order_relaxed);
+    values[4] = g_scoped_raw_live_bytes.load(std::memory_order_relaxed);
+    return true;
+}
+
+extern "C" __attribute__((visibility("default"))) bool
+aimdo_full_proxy_is_compiler_owner(void *pointer) {
+    if (!g_proxy || !pointer) return false;
+    std::lock_guard<std::mutex> guard(g_owner_mutex);
+    const auto found = g_owners.find(pointer);
+    return found != g_owners.end() && found->second->kind == Owner::Kind::Compiler;
 }
 
 extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_scope_begin(

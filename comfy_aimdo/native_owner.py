@@ -71,6 +71,12 @@ def install(torch_module) -> None:
         ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t,
     ]
     library.aimdo_full_proxy_snapshot.restype = ctypes.c_bool
+    library.aimdo_full_proxy_scoped_raw_snapshot.argtypes = [
+        ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t,
+    ]
+    library.aimdo_full_proxy_scoped_raw_snapshot.restype = ctypes.c_bool
+    library.aimdo_full_proxy_is_compiler_owner.argtypes = [ctypes.c_void_p]
+    library.aimdo_full_proxy_is_compiler_owner.restype = ctypes.c_bool
 
     if library.aimdo_full_proxy_torch_version() != _TORCH_VERSION.encode():
         raise RuntimeError("native-owner DSO Torch ABI does not match the runtime")
@@ -90,6 +96,23 @@ def snapshot() -> list[int]:
     if not _library.aimdo_full_proxy_snapshot(values, len(values)):
         raise RuntimeError("native-owner diagnostic snapshot failed")
     return list(map(int, values))
+
+
+def scoped_raw_snapshot() -> list[int]:
+    """Return live, allocation, release, failure and byte counts for raw workspaces."""
+    if not installed():
+        raise RuntimeError("native-owner diagnostic is not installed")
+    values = (ctypes.c_uint64 * 5)()
+    if not _library.aimdo_full_proxy_scoped_raw_snapshot(values, len(values)):
+        raise RuntimeError("scoped raw snapshot failed")
+    return list(map(int, values))
+
+
+def is_compiler_owner(pointer: int) -> bool:
+    """Check whether a live XPU pointer is owned by the diagnostic compiler."""
+    if not installed():
+        raise RuntimeError("native-owner diagnostic is not installed")
+    return bool(_library.aimdo_full_proxy_is_compiler_owner(ctypes.c_void_p(int(pointer))))
 
 
 def inject_next_compiler_owner_insert_failure() -> None:

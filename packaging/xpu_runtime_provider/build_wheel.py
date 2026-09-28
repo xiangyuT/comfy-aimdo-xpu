@@ -42,6 +42,7 @@ _NATIVE_OWNER_SYMBOLS = (
     "aimdo_full_proxy_test_duplicate_next_compiler_pointer",
     "aimdo_full_proxy_compiler_begin",
     "aimdo_full_proxy_compiler_end", "aimdo_full_proxy_snapshot",
+    "aimdo_full_proxy_scoped_raw_snapshot", "aimdo_full_proxy_is_compiler_owner",
 )
 _NATIVE_OWNER_CORE_SYMBOLS = (
     "malloc_graph_free_owned", "malloc_graph_test_fail_next_page_creates",
