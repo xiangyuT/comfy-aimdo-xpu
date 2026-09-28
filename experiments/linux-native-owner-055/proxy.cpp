@@ -360,7 +360,7 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_snapshot
 
 extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_scope_begin(
     size_t bytes) {
-    if (!g_proxy || g_custom_scope || bytes != 4097) return false;
+    if (!g_proxy || g_custom_scope || !bytes) return false;
     g_custom_scope_bytes = bytes;
     g_custom_scope = true;
     return true;
@@ -375,7 +375,7 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_scope_en
 
 extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler_begin(
     size_t bytes, uint64_t stream, const char *expected_revision) {
-    if (!g_proxy || g_custom_scope || g_compiler_scope || bytes != 4097 ||
+    if (!g_proxy || g_custom_scope || g_compiler_scope || !bytes ||
         !stream || !expected_revision) return false;
     using SourceRevision = const char *(*)();
     auto source = reinterpret_cast<SourceRevision>(
