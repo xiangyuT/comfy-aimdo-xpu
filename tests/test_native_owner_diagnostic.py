@@ -1,5 +1,7 @@
 """Fail-closed admission for the opt-in Torch 2.14 native-owner sidecar."""
 
+import contextlib
+import sys
 import threading
 from types import SimpleNamespace
 import weakref
@@ -54,6 +56,70 @@ def test_unrestricted_scope_still_requires_opt_in_installation(monkeypatch):
             pytest.fail("uninstalled proxy entered a compiler scope")
     with pytest.raises(ValueError, match="must be positive"):
         native_owner.selected_scope(0, stream)
+
+
+def test_consumer_scope_registers_before_work_and_restores_stream(monkeypatch):
+    calls = []
+
+    @contextlib.contextmanager
+    def select(stream):
+        calls.append(("enter", stream.sycl_queue))
+        try:
+            yield
+        finally:
+            calls.append(("exit", stream.sycl_queue))
+
+    device = SimpleNamespace(type="xpu", index=0)
+    stream = SimpleNamespace(device=device, sycl_queue=456)
+    tensor = SimpleNamespace(device=device, data_ptr=lambda: 123,
+                             record_stream=lambda value: calls.append(
+                                 ("record", value.sycl_queue)))
+    monkeypatch.setattr(native_owner, "installed", lambda: True)
+    monkeypatch.setattr(native_owner, "drain_deferred_graphs",
+                        lambda: calls.append(("drain", 0)))
+    monkeypatch.setattr(native_owner, "is_compiler_owner",
+                        lambda pointer: pointer == 123)
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(
+        xpu=SimpleNamespace(stream=select)))
+    with native_owner.consumer_scope(tensor, stream) as selected:
+        assert selected is tensor
+        calls.append(("work", stream.sycl_queue))
+    assert calls == [("drain", 0), ("record", 456), ("enter", 456),
+                     ("work", 456), ("exit", 456)]
+    calls.clear()
+    with pytest.raises(KeyError):
+        with native_owner.consumer_scope(tensor, stream):
+            raise KeyError("cancel after work was queued")
+    assert calls == [("drain", 0), ("record", 456), ("enter", 456),
+                     ("exit", 456)]
+    calls.clear()
+    tensor.record_stream = lambda value: (_ for _ in ()).throw(
+        RuntimeError("registration failed"))
+    with pytest.raises(RuntimeError, match="registration failed"):
+        with native_owner.consumer_scope(tensor, stream):
+            pytest.fail("consumer work began before registration succeeded")
+    assert calls == [("drain", 0)]
+
+
+def test_consumer_scope_rejects_wrong_device_and_unowned_tensor(monkeypatch):
+    calls = []
+    monkeypatch.setattr(native_owner, "installed", lambda: True)
+    monkeypatch.setattr(native_owner, "drain_deferred_graphs", lambda: 0)
+    monkeypatch.setattr(native_owner, "is_compiler_owner",
+                        lambda pointer: pointer == 123)
+    tensor = SimpleNamespace(device=SimpleNamespace(type="xpu", index=0),
+                             data_ptr=lambda: 999,
+                             record_stream=lambda stream: calls.append(stream))
+    wrong = SimpleNamespace(device=SimpleNamespace(type="xpu", index=1),
+                            sycl_queue=456)
+    with pytest.raises(ValueError, match="same indexed XPU device"):
+        with native_owner.consumer_scope(tensor, wrong):
+            pytest.fail("wrong-device consumer entered the scope")
+    correct = SimpleNamespace(device=tensor.device, sycl_queue=456)
+    with pytest.raises(RuntimeError, match="live compiler-owned tensor"):
+        with native_owner.consumer_scope(tensor, correct):
+            pytest.fail("unowned tensor entered the scope")
+    assert calls == []
 
 
 def test_diagnostic_graph_requires_installed_proxy(monkeypatch):

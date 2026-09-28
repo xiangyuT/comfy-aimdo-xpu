@@ -66,6 +66,10 @@ preserved the previously live owner; callers must not resume normal work.
 The sidecar build also requires the XPU-only `malloc_graph_free_owned` export
 in the matching D1 native library. It is used only after owner and registered
 consumer queues complete; the standard shared-core free API is unchanged.
+The opt-in Python `native_owner.consumer_scope(tensor, stream)` verifies a live
+compiler-owned tensor on the same indexed XPU device and registers the stream
+before yielding to queued work. It is a caller contract, not automatic
+tracking: previously queued unregistered work remains outside the guarantee.
 Its additional `malloc_graph_test_fail_next_page_creates` export supports a
 bounded, active-graph-only synthetic OOM diagnostic. One rejected page attempt
 exercises retry; two rejected attempts exercise failure propagation. Neither

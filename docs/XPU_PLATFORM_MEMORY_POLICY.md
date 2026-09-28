@@ -42,6 +42,14 @@ the XPU-only `malloc_graph_free_owned` entry point to apply the free event on
 the owner's stream and restore the graph's previous stream. The original
 `malloc_graph_free` keeps its strict current-stream check. Unregistered
 external consumers remain outside this contract.
+The opt-in `native_owner.consumer_scope(tensor, stream)` checks an indexed XPU
+device and live compiler ownership, calls Torch `record_stream` **before**
+yielding to the secondary stream, then restores the previous stream on exit.
+Callers must enter it before queuing that stream's first use of the tensor;
+entering later cannot repair work that was already unregistered. Torch's
+explicit stream registration or an equivalent caller-managed completion wait
+is required before compiler backing may be reused. This diagnostic helper does
+not discover arbitrary hidden consumers or enable public graph recording.
 
 The opt-in Torch 2.14 diagnostic also exposes a bounded per-graph physical-page
 OOM injection. One failed attempt exercises the existing reclaim/retry path;

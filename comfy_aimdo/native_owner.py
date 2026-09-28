@@ -350,6 +350,35 @@ def compiler_scope(stream):
     return _compiler_scope(0, stream)
 
 
+@contextlib.contextmanager
+def consumer_scope(tensor, stream):
+    """Register a compiler tensor before queued work on another XPU stream.
+
+    This opt-in diagnostic uses Torch's explicit record_stream contract. It
+    covers only work submitted inside this scope or later on this registered
+    stream; it cannot discover earlier unregistered consumers.
+    """
+    if not installed():
+        raise RuntimeError("native-owner diagnostic is not installed")
+    drain_deferred_graphs()
+    tensor_device = getattr(tensor, "device", None)
+    stream_device = getattr(stream, "device", None)
+    index = getattr(tensor_device, "index", None)
+    if (getattr(tensor_device, "type", None) != "xpu" or
+            getattr(stream_device, "type", None) != "xpu" or
+            index is None or index != getattr(stream_device, "index", None) or
+            not int(getattr(stream, "sycl_queue", 0))):
+        raise ValueError("consumer scope requires the same indexed XPU device and queue")
+    pointer = int(tensor.data_ptr())
+    if not pointer or not is_compiler_owner(pointer):
+        raise RuntimeError("consumer scope requires a live compiler-owned tensor")
+    import torch
+
+    tensor.record_stream(stream)  # Before yielding, so failures queue no consumer work.
+    with torch.xpu.stream(stream):
+        yield tensor
+
+
 def record_diagnostic(stream, assert_graph_breaks: bool = False):
     """Create a memory-only XPU graph for the opt-in diagnostic route."""
     if not installed():
