@@ -89,6 +89,9 @@ healthy.
 The checked XPU destroy reports a terminal state for generic/device-loss
 release errors: the graph handle remains owned and no second native release is
 attempted in that process. OOM-style failures retain the retry route.
+If a diagnostic graph's creator thread has exited, foreign-thread close still
+retains the handle, but reports a terminal process-exit requirement immediately.
+No other thread adopts that native graph or continues allocator scopes.
 
 For a Linux source wheel containing `malloc_graph.py`, the builder requires the
 complete provider module set and all twelve compiler ABI/provenance exports in

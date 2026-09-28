@@ -108,6 +108,8 @@ class MallocGraph:
                         self._owner_thread, self._native_lib, handle
                     )
                     self._handle = None
+                    if not self._owner_thread.is_alive():
+                        raise RuntimeError(native_owner._DEAD_OWNER_ERROR)
                     return False
                 native_owner.drain_deferred_graphs()
                 if native_owner._destroy_graph_terminal(self._native_lib, handle):
@@ -134,6 +136,8 @@ class MallocGraph:
         try:
             self.close()
         except Exception:
+            if getattr(self, "_handle", None) != handle:
+                return
             owner = getattr(self, "_owner_thread", None)
             library = getattr(self, "_native_lib", None)
             if owner is not None and library is not None:

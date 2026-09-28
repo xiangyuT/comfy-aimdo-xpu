@@ -81,6 +81,10 @@ generic or device-loss release error marks that diagnostic graph terminal:
 subsequent close calls do not re-enter native release, and deinitialization
 continues to refuse the live handle until process exit. The driver state after
 a real device loss is not assumed recoverable.
+The diagnostic queue also treats an exited graph creator as terminal. It keeps
+the handle owned and prevents later scopes, graph creation and deinitialization
+from silently proceeding; no surviving thread adopts a dead thread's native
+graph. Process exit is required for that unresolved owner.
 
 Linux native mode keeps Torch's allocator, statistics and cache-management APIs.
 At model prioritization, Python publishes a cached-byte estimate to the hook.

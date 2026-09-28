@@ -200,6 +200,51 @@ def test_foreign_thread_graph_close_is_drained_by_owner(monkeypatch):
     assert native_owner.graph_ownership_snapshot() == {"live": 0, "deferred": 0}
 
 
+def test_dead_owner_close_is_terminal_without_duplicate_queue_entry(monkeypatch):
+    monkeypatch.setattr(native_owner, "_graph_lock", threading.Lock())
+    monkeypatch.setattr(native_owner, "_live_graphs", weakref.WeakSet())
+    monkeypatch.setattr(native_owner, "_deferred_graphs", {})
+    dead = threading.Thread()
+    assert not dead.is_alive()
+    calls = []
+
+    def destroy(handle):
+        calls.append(handle.value)
+        return True
+
+    graph = malloc_graph.MallocGraph(
+        321, None, owner_thread=dead,
+        native_lib=SimpleNamespace(malloc_graph_destroy_checked=destroy),
+    )
+    native_owner._register_graph(graph)
+    assert native_owner.dead_owner_graphs() == 1
+    with pytest.raises(RuntimeError, match="owner thread exited; process must exit"):
+        graph.close()
+    assert graph._handle is None
+    assert native_owner.graph_ownership_snapshot() == {"live": 0, "deferred": 1}
+    graph.__del__()
+    assert native_owner.dead_owner_graphs() == 1
+    with pytest.raises(RuntimeError, match="owner thread exited; process must exit"):
+        native_owner.drain_deferred_graphs()
+    assert calls == []
+    assert native_owner.graph_ownership_snapshot() == {"live": 0, "deferred": 1}
+
+
+def test_dead_graph_owner_blocks_deinit_before_native_cleanup(monkeypatch):
+    library = SimpleNamespace()
+    monkeypatch.setattr(control, "lib", library)
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "_xpu_allocator_ready", False)
+    monkeypatch.setattr(native_owner, "installed", lambda: True)
+    monkeypatch.setattr(native_owner, "_graph_lock", threading.Lock())
+    monkeypatch.setattr(native_owner, "_live_graphs", weakref.WeakSet())
+    monkeypatch.setattr(native_owner, "_deferred_graphs",
+                        {threading.Thread(): [(library, 654)]})
+    with pytest.raises(RuntimeError, match="owner thread exited; process must exit"):
+        control.deinit()
+    assert control.lib is library
+
+
 def test_failed_checked_graph_close_keeps_handle_for_retry(monkeypatch):
     monkeypatch.setattr(native_owner, "_deferred_graphs", {})
     outcomes = iter((False, True))

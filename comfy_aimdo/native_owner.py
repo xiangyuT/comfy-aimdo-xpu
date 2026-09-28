@@ -21,6 +21,7 @@ _library = None
 _graph_lock = threading.Lock()
 _live_graphs = weakref.WeakSet()
 _deferred_graphs = {}
+_DEAD_OWNER_ERROR = "AIMDO graph owner thread exited; process must exit"
 
 
 def _destroy_graph_checked(library, handle: int) -> bool:
@@ -58,8 +59,24 @@ def _defer_graph_destroy(owner: threading.Thread, library, handle: int) -> None:
         _deferred_graphs.setdefault(owner, []).append((library, int(handle)))
 
 
+def dead_owner_graphs() -> int:
+    """Count graph handles whose original Python owner thread has exited."""
+    with _graph_lock:
+        live = sum(
+            bool(getattr(graph, "_handle", None))
+            for graph in _live_graphs
+            if (getattr(graph, "_owner_thread", None) is not None
+                and not graph._owner_thread.is_alive())
+        )
+        deferred = sum(len(handles) for owner, handles in _deferred_graphs.items()
+                       if not owner.is_alive())
+    return live + deferred
+
+
 def drain_deferred_graphs() -> int:
     """Complete queued graph closes on their original Python owner thread."""
+    if dead_owner_graphs():
+        raise RuntimeError(_DEAD_OWNER_ERROR)
     owner = threading.current_thread()
     with _graph_lock:
         pending = _deferred_graphs.pop(owner, [])
@@ -356,6 +373,7 @@ def record_diagnostic(stream, assert_graph_breaks: bool = False):
 def _compiler_scope(size: int, stream):
     if not installed():
         raise RuntimeError("native-owner diagnostic is not installed")
+    drain_deferred_graphs()
     from . import control
 
     if control.lib is None or control.implementation != "xpu" or \
