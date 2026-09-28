@@ -90,6 +90,13 @@ The diagnostic queue also treats an exited graph creator as terminal. It keeps
 the handle owned and prevents later scopes, graph creation and deinitialization
 from silently proceeding; no surviving thread adopts a dead thread's native
 graph. Process exit is required for that unresolved owner.
+For a compiler tensor whose final Python reference is released on another
+thread while its graph is still recording, the optional proxy waits its
+allocation and registered consumer queues, then retains the native owner for
+the original graph thread. The owner drains pending tensor frees before graph
+pop, abort or destroy. Pending owners count as live at deinitialization; a
+failed owner-thread free blocks further graph work and requires process exit.
+This does not detect an unregistered asynchronous consumer.
 
 Linux native mode keeps Torch's allocator, statistics and cache-management APIs.
 At model prioritization, Python publishes a cached-byte estimate to the hook.

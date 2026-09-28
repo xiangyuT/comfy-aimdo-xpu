@@ -10,11 +10,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <new>
 #include <optional>
 #include <stdexcept>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -22,6 +24,8 @@
 #include <sycl/sycl.hpp>
 
 namespace {
+
+uint64_t current_thread_token();
 
 struct Owner {
     explicit Owner(c10::DataPtr &&value) : kind(Kind::Native), native(std::move(value)) {}
@@ -32,8 +36,9 @@ struct Owner {
           uint64_t stream, int device)
         : kind(Kind::Compiler), custom_pointer(reinterpret_cast<void *>(pointer)),
           custom_bytes(bytes), custom_queue(queue), compiler_stream(stream),
-          compiler_device(device) {}
+          compiler_device(device), creator_token(current_thread_token()) {}
     ~Owner();
+    bool wait_consumers();
     enum class Kind { Native, Custom, Compiler } kind;
     c10::DataPtr native;
     void *custom_pointer = nullptr;
@@ -44,6 +49,8 @@ struct Owner {
     bool accounted = false;
     uint64_t compiler_stream = 0;
     int compiler_device = -1;
+    uint64_t creator_token = 0;
+    bool fenced = false;
 };
 
 struct ScopedRaw {
@@ -63,6 +70,16 @@ SetDevice g_set_device = nullptr;
 
 std::mutex g_owner_mutex;
 std::unordered_map<void *, std::shared_ptr<Owner>> g_owners;
+std::atomic<uint64_t> g_next_thread_token{1};
+thread_local uint64_t g_thread_token =
+    g_next_thread_token.fetch_add(1, std::memory_order_relaxed);
+uint64_t current_thread_token() { return g_thread_token; }
+std::mutex g_deferred_mutex;
+using DeferredFrees =
+    std::unordered_map<uint64_t, std::deque<std::shared_ptr<Owner>>>;
+DeferredFrees *g_deferred_frees = new DeferredFrees(); // Never drain on process teardown.
+std::atomic<uint64_t> g_deferred_free_count{0};
+std::atomic<bool> g_compiler_terminal{false};
 std::mutex g_scoped_raw_mutex;
 std::unordered_map<void *, ScopedRaw> g_scoped_raw;
 std::atomic<uint64_t> g_allocations{0};
@@ -93,17 +110,38 @@ thread_local uint64_t g_compiler_scope_stream = 0;
 thread_local bool g_fail_next_compiler_owner_insert = false;
 thread_local void *g_duplicate_next_compiler_pointer = nullptr;
 
-Owner::~Owner() {
-    if (kind == Kind::Native || !custom_pointer || !custom_queue) return;
+bool Owner::wait_consumers() {
+    if (fenced) return true;
+    if (!custom_queue) return false;
     try {
         for (auto &queue : consumers) {
             queue.ext_oneapi_submit_barrier().wait_and_throw();
         }
         custom_queue->ext_oneapi_submit_barrier().wait_and_throw();
+        fenced = true;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+Owner::~Owner() {
+    if (kind == Kind::Native || !custom_pointer || !custom_queue) return;
+    if (!wait_consumers()) {
+        if (kind == Kind::Compiler) {
+            g_compiler_failures.fetch_add(1, std::memory_order_relaxed);
+            g_compiler_terminal.store(true, std::memory_order_release);
+        } else {
+            g_custom_failures.fetch_add(1, std::memory_order_relaxed);
+        }
+        return;
+    }
+    try {
         if (kind == Kind::Compiler) {
             if (!g_set_device || !g_set_device(compiler_device) ||
                 !g_compiler_free_owned || !g_compiler_rogue) {
                 g_compiler_failures.fetch_add(1, std::memory_order_relaxed);
+                g_compiler_terminal.store(true, std::memory_order_release);
                 return;
             }
             int result = -1;
@@ -115,6 +153,7 @@ Owner::~Owner() {
             }
             if (!handled || result != 0) {
                 g_compiler_failures.fetch_add(1, std::memory_order_relaxed);
+                g_compiler_terminal.store(true, std::memory_order_release);
                 return;
             }
             if (accounted) {
@@ -130,8 +169,21 @@ Owner::~Owner() {
         }
     } catch (...) {
         // A failed fence keeps the device pointer unreleased in this process.
-        g_custom_failures.fetch_add(1, std::memory_order_relaxed);
+        if (kind == Kind::Compiler) {
+            g_compiler_failures.fetch_add(1, std::memory_order_relaxed);
+            g_compiler_terminal.store(true, std::memory_order_release);
+        } else {
+            g_custom_failures.fetch_add(1, std::memory_order_relaxed);
+        }
     }
+}
+
+void terminalize_compiler_owner(std::shared_ptr<Owner> &owner) {
+    // The owner cannot safely be freed from this thread after a failed fence,
+    // graph release or deferred-queue insertion. Keep its backing until exit.
+    owner->custom_pointer = nullptr;
+    g_compiler_failures.fetch_add(1, std::memory_order_relaxed);
+    g_compiler_terminal.store(true, std::memory_order_release);
 }
 
 void proxy_delete(void *pointer) {
@@ -146,6 +198,41 @@ void proxy_delete(void *pointer) {
         }
         owner = std::move(found->second);
         g_owners.erase(found);
+    }
+    if (owner->kind == Owner::Kind::Compiler &&
+        owner->creator_token != current_thread_token()) {
+        if (g_compiler_terminal.load(std::memory_order_acquire) ||
+            !owner->wait_consumers() || !g_set_device ||
+            !g_set_device(owner->compiler_device) || !g_compiler_rogue) {
+            terminalize_compiler_owner(owner);
+        } else {
+            int result = -1;
+            bool handled = g_compiler_rogue(
+                reinterpret_cast<uintptr_t>(pointer), &result);
+            if (handled) {
+                if (result == 0) {
+                    owner->custom_pointer = nullptr;
+                    if (owner->accounted) {
+                        g_compiler_live_bytes.fetch_sub(owner->custom_bytes,
+                            std::memory_order_relaxed);
+                        g_compiler_releases.fetch_add(1, std::memory_order_relaxed);
+                    }
+                } else {
+                    terminalize_compiler_owner(owner);
+                }
+            } else {
+                try {
+                    std::lock_guard<std::mutex> guard(g_deferred_mutex);
+                    (*g_deferred_frees)[owner->creator_token].push_back(owner);
+                    g_deferred_free_count.fetch_add(1, std::memory_order_relaxed);
+                } catch (...) {
+                    terminalize_compiler_owner(owner);
+                }
+            }
+        }
+        owner.reset();
+        g_releases.fetch_add(1, std::memory_order_relaxed);
+        return;
     }
     owner.reset(); // Run the original native DataPtr deleter outside our mutex.
     g_releases.fetch_add(1, std::memory_order_relaxed);
@@ -253,6 +340,10 @@ public:
 
     c10::DataPtr allocate(size_t bytes) override {
         if (g_compiler_scope) {
+            if (g_compiler_terminal.load(std::memory_order_acquire)) {
+                throw std::runtime_error(
+                    "terminal compiler owner error; process must exit");
+            }
             if (!bytes) return native_->allocate(0);
             if ((g_compiler_scope_bytes && bytes != g_compiler_scope_bytes) ||
                 !g_compiler_scope_stream || !g_compiler_alloc || !g_set_device) {
@@ -301,6 +392,7 @@ public:
                     // and require the process to exit.
                     owner->custom_pointer = nullptr;
                     g_compiler_failures.fetch_add(1, std::memory_order_relaxed);
+                    g_compiler_terminal.store(true, std::memory_order_release);
                     throw std::runtime_error(
                         "duplicate compiler owner pointer; process must exit");
                 }
@@ -421,6 +513,42 @@ aimdo_full_proxy_is_installed() {
 }
 
 extern "C" __attribute__((visibility("default"))) bool
+aimdo_full_proxy_drain_deferred_frees() {
+    if (!g_proxy || g_compiler_terminal.load(std::memory_order_acquire)) return false;
+    const uint64_t token = current_thread_token();
+    try {
+        for (;;) {
+            std::shared_ptr<Owner> owner;
+            {
+                std::lock_guard<std::mutex> guard(g_deferred_mutex);
+                auto found = g_deferred_frees->find(token);
+                if (found == g_deferred_frees->end() || found->second.empty()) break;
+                owner = std::move(found->second.front());
+                found->second.pop_front();
+                if (found->second.empty()) g_deferred_frees->erase(found);
+                g_deferred_free_count.fetch_sub(1, std::memory_order_relaxed);
+            }
+            const uint64_t failures =
+                g_compiler_failures.load(std::memory_order_acquire);
+            owner.reset(); // Native graph free runs on the original owner thread.
+            if (g_compiler_terminal.load(std::memory_order_acquire) ||
+                g_compiler_failures.load(std::memory_order_acquire) != failures) {
+                return false;
+            }
+        }
+    } catch (...) {
+        g_compiler_terminal.store(true, std::memory_order_release);
+        return false;
+    }
+    return !g_compiler_terminal.load(std::memory_order_acquire);
+}
+
+extern "C" __attribute__((visibility("default"))) uint64_t
+aimdo_full_proxy_deferred_free_count() {
+    return g_deferred_free_count.load(std::memory_order_acquire);
+}
+
+extern "C" __attribute__((visibility("default"))) bool
 aimdo_full_proxy_test_fail_next_compiler_owner_insert() {
     if (!g_proxy || !g_compiler_scope || g_fail_next_compiler_owner_insert) {
         return false;
@@ -467,7 +595,8 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_snapshot
     if (!g_proxy || !values || count != 17) return false;
     {
         std::lock_guard<std::mutex> guard(g_owner_mutex);
-        values[0] = g_owners.size();
+        values[0] = g_owners.size() +
+            g_deferred_free_count.load(std::memory_order_acquire);
     }
     values[1] = g_allocations.load(std::memory_order_relaxed);
     values[2] = g_releases.load(std::memory_order_relaxed);
@@ -529,6 +658,7 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler
     size_t bytes, uint64_t stream, const char *expected_revision) {
     // Zero selects every positive-size Torch tensor request in this scope.
     if (!g_proxy || g_custom_scope || g_compiler_scope ||
+        g_compiler_terminal.load(std::memory_order_acquire) ||
         !stream || !expected_revision) return false;
     using SourceRevision = const char *(*)();
     auto source = reinterpret_cast<SourceRevision>(

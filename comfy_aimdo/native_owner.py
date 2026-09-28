@@ -74,9 +74,12 @@ def dead_owner_graphs() -> int:
 
 
 def drain_deferred_graphs() -> int:
-    """Complete queued graph closes on their original Python owner thread."""
+    """Complete queued tensor frees before graph closes on their owner thread."""
     if dead_owner_graphs():
         raise RuntimeError(_DEAD_OWNER_ERROR)
+    drain_frees = getattr(_library, "aimdo_full_proxy_drain_deferred_frees", None)
+    if drain_frees is not None and not drain_frees():
+        raise RuntimeError("AIMDO deferred compiler free failed; process must exit")
     owner = threading.current_thread()
     with _graph_lock:
         pending = _deferred_graphs.pop(owner, [])
@@ -167,6 +170,10 @@ def install(torch_module) -> None:
     library.aimdo_full_proxy_scoped_raw_snapshot.restype = ctypes.c_bool
     library.aimdo_full_proxy_is_compiler_owner.argtypes = [ctypes.c_void_p]
     library.aimdo_full_proxy_is_compiler_owner.restype = ctypes.c_bool
+    library.aimdo_full_proxy_drain_deferred_frees.argtypes = []
+    library.aimdo_full_proxy_drain_deferred_frees.restype = ctypes.c_bool
+    library.aimdo_full_proxy_deferred_free_count.argtypes = []
+    library.aimdo_full_proxy_deferred_free_count.restype = ctypes.c_uint64
 
     if library.aimdo_full_proxy_torch_version() != _TORCH_VERSION.encode():
         raise RuntimeError("native-owner DSO Torch ABI does not match the runtime")
@@ -203,6 +210,13 @@ def is_compiler_owner(pointer: int) -> bool:
     if not installed():
         raise RuntimeError("native-owner diagnostic is not installed")
     return bool(_library.aimdo_full_proxy_is_compiler_owner(ctypes.c_void_p(int(pointer))))
+
+
+def pending_compiler_frees() -> int:
+    """Count compiler DataPtr releases awaiting their original graph thread."""
+    if not installed():
+        raise RuntimeError("native-owner diagnostic is not installed")
+    return int(_library.aimdo_full_proxy_deferred_free_count())
 
 
 def inject_next_compiler_owner_insert_failure() -> None:

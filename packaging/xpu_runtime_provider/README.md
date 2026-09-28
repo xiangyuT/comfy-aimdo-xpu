@@ -95,6 +95,12 @@ attempted in that process. OOM-style failures retain the retry route.
 If a diagnostic graph's creator thread has exited, foreign-thread close still
 retains the handle, but reports a terminal process-exit requirement immediately.
 No other thread adopts that native graph or continues allocator scopes.
+If a compiler tensor is finally released on a foreign thread before the graph
+has completed, its DataPtr waits registered consumers and defers the native
+free to the original graph thread. Graph operations drain those frees before
+pop/abort/destroy; deinitialization counts outstanding deferred owners as live.
+A failed deferred free is terminal, while unregistered consumers remain outside
+the diagnostic contract.
 
 For a Linux source wheel containing `malloc_graph.py`, the builder requires the
 complete provider module set and all twelve compiler ABI/provenance exports in

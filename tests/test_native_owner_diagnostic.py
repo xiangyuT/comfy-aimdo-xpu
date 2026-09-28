@@ -267,6 +267,41 @@ def test_owner_close_retry_retains_failed_deferred_graph(monkeypatch):
     assert native_owner.graph_ownership_snapshot() == {"live": 0, "deferred": 0}
 
 
+def test_deferred_compiler_free_drains_before_graph_destroy(monkeypatch):
+    monkeypatch.setattr(native_owner, "_graph_lock", threading.Lock())
+    monkeypatch.setattr(native_owner, "_live_graphs", weakref.WeakSet())
+    monkeypatch.setattr(native_owner, "_deferred_graphs", {})
+    calls = []
+    library = SimpleNamespace(malloc_graph_destroy_checked=lambda handle:
+                              calls.append(("graph", handle.value)) or True)
+    proxy = SimpleNamespace(
+        aimdo_full_proxy_is_installed=lambda: True,
+        aimdo_full_proxy_drain_deferred_frees=lambda: calls.append(("tensor", 1)) or True,
+        aimdo_full_proxy_deferred_free_count=lambda: 1,
+    )
+    monkeypatch.setattr(native_owner, "_library", proxy)
+    native_owner._defer_graph_destroy(threading.current_thread(), library, 123)
+    assert native_owner.pending_compiler_frees() == 1
+    assert native_owner.drain_deferred_graphs() == 1
+    assert calls == [("tensor", 1), ("graph", 123)]
+
+
+def test_failed_deferred_compiler_free_blocks_graph_destroy(monkeypatch):
+    monkeypatch.setattr(native_owner, "_graph_lock", threading.Lock())
+    monkeypatch.setattr(native_owner, "_live_graphs", weakref.WeakSet())
+    monkeypatch.setattr(native_owner, "_deferred_graphs", {})
+    calls = []
+    library = SimpleNamespace(malloc_graph_destroy_checked=lambda handle:
+                              calls.append(handle.value) or True)
+    proxy = SimpleNamespace(aimdo_full_proxy_drain_deferred_frees=lambda: False)
+    monkeypatch.setattr(native_owner, "_library", proxy)
+    native_owner._defer_graph_destroy(threading.current_thread(), library, 456)
+    with pytest.raises(RuntimeError, match="deferred compiler free failed; process must exit"):
+        native_owner.drain_deferred_graphs()
+    assert calls == []
+    assert native_owner.graph_ownership_snapshot() == {"live": 0, "deferred": 1}
+
+
 def test_dead_owner_close_is_terminal_without_duplicate_queue_entry(monkeypatch):
     monkeypatch.setattr(native_owner, "_graph_lock", threading.Lock())
     monkeypatch.setattr(native_owner, "_live_graphs", weakref.WeakSet())
