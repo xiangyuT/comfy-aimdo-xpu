@@ -99,12 +99,33 @@ def _compiler_api_contract(source_version, files):
 def _native_owner_diagnostic_contract(source_version, torch_version, files):
     """Bind the optional D2 sidecar without declaring compiler availability."""
     native = f"{CANONICAL_PACKAGE}/aimdo_xpu_native_owner.so"
+    abi_identity = f"{CANONICAL_PACKAGE}/aimdo_xpu_native_owner_abi.json"
     if native not in files:
+        if abi_identity in files:
+            raise RuntimeError("native-owner Torch ABI identity has no sidecar")
         return None
     if source_version != "0.5.5" or torch_version != "2.14.0+xpu":
         raise RuntimeError("native-owner diagnostic requires AIMDO 0.5.5 and Torch 2.14.0+xpu")
     if f"{CANONICAL_PACKAGE}/native_owner.py" not in files:
         raise RuntimeError("native-owner diagnostic Python module is missing")
+    if abi_identity not in files:
+        raise RuntimeError("native-owner Torch ABI identity is missing")
+    try:
+        identity = json.loads(files[abi_identity])
+    except (ValueError, TypeError) as error:
+        raise RuntimeError("native-owner Torch ABI identity is invalid") from error
+    libraries = identity.get("libraries") if isinstance(identity, dict) else None
+    if (not isinstance(identity, dict)
+            or set(identity) != {"schema_version", "torch_version", "cxx11_abi", "libraries"}
+            or identity["schema_version"] != 1
+            or identity["torch_version"] != torch_version
+            or identity["cxx11_abi"] is not True
+            or not isinstance(libraries, dict)
+            or set(libraries) != {"libc10.so", "libc10_xpu.so", "libtorch_xpu.so"}
+            or any(not isinstance(value, str) or
+                   not re.fullmatch(r"[0-9a-f]{64}", value)
+                   for value in libraries.values())):
+        raise RuntimeError("native-owner Torch C10/XPU ABI identity is invalid")
     with tempfile.TemporaryDirectory(prefix="aimdo-native-owner-inspect-") as temporary:
         tool = shutil.which("nm")
         if tool is None:
@@ -133,6 +154,8 @@ def _native_owner_diagnostic_contract(source_version, torch_version, files):
         "torch_version": torch_version,
         "path": f"{PROVIDER_PACKAGE}/_vendor/{native}",
         "sha256": _sha256(files[native]),
+        "abi_identity_path": f"{PROVIDER_PACKAGE}/_vendor/{abi_identity}",
+        "abi_identity_sha256": _sha256(files[abi_identity]),
     }
 
 

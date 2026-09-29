@@ -26,6 +26,11 @@ have a separate owner. This process-lifetime experiment does not change the
 default `native_hook` route or public memory-compiler capability. The proxy's
 private C10/XPU ABI, stream and failure contracts need separate validation
 before it can become a supported allocator path.
+The opt-in sidecar build records SHA-256 for Torch's C10, C10/XPU and
+Torch/XPU shared libraries. Before loading the private proxy, installation
+checks those exact runtime bytes and Torch's CXX11 ABI flag in addition to the
+`2.14.0+xpu` version. A same-version ABI mismatch is rejected before allocator
+installation; this does not make the private ABI a public Torch interface.
 The read-only `get_memory_compiler_capability()` query reports this path under
 `native_owner_diagnostic`: process installation, active `native_hook` context,
 its opt-in graph entry point and explicit `record_stream` consumer contract are

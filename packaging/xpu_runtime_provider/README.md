@@ -53,8 +53,12 @@ python packaging/xpu_runtime_provider/build_wheel.py \
 ```
 
 This adds `aimdo_xpu_native_owner.so` as a second, privately vendored native
-artifact. The manifest binds it to Torch 2.14.0 XPU and marks it disabled by
-default. Only an explicitly set `AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC=1` with Linux
+artifact and `aimdo_xpu_native_owner_abi.json` with SHA-256 for the C10,
+C10/XPU and Torch/XPU libraries used by the build. The provider manifest binds
+both files. Installation checks the runtime Torch CXX11 ABI flag and these
+three library bytes before loading the sidecar; a same-version different build
+fails closed. The diagnostic remains disabled by default. Only an explicitly
+set `AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC=1` with Linux
 `native_hook` can install it before XPU initialization. The process-lifetime
 proxy cannot be unloaded or switched off in the same process. This diagnostic
 path does not enable public XPU `record()` or compiler capability; it has not

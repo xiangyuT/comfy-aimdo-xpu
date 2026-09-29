@@ -1,6 +1,8 @@
 """Fail-closed admission for the opt-in Torch 2.14 native-owner sidecar."""
 
 import contextlib
+import hashlib
+import json
 import sys
 import threading
 from types import SimpleNamespace
@@ -36,6 +38,46 @@ def test_wrong_torch_and_late_xpu_init_rejected_before_dso_load(monkeypatch):
                            xpu=SimpleNamespace(is_initialized=lambda: True))
     with pytest.raises(RuntimeError, match="before XPU initialization"):
         native_owner.install(late)
+
+
+def test_private_torch_abi_library_hashes_are_checked_before_dso_load(tmp_path, monkeypatch):
+    package = tmp_path / "vendor"
+    package.mkdir()
+    torch_root = tmp_path / "torch"
+    library_dir = torch_root / "lib"
+    library_dir.mkdir(parents=True)
+    libraries = {}
+    for name in native_owner._TORCH_ABI_LIBRARIES:
+        data = ("test-" + name).encode()
+        (library_dir / name).write_bytes(data)
+        libraries[name] = hashlib.sha256(data).hexdigest()
+    identity = {"schema_version": 1, "torch_version": "2.14.0+xpu",
+                "cxx11_abi": True, "libraries": libraries}
+    (package / "aimdo_xpu_native_owner_abi.json").write_text(json.dumps(identity))
+    torch_module = SimpleNamespace(
+        __file__=str(torch_root / "__init__.py"), __version__="2.14.0+xpu",
+        _C=SimpleNamespace(_GLIBCXX_USE_CXX11_ABI=True),
+        xpu=SimpleNamespace(is_initialized=lambda: False),
+    )
+    native_owner._validate_torch_abi_identity(torch_module, package)
+    (library_dir / "libc10_xpu.so").write_bytes(b"different same-version build")
+    with pytest.raises(RuntimeError, match="library mismatch: libc10_xpu.so"):
+        native_owner._validate_torch_abi_identity(torch_module, package)
+    torch_module._C._GLIBCXX_USE_CXX11_ABI = False
+    with pytest.raises(RuntimeError, match="C10/XPU ABI identity does not match"):
+        native_owner._validate_torch_abi_identity(torch_module, package)
+
+    missing = tmp_path / "missing"
+    missing.mkdir()
+    (missing / "aimdo_xpu_native_owner.so").write_bytes(b"fake-sidecar")
+    monkeypatch.setattr(native_owner, "__file__", str(missing / "native_owner.py"))
+    monkeypatch.setattr(native_owner, "_library", None)
+    monkeypatch.setattr(native_owner.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(native_owner.ctypes, "CDLL",
+                        lambda *args, **kwargs: pytest.fail("sidecar loaded before ABI validation"))
+    torch_module._C._GLIBCXX_USE_CXX11_ABI = True
+    with pytest.raises(RuntimeError, match="Torch ABI identity is missing or invalid"):
+        native_owner.install(torch_module)
 
 
 def test_process_lifetime_proxy_cannot_be_disabled(monkeypatch):
