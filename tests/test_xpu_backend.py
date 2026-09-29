@@ -35,6 +35,10 @@ def _destroy_vbar(vbar):
     gc.collect()
 
 
+def _linux_native_hook():
+    return sys.platform == "linux" and control.get_xpu_allocator_mode() == "native_hook"
+
+
 def test_vbar_raw_tensor_hit_evict_and_refault_signature():
     from comfy_aimdo.model_vbar import ModelVBAR, vbar_signature_compare
     from comfy_aimdo.torch import aimdo_to_tensor
@@ -295,6 +299,7 @@ def test_torch_allocator_pressure_preserves_active_vbar_priority():
     recorded = control.get_total_vram_usage()
     control.init(simple_vram_headroom=total - recorded - (32 << 20))
     stats_before = control.get_xpu_vmm_stats()
+    hook_before = control.get_xpu_ur_hook_stats() if _linux_native_hook() else None
 
     activation = torch.empty(64 << 20, dtype=torch.uint8, device=device)
     activation.fill_(23)
@@ -324,10 +329,20 @@ def test_torch_allocator_pressure_preserves_active_vbar_priority():
     assert active_vbar.get_watermark() == active_vbar.get_nr_pages()
     stats_after = control.get_xpu_vmm_stats()
     assert stats_after["unmap_bytes"] - stats_before["unmap_bytes"] == 32 << 20
-    assert (
-        stats_after["torch_allocator_physical_alloc_calls"]
-        > stats_before["torch_allocator_physical_alloc_calls"]
-    )
+    if hook_before is not None:
+        # Torch owns its native cache; physical USM growth is observed by the
+        # UR hook rather than AIMDO's separate global allocator counters.
+        hook_after = control.get_xpu_ur_hook_stats()
+        assert hook_after["tracked_alloc_calls"] > hook_before["tracked_alloc_calls"]
+        assert (
+            stats_after["torch_allocator_physical_alloc_calls"]
+            == stats_before["torch_allocator_physical_alloc_calls"]
+        )
+    else:
+        assert (
+            stats_after["torch_allocator_physical_alloc_calls"]
+            > stats_before["torch_allocator_physical_alloc_calls"]
+        )
 
     if sys.platform != "win32":
         del activation
@@ -385,6 +400,7 @@ def test_torch_allocator_reuses_completed_same_size_block():
     device = torch.device("xpu", torch.xpu.current_device())
     assert control.empty_xpu_allocator_cache(wait=True)
     stats_before = control.get_xpu_vmm_stats()
+    hook_before = control.get_xpu_ur_hook_stats() if _linux_native_hook() else None
     active_before, reserved_before, _, _ = (
         control.get_xpu_allocator_memory_stats(device)
     )
@@ -398,9 +414,9 @@ def test_torch_allocator_reuses_completed_same_size_block():
                 control.get_xpu_allocator_memory_stats(device)
             )
             assert active - active_before == 4 << 20
-            if sys.platform == "win32":
+            if sys.platform == "win32" or hook_before is not None:
                 # The native allocator rounds this request to a reusable
-                # segment (currently 20 MiB in Torch 2.12).
+                # segment; its size depends on the installed Torch build.
                 assert reserved - reserved_before >= 4 << 20
             else:
                 assert reserved - reserved_before == 4 << 20
@@ -413,18 +429,30 @@ def test_torch_allocator_reuses_completed_same_size_block():
         control.get_xpu_allocator_memory_stats(device)
     )
     assert active_cached == active_before
-    if sys.platform == "win32":
+    if sys.platform == "win32" or hook_before is not None:
         assert reserved_cached - reserved_before >= 4 << 20
+        assert reserved_cached == reserved
     else:
         assert reserved_cached - reserved_before == 4 << 20
 
     stats_after = control.get_xpu_vmm_stats()
-    assert (
-        stats_after["torch_allocator_physical_alloc_calls"]
-        - stats_before["torch_allocator_physical_alloc_calls"]
-        == 1
-    )
-    if sys.platform != "win32":
+    if hook_before is not None:
+        hook_after = control.get_xpu_ur_hook_stats()
+        assert (
+            hook_after["tracked_alloc_calls"] - hook_before["tracked_alloc_calls"]
+            == 1
+        )
+        assert (
+            stats_after["torch_allocator_physical_alloc_calls"]
+            == stats_before["torch_allocator_physical_alloc_calls"]
+        )
+    else:
+        assert (
+            stats_after["torch_allocator_physical_alloc_calls"]
+            - stats_before["torch_allocator_physical_alloc_calls"]
+            == 1
+        )
+    if sys.platform != "win32" and hook_before is None:
         assert (
             stats_after["torch_allocator_cache_hits"]
             - stats_before["torch_allocator_cache_hits"]
@@ -439,6 +467,12 @@ def test_torch_allocator_reuses_completed_same_size_block():
     )
     assert active_empty == active_before
     assert reserved_empty == reserved_before
+    if hook_before is not None:
+        hook_empty = control.get_xpu_ur_hook_stats()
+        assert (
+            hook_empty["tracked_free_calls"] - hook_before["tracked_free_calls"]
+            == 1
+        )
     if sys.platform == "win32":
         stats_empty = control.get_xpu_vmm_stats()
         assert (
