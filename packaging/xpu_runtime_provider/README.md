@@ -76,6 +76,9 @@ diagnostic graph. The caller resumes the graph before leaving the context;
 nested suspensions are supported, nested compiler scopes are rejected, and a
 failed native scope transition requires process exit. ComfyUI caller wiring
 remains a separate gate.
+`native_owner.paused_graph_scope(graph)` pairs that route suspension with
+graph pause/resume and restores both on exceptional exit. Nested calls require
+the same graph and sync mode; a failed graph transition requires process exit.
 The Torch 2.14 sidecar publishes its D1 function pointers once as an immutable
 table. Later compiler scopes verify the same native addresses and source
 revision; concurrent graph threads do not overwrite pointers read by tensor

@@ -157,6 +157,83 @@ def test_failed_compiler_scope_resume_is_process_terminal(monkeypatch):
         real_drain()
 
 
+def test_paused_graph_scope_restores_graph_and_route_after_nested_cancellation(monkeypatch):
+    calls = []
+    proxy = SimpleNamespace(
+        aimdo_full_proxy_is_installed=lambda: True,
+        aimdo_full_proxy_compiler_begin=lambda *args: calls.append(("begin", *args)) or True,
+        aimdo_full_proxy_compiler_end=lambda: calls.append(("end",)) or True,
+    )
+    core = SimpleNamespace()
+    stream = SimpleNamespace(sycl_queue=456)
+    graph = SimpleNamespace(
+        _native_lib=core, _handle=123,
+        _owner_thread=threading.current_thread(), _stream=stream,
+        pause=lambda *, sync: calls.append(("pause", sync)),
+        resume=lambda *, sync: calls.append(("resume", sync)),
+    )
+    other = SimpleNamespace(**{**vars(graph), "_handle": 789})
+    monkeypatch.setattr(native_owner, "_library", proxy)
+    monkeypatch.setattr(native_owner, "_scope_context", threading.local())
+    monkeypatch.setattr(native_owner, "_scope_terminal", False)
+    monkeypatch.setattr(native_owner, "drain_deferred_graphs", lambda: 0)
+    monkeypatch.setattr(control, "lib", core)
+    monkeypatch.setattr(control, "_xpu_native_owner_context_ready", lambda: True)
+    monkeypatch.setattr(control, "get_memory_compiler_capability",
+                        lambda: {"source_revision": "exact-source"})
+    with pytest.raises(KeyError, match="cancel"):
+        with native_owner.compiler_scope(stream):
+            with native_owner.paused_graph_scope(graph, sync=True):
+                with native_owner.paused_graph_scope(graph, sync=True):
+                    calls.append(("ordinary-work",))
+                with pytest.raises(RuntimeError, match="same graph and sync mode"):
+                    with native_owner.paused_graph_scope(graph, sync=False):
+                        pytest.fail("mismatched sync mode entered")
+                with pytest.raises(RuntimeError, match="same graph and sync mode"):
+                    with native_owner.paused_graph_scope(other, sync=True):
+                        pytest.fail("different graph entered")
+                raise KeyError("cancel")
+    assert calls == [("begin", 0, 456, b"exact-source"), ("end",),
+                     ("pause", True), ("ordinary-work",), ("resume", True),
+                     ("begin", 0, 456, b"exact-source"), ("end",)]
+    assert native_owner._scope_terminal is False
+
+
+def test_paused_graph_scope_failed_resume_is_process_terminal(monkeypatch):
+    calls = []
+    proxy = SimpleNamespace(
+        aimdo_full_proxy_is_installed=lambda: True,
+        aimdo_full_proxy_compiler_begin=lambda *args: calls.append("begin") or True,
+        aimdo_full_proxy_compiler_end=lambda: calls.append("end") or True,
+    )
+    core = SimpleNamespace()
+    stream = SimpleNamespace(sycl_queue=456)
+
+    def failed_resume(*, sync):
+        calls.append("resume")
+        raise RuntimeError("graph resume failed")
+
+    graph = SimpleNamespace(
+        _native_lib=core, _handle=123,
+        _owner_thread=threading.current_thread(), _stream=stream,
+        pause=lambda *, sync: calls.append("pause"), resume=failed_resume,
+    )
+    monkeypatch.setattr(native_owner, "_library", proxy)
+    monkeypatch.setattr(native_owner, "_scope_context", threading.local())
+    monkeypatch.setattr(native_owner, "_scope_terminal", False)
+    monkeypatch.setattr(native_owner, "drain_deferred_graphs", lambda: 0)
+    monkeypatch.setattr(control, "lib", core)
+    monkeypatch.setattr(control, "_xpu_native_owner_context_ready", lambda: True)
+    monkeypatch.setattr(control, "get_memory_compiler_capability",
+                        lambda: {"source_revision": "exact-source"})
+    with pytest.raises(RuntimeError, match="process must exit"):
+        with native_owner.compiler_scope(stream):
+            with native_owner.paused_graph_scope(graph):
+                pass
+    assert calls == ["begin", "end", "pause", "resume"]
+    assert native_owner._scope_terminal is True
+
+
 def test_consumer_scope_registers_before_work_and_restores_stream(monkeypatch):
     calls = []
 

@@ -397,6 +397,52 @@ def suspend_compiler_scope():
 
 
 @contextlib.contextmanager
+def paused_graph_scope(graph, *, sync: bool = False):
+    """Pause an owner graph and its compiler route for ordinary allocations.
+
+    Nested pauses of the same graph retain the outer pause. The graph and
+    compiler route are both restored before an exception leaves this context.
+    """
+    global _scope_terminal
+    state = getattr(_scope_context, "active", None)
+    from . import control
+
+    if (state is None or state["failed"] or _scope_terminal or
+            getattr(graph, "_native_lib", None) is not control.lib or
+            not getattr(graph, "_handle", None) or
+            getattr(graph, "_owner_thread", None) is not threading.current_thread() or
+            int(getattr(getattr(graph, "_stream", None), "sycl_queue", 0)) != state["stream"]):
+        raise RuntimeError("paused diagnostic graph requires its active owner scope")
+    if state["pause_depth"] and (
+            state["paused_graph"] is not graph or state["pause_sync"] != sync):
+        raise RuntimeError("nested diagnostic pause requires the same graph and sync mode")
+    with suspend_compiler_scope():
+        if state["pause_depth"] == 0:
+            try:
+                graph.pause(sync=sync)
+            except BaseException as error:
+                state["failed"] = True
+                _scope_terminal = True
+                raise RuntimeError("diagnostic graph pause failed; process must exit") from error
+            state["paused_graph"] = graph
+            state["pause_sync"] = sync
+        state["pause_depth"] += 1
+        try:
+            yield
+        finally:
+            state["pause_depth"] -= 1
+            if state["pause_depth"] == 0:
+                try:
+                    graph.resume(sync=sync)
+                except BaseException as error:
+                    state["failed"] = True
+                    _scope_terminal = True
+                    raise RuntimeError("diagnostic graph resume failed; process must exit") from error
+                state["paused_graph"] = None
+                state["pause_sync"] = False
+
+
+@contextlib.contextmanager
 def consumer_scope(tensor, stream):
     """Register a compiler tensor before queued work on another XPU stream.
 
@@ -496,13 +542,15 @@ def _compiler_scope(size: int, stream):
         raise RuntimeError("native-owner compiler scope could not start")
     state = {"size": size, "stream": stream_pointer,
              "source_revision": revision_bytes, "suspend_depth": 0,
-             "native_active": True, "failed": False}
+             "native_active": True, "failed": False,
+             "paused_graph": None, "pause_depth": 0, "pause_sync": False}
     _scope_context.active = state
     try:
         yield
     finally:
         _scope_context.active = None
-        if state["failed"] or state["suspend_depth"] or not state["native_active"]:
+        if (state["failed"] or state["suspend_depth"] or state["pause_depth"] or
+                not state["native_active"]):
             _scope_terminal = True
             raise RuntimeError("native-owner compiler scope lost; process must exit")
         if not _library.aimdo_full_proxy_compiler_end():
