@@ -50,6 +50,7 @@ struct Event {
     Event *previous;
     Event *allocation_previous;
     bool rogue_owned;
+    bool freed_out_of_scope;
     AllocationState *snapshot;
     SmallRange *small_snapshot;
 };
@@ -306,12 +307,21 @@ static bool collect_rogue_candidates(MallocGraph *g) {
 
     while (allocation) {
         Event *previous = allocation->allocation_previous;
-        if (!register_rogue_candidate(candidate_ptr(g, allocation))) {
+        CUdeviceptr pointer = candidate_ptr(g, allocation);
+        if (!register_rogue_candidate(pointer)) {
             g->failed = true;
             return false;
         }
+        if (allocation->freed_out_of_scope) {
+            int result = -1;
+            if (!free_rogue(pointer, &result) || result != CUDA_SUCCESS) {
+                unregister_rogue_candidate(pointer);
+                g->failed = true;
+                return false;
+            }
+        }
         if (!sever_event(g, allocation)) {
-            unregister_rogue_candidate(candidate_ptr(g, allocation));
+            unregister_rogue_candidate(pointer);
             return false;
         }
         allocation->allocation_previous = g->rogue_candidates;
@@ -1031,8 +1041,15 @@ bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
         while (*entry && (*entry)->offset != value) {
             entry = &(*entry)->next;
         }
-        RETURN_G_FAILED(!*entry || (*entry)->owner_depth != g->state->depth ||
-                        !event(g, EV_FREE_SMALL, value, 0) ||
+        RETURN_G_FAILED(!*entry || !(*entry)->allocation, true);
+        if ((*entry)->owner_depth != g->state->depth) {
+            /* The DataPtr has gone away even though this graph event is invalid.
+             * Abort must hand off a freed candidate, not an orphaned rogue. */
+            (*entry)->allocation->freed_out_of_scope = true;
+            g->failed = true;
+            return true;
+        }
+        RETURN_G_FAILED(!event(g, EV_FREE_SMALL, value, 0) ||
                         !untrack_allocation(g, (*entry)->allocation), true);
 
         SmallRange *range = *entry;
@@ -1043,8 +1060,13 @@ bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
     }
 
     VirtualPage *first = &g->allocations.virtual_pages[value];
-    RETURN_G_FAILED(first->owner_depth != g->state->depth || !first->va_span ||
-                    !event(g, EV_FREE, value, 0) ||
+    RETURN_G_FAILED(!first->va_span || !first->allocation, true);
+    if (first->owner_depth != g->state->depth) {
+        first->allocation->freed_out_of_scope = true;
+        g->failed = true;
+        return true;
+    }
+    RETURN_G_FAILED(!event(g, EV_FREE, value, 0) ||
                     !untrack_allocation(g, first->allocation), true);
 
     for (size_t j = 0; j < first->va_span; j++) {
