@@ -67,7 +67,8 @@ The sidecar build also requires the XPU-only `malloc_graph_free_owned` export
 in the matching D1 native library. It is used only after owner and registered
 consumer queues complete; the standard shared-core free API is unchanged.
 The opt-in Python `native_owner.consumer_scope(tensor, stream)` verifies a live
-compiler-owned tensor on the same indexed XPU device and registers the stream
+compiler-owned storage base on the same indexed XPU device, including views
+with nonzero storage offsets, and registers the stream
 before yielding to queued work. It is a caller contract, not automatic
 tracking: previously queued unregistered work remains outside the guarantee.
 The private `native_owner.suspend_compiler_scope()` context temporarily sends

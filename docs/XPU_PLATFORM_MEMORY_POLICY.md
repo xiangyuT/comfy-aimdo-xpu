@@ -62,7 +62,9 @@ the owner's stream and restore the graph's previous stream. The original
 `malloc_graph_free` keeps its strict current-stream check. Unregistered
 external consumers remain outside this contract.
 The opt-in `native_owner.consumer_scope(tensor, stream)` checks an indexed XPU
-device and live compiler ownership, calls Torch `record_stream` **before**
+device and live compiler ownership at the tensor's storage base, so a view with
+a nonzero storage offset can register its underlying compiler owner. It calls
+Torch `record_stream` **before**
 yielding to the secondary stream, then restores the previous stream on exit.
 Callers must enter it before queuing that stream's first use of the tensor;
 entering later cannot repair work that was already unregistered. Torch's

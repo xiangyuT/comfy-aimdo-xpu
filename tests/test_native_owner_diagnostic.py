@@ -247,7 +247,8 @@ def test_consumer_scope_registers_before_work_and_restores_stream(monkeypatch):
 
     device = SimpleNamespace(type="xpu", index=0)
     stream = SimpleNamespace(device=device, sycl_queue=456)
-    tensor = SimpleNamespace(device=device, data_ptr=lambda: 123,
+    tensor = SimpleNamespace(device=device, data_ptr=lambda: 127,
+                             untyped_storage=lambda: SimpleNamespace(data_ptr=lambda: 123),
                              record_stream=lambda value: calls.append(
                                  ("record", value.sycl_queue)))
     monkeypatch.setattr(native_owner, "installed", lambda: True)
@@ -285,6 +286,7 @@ def test_consumer_scope_rejects_wrong_device_and_unowned_tensor(monkeypatch):
                         lambda pointer: pointer == 123)
     tensor = SimpleNamespace(device=SimpleNamespace(type="xpu", index=0),
                              data_ptr=lambda: 999,
+                             untyped_storage=lambda: SimpleNamespace(data_ptr=lambda: 999),
                              record_stream=lambda stream: calls.append(stream))
     wrong = SimpleNamespace(device=SimpleNamespace(type="xpu", index=1),
                             sycl_queue=456)
@@ -295,6 +297,10 @@ def test_consumer_scope_rejects_wrong_device_and_unowned_tensor(monkeypatch):
     with pytest.raises(RuntimeError, match="live compiler-owned tensor"):
         with native_owner.consumer_scope(tensor, correct):
             pytest.fail("unowned tensor entered the scope")
+    tensor.untyped_storage = lambda: None
+    with pytest.raises(ValueError, match="requires a tensor with XPU storage"):
+        with native_owner.consumer_scope(tensor, correct):
+            pytest.fail("missing storage entered the scope")
     assert calls == []
 
 

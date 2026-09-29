@@ -461,7 +461,10 @@ def consumer_scope(tensor, stream):
             index is None or index != getattr(stream_device, "index", None) or
             not int(getattr(stream, "sycl_queue", 0))):
         raise ValueError("consumer scope requires the same indexed XPU device and queue")
-    pointer = int(tensor.data_ptr())
+    try:
+        pointer = int(tensor.untyped_storage().data_ptr())
+    except (AttributeError, TypeError, ValueError) as error:
+        raise ValueError("consumer scope requires a tensor with XPU storage") from error
     if not pointer or not is_compiler_owner(pointer):
         raise RuntimeError("consumer scope requires a live compiler-owned tensor")
     import torch
