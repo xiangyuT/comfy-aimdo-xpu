@@ -31,6 +31,13 @@ Torch/XPU shared libraries. Before loading the private proxy, installation
 checks those exact runtime bytes and Torch's CXX11 ABI flag in addition to the
 `2.14.0+xpu` version. A same-version ABI mismatch is rejected before allocator
 installation; this does not make the private ABI a public Torch interface.
+On Linux, `AIMDO_XPU_GRAPH_AVOID_ALIAS=1` makes each newly assigned large
+graph VA use a distinct physical page. This diagnostic option avoids a second
+map of one physical handle on drivers that reject it. It is sampled when a
+graph is created; unset or `0` preserves physical-page reuse. Unique pages
+can increase physical memory use, so this option does not establish a public
+compiler route or a performance result.
+
 The read-only `get_memory_compiler_capability()` query reports this path under
 `native_owner_diagnostic`: process installation, active `native_hook` context,
 its opt-in graph entry point and explicit `record_stream` consumer contract are

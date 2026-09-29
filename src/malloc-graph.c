@@ -123,6 +123,7 @@ typedef struct {
     bool handoff_attempted;
     bool aborted;
 #ifdef AIMDO_XPU
+    bool avoid_physical_alias;
     unsigned test_page_create_oom_attempts;
     unsigned test_destroy_release_stage;
     bool destroy_terminal;
@@ -989,11 +990,16 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
 
     for (size_t j = 0; j < pages; j++) {
         if (g->va_phys[va + j] < 0) {
-            size_t p = 0;
-            while (p < g->phys_count &&
+            bool reuse_physical = true;
+#ifdef AIMDO_XPU
+            reuse_physical = !g->avoid_physical_alias;
+#endif
+            size_t p = reuse_physical ? 0 : g->phys_count;
+            while (reuse_physical && p < g->phys_count &&
                    (g->allocations.physical_live[p] || rogue_phys(g, p))) {
                 p++;
             }
+            RETURN_G_FAILED(p >= MG_PAGES, true);
             RETURN_G_FAILED(map_page(g, va + j, p), true);
         }
         g->allocations.physical_live[g->va_phys[va + j]] = true;
@@ -1142,6 +1148,10 @@ SHARED_EXPORT void *malloc_graph_create(void *devctx, CUstream stream, bool asse
     g->device = g_devctx->_device_id;
     g->owner_thread = &active_graph;
     g->assert_breaks = assert_breaks;
+#ifdef AIMDO_XPU
+    const char *avoid_alias = getenv("AIMDO_XPU_GRAPH_AVOID_ALIAS");
+    g->avoid_physical_alias = avoid_alias && strcmp(avoid_alias, "1") == 0;
+#endif
 
     if (!(g->base = virtual_range_alloc(MG_PAGES * MG_PAGE, MG_PAGE))) {
         goto fail;
