@@ -14,6 +14,7 @@ implementation = None
 _torch_allocator = None
 _torch_allocator_library = None
 _xpu_allocator_ready = False
+_xpu_native_hook_active = False
 _xpu_allocator_mode = None
 _torch_xpu_empty_cache_original = None
 _torch_xpu_memory_stats_original = None
@@ -67,6 +68,15 @@ def _bind_memory_compiler(library, backend):
             "router_available": flags is None and backend in ("cuda", "rocm"), **identity}
 
 
+def _xpu_native_owner_context_ready():
+    """Report a fully initialized, hook-enabled private XPU owner context."""
+    return bool(
+        lib is not None and implementation == "xpu"
+        and _xpu_allocator_mode == "native_hook" and _xpu_allocator_ready
+        and devctxs and _xpu_native_hook_active
+    )
+
+
 def get_memory_compiler_capability():
     """Query support without loading a library or initializing a device.
 
@@ -87,10 +97,7 @@ def get_memory_compiler_capability():
         from . import native_owner
 
         diagnostic_installed = native_owner.installed()
-    diagnostic_active = bool(
-        diagnostic_installed and lib is not None and implementation == "xpu"
-        and _xpu_allocator_mode == "native_hook" and _xpu_allocator_ready
-    )
+    diagnostic_active = diagnostic_installed and _xpu_native_owner_context_ready()
     diagnostic_reason = (
         "opt_in_component_only" if diagnostic_active else
         "installed_context_inactive" if diagnostic_installed else
@@ -602,7 +609,7 @@ def init(
     return True
 
 def init_devices(device_ids):
-    global devctxs
+    global devctxs, _xpu_native_hook_active
 
     if lib is None:
         return False
@@ -654,16 +661,13 @@ def init_devices(device_ids):
     headroom_array = (ctypes.c_uint64 * len(headrooms))(*headrooms)
     if lib.init(device_array, headroom_array, len(requested)):
         devctxs = [get_devctx(device_id) for device_id in requested]
-        if (
-            implementation == "xpu"
-            and _xpu_allocator_mode == "native_hook"
-            and not lib.xpu_ur_hook_enable()
-        ):
-            lib.cleanup()
-            devctxs = []
-            lib.plat_cleanup()
-            return False
         if implementation == "xpu" and _xpu_allocator_mode == "native_hook":
+            if not lib.xpu_ur_hook_enable():
+                lib.cleanup()
+                devctxs = []
+                lib.plat_cleanup()
+                return False
+            _xpu_native_hook_active = True
             logging.info(
                 "comfy-aimdo XPU native allocator hook enabled; "
                 "PyTorch caching allocator retained"
@@ -719,6 +723,7 @@ def get_simple_vram_headroom():
 
 def deinit():
     global lib, devctxs, _log_callback, _xpu_allocator_ready
+    global _xpu_native_hook_active
     global _memory_compiler_native
     if lib is not None:
         if implementation == "xpu":
@@ -738,6 +743,7 @@ def deinit():
                     )
         if implementation == "xpu" and _xpu_allocator_ready:
             if _xpu_allocator_mode == "native_hook":
+                _xpu_native_hook_active = False
                 import torch
 
                 torch.xpu.empty_cache()
@@ -763,6 +769,7 @@ def deinit():
     _memory_compiler_native = None
     globals()["implementation"] = None
     _xpu_allocator_ready = False
+    _xpu_native_hook_active = False
 
 
 def set_log_none(): lib.set_log_level_none()

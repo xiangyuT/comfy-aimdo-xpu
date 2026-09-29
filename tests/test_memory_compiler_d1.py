@@ -3,6 +3,7 @@ import ctypes
 import os
 from pathlib import Path
 import subprocess
+import sys
 import types
 
 import pytest
@@ -104,7 +105,17 @@ def test_native_owner_diagnostic_capability_is_separate_from_public_record(monke
                         control._bind_memory_compiler(native, "xpu"))
     monkeypatch.setattr(control, "_xpu_allocator_mode", "native_hook")
     monkeypatch.setattr(control, "_xpu_allocator_ready", True)
+    monkeypatch.setattr(control, "_xpu_native_hook_active", False)
+    monkeypatch.setattr(control, "devctxs", [])
     monkeypatch.setattr(native_owner, "installed", lambda: True)
+    diagnostic = control.get_memory_compiler_capability()["native_owner_diagnostic"]
+    assert diagnostic["installed"] and not diagnostic["active"]
+    assert diagnostic["entrypoint"] is None
+    assert diagnostic["reason"] == "installed_context_inactive"
+    monkeypatch.setattr(control, "devctxs", [0x1234])
+    diagnostic = control.get_memory_compiler_capability()["native_owner_diagnostic"]
+    assert diagnostic["installed"] and not diagnostic["active"]
+    monkeypatch.setattr(control, "_xpu_native_hook_active", True)
     capability = control.get_memory_compiler_capability()
     assert capability["native_owner_diagnostic"] == {
         "installed": True, "active": True,
@@ -128,6 +139,110 @@ def test_native_owner_diagnostic_capability_is_separate_from_public_record(monke
     diagnostic = control.get_memory_compiler_capability()["native_owner_diagnostic"]
     assert diagnostic["installed"] and not diagnostic["active"]
     assert diagnostic["reason"] == "installed_context_inactive"
+
+
+def test_native_owner_capability_publishes_only_after_hook_enable(monkeypatch):
+    calls = []
+    native = types.SimpleNamespace(_name="/not-a-real-library")
+    native.xpu_set_queues = lambda *args: True
+    native.plat_init = lambda: True
+    native.init = lambda *args: True
+    native.get_devctx = lambda device: 0x1234
+    native.cleanup = lambda: calls.append("cleanup")
+    native.plat_cleanup = lambda: calls.append("plat_cleanup")
+    native.set_log_callback = lambda callback: calls.append("callback_clear")
+    native.xpu_ur_hook_enable = lambda: (
+        calls.append(("enable", len(control.devctxs),
+                      control.get_memory_compiler_capability()["native_owner_diagnostic"]["active"]))
+        or True
+    )
+    disable_results = iter((False, True))
+    native.xpu_ur_hook_disable = lambda: (
+        calls.append(("disable", control.get_memory_compiler_capability()[
+            "native_owner_diagnostic"]["active"])) or next(disable_results)
+    )
+    monkeypatch.setattr(control.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(control, "lib", native)
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "_memory_compiler_native", None)
+    monkeypatch.setattr(control, "_xpu_allocator_mode", "native_hook")
+    monkeypatch.setattr(control, "_xpu_allocator_ready", True)
+    monkeypatch.setattr(control, "_xpu_native_hook_active", False)
+    monkeypatch.setattr(control, "devctxs", [])
+    monkeypatch.setattr(native_owner, "installed", lambda: True)
+    monkeypatch.setattr(native_owner, "drain_deferred_graphs", lambda: 0)
+    monkeypatch.setattr(native_owner, "graph_ownership_snapshot",
+                        lambda: {"live": 0, "deferred": 0})
+    monkeypatch.setattr(native_owner, "snapshot", lambda: [0] * 17)
+    monkeypatch.setattr(native_owner, "scoped_raw_snapshot", lambda: [0] * 5)
+    torch_stub = types.SimpleNamespace(
+        device=lambda *args: object(),
+        xpu=types.SimpleNamespace(
+            current_stream=lambda device: types.SimpleNamespace(sycl_queue=777),
+            empty_cache=lambda: None, synchronize=lambda: None,
+        ),
+    )
+    monkeypatch.setitem(sys.modules, "torch", torch_stub)
+    assert control.get_memory_compiler_capability()["native_owner_diagnostic"]["active"] is False
+    stream = types.SimpleNamespace(device=types.SimpleNamespace(type="xpu", index=0),
+                                   sycl_queue=777)
+    with pytest.raises(RuntimeError, match="requires initialized XPU native_hook"):
+        native_owner.record_diagnostic(stream)
+    with pytest.raises(RuntimeError, match="requires initialized XPU native_hook"):
+        with native_owner.compiler_scope(stream):
+            pytest.fail("scope entered before device initialization")
+    assert control.init_devices([0]) is True
+    assert calls[0] == ("enable", 1, False)
+    assert control.get_memory_compiler_capability()["native_owner_diagnostic"]["active"] is True
+    with pytest.raises(RuntimeError, match="cannot disable AIMDO XPU native hook"):
+        control.deinit()
+    assert ("disable", False) in calls
+    assert control.get_memory_compiler_capability()["native_owner_diagnostic"]["active"] is False
+    with pytest.raises(RuntimeError, match="requires initialized XPU native_hook"):
+        native_owner.record_diagnostic(stream)
+    control.deinit()
+    assert control.lib is None
+    diagnostic = control.get_memory_compiler_capability()["native_owner_diagnostic"]
+    assert diagnostic["installed"] and not diagnostic["active"]
+    assert diagnostic["reason"] == "installed_context_inactive"
+
+
+def test_failed_native_hook_enable_never_publishes_diagnostic_entry(monkeypatch):
+    native = types.SimpleNamespace(
+        _name="/not-a-real-library",
+        xpu_set_queues=lambda *args: True,
+        plat_init=lambda: True,
+        init=lambda *args: True,
+        get_devctx=lambda device: 0x1234,
+        cleanup=lambda: None,
+        plat_cleanup=lambda: None,
+    )
+    observed = []
+    native.xpu_ur_hook_enable = lambda: (
+        observed.append((len(control.devctxs),
+                         control.get_memory_compiler_capability()[
+                             "native_owner_diagnostic"]["active"])) or False
+    )
+    monkeypatch.setattr(control.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(control, "lib", native)
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "_memory_compiler_native", None)
+    monkeypatch.setattr(control, "_xpu_allocator_mode", "native_hook")
+    monkeypatch.setattr(control, "_xpu_allocator_ready", True)
+    monkeypatch.setattr(control, "_xpu_native_hook_active", False)
+    monkeypatch.setattr(control, "devctxs", [])
+    monkeypatch.setattr(native_owner, "installed", lambda: True)
+    monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(
+        device=lambda *args: object(),
+        xpu=types.SimpleNamespace(
+            current_stream=lambda device: types.SimpleNamespace(sycl_queue=777)),
+    ))
+    assert control.init_devices([0]) is False
+    assert observed == [(1, False)]
+    assert control.devctxs == [] and control._xpu_native_hook_active is False
+    diagnostic = control.get_memory_compiler_capability()["native_owner_diagnostic"]
+    assert diagnostic["installed"] and not diagnostic["active"]
+    assert diagnostic["entrypoint"] is None
 
 
 def test_non_linux_capability_does_not_query_native_owner(monkeypatch):

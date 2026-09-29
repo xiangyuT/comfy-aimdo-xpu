@@ -431,9 +431,8 @@ def record_diagnostic(stream, assert_graph_breaks: bool = False):
         raise RuntimeError("native-owner diagnostic is not installed")
     from . import control
 
-    if control.lib is None or control.implementation != "xpu" or \
-            control.get_xpu_allocator_mode() != "native_hook":
-        raise RuntimeError("native-owner graph requires active XPU native_hook")
+    if not control._xpu_native_owner_context_ready():
+        raise RuntimeError("native-owner graph requires initialized XPU native_hook")
     drain_deferred_graphs()
     if not hasattr(control.lib, "malloc_graph_destroy_checked"):
         raise RuntimeError("native-owner checked graph destroy export is missing")
@@ -482,9 +481,8 @@ def _compiler_scope(size: int, stream):
     drain_deferred_graphs()
     from . import control
 
-    if control.lib is None or control.implementation != "xpu" or \
-            control.get_xpu_allocator_mode() != "native_hook":
-        raise RuntimeError("native-owner scope requires active XPU native_hook")
+    if not control._xpu_native_owner_context_ready():
+        raise RuntimeError("native-owner scope requires initialized XPU native_hook")
     if size < 0:
         raise ValueError("native-owner scope size cannot be negative")
     stream_pointer = int(stream.sycl_queue)

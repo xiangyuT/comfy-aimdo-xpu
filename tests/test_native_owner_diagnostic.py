@@ -73,6 +73,7 @@ def test_compiler_scope_suspension_restores_native_binding_after_nested_pause(mo
     monkeypatch.setattr(control, "lib", SimpleNamespace())
     monkeypatch.setattr(control, "implementation", "xpu")
     monkeypatch.setattr(control, "get_xpu_allocator_mode", lambda: "native_hook")
+    monkeypatch.setattr(control, "_xpu_native_owner_context_ready", lambda: True)
     monkeypatch.setattr(control, "get_memory_compiler_capability",
                         lambda: {"source_revision": "exact-source"})
     stream = SimpleNamespace(sycl_queue=456)
@@ -107,6 +108,7 @@ def test_compiler_scope_suspension_exception_restores_route(monkeypatch):
     monkeypatch.setattr(control, "lib", SimpleNamespace())
     monkeypatch.setattr(control, "implementation", "xpu")
     monkeypatch.setattr(control, "get_xpu_allocator_mode", lambda: "native_hook")
+    monkeypatch.setattr(control, "_xpu_native_owner_context_ready", lambda: True)
     monkeypatch.setattr(control, "get_memory_compiler_capability",
                         lambda: {"source_revision": "exact-source"})
     with pytest.raises(KeyError, match="cancel"):
@@ -138,6 +140,7 @@ def test_failed_compiler_scope_resume_is_process_terminal(monkeypatch):
     monkeypatch.setattr(control, "lib", SimpleNamespace())
     monkeypatch.setattr(control, "implementation", "xpu")
     monkeypatch.setattr(control, "get_xpu_allocator_mode", lambda: "native_hook")
+    monkeypatch.setattr(control, "_xpu_native_owner_context_ready", lambda: True)
     monkeypatch.setattr(control, "get_memory_compiler_capability",
                         lambda: {"source_revision": "exact-source"})
     stream = SimpleNamespace(sycl_queue=456)

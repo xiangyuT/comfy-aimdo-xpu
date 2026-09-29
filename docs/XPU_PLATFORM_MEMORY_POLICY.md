@@ -30,6 +30,10 @@ The read-only `get_memory_compiler_capability()` query reports this path under
 `native_owner_diagnostic`: process installation, active `native_hook` context,
 its opt-in graph entry point and explicit `record_stream` consumer contract are
 separate from public `available=false` and `xpu_consumer_tracking=false`.
+The diagnostic is active only after `init_devices()` has established at least
+one device context and enabled the native hook. It stays inactive during
+initialization and from the start of hook teardown, including if teardown
+fails; the graph and compiler-scope entry points use the same readiness check.
 After `deinit()`, the process-lifetime proxy can remain installed while the
 diagnostic context is inactive. This status query loads no new DSO and performs
 no XPU allocation.

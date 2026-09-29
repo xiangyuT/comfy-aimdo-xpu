@@ -140,6 +140,10 @@ native ABI prevents Linux XPU initialization before allocator installation.
 The additive `native_owner_diagnostic` field reports whether the private proxy
 is installed and active, and names its explicit `record_stream` caller contract.
 It never makes public `available` true, including after an opt-in install.
+Active requires completed `init_devices()` and a successfully enabled native
+hook; the private graph/scope entry points reject pre-device and teardown
+contexts. Hook teardown clears active before native calls and stays inactive
+after a failed teardown attempt.
 The query remains read-only before initialization and after `deinit()`.
 
 ComfyUI-OmniXPU activates this provider only when DynamicVRAM is explicitly
