@@ -446,6 +446,13 @@ static CUresult alloc_graph_page(MallocGraph *g, PhysicalPage **page) {
     return physical_page_alloc(page, MG_PAGE, g->device);
 }
 
+#ifdef AIMDO_XPU
+static _Thread_local CUresult last_allocation_driver_error;
+SHARED_EXPORT int malloc_graph_last_allocation_driver_error(void) {
+    return (int)last_allocation_driver_error;
+}
+#endif
+
 static CUresult create_page(MallocGraph *g, PhysicalPage **page) {
     CUresult r;
 
@@ -455,6 +462,9 @@ static CUresult create_page(MallocGraph *g, PhysicalPage **page) {
         vbars_free(MG_PAGE);
         r = alloc_graph_page(g, page);
     }
+#ifdef AIMDO_XPU
+    if (r) last_allocation_driver_error = r;
+#endif
     return r;
 }
 
@@ -473,6 +483,9 @@ static CUresult map_reference(MallocGraph *g, CUdeviceptr address,
         result = cuMemSetAccess(address, MG_PAGE, &access, 1);
     }
     if (result) {
+#ifdef AIMDO_XPU
+        last_allocation_driver_error = result;
+#endif
         physical_page_unref(reference);
     } else {
         *mapping = reference;
@@ -890,6 +903,9 @@ static size_t small_allocation_offset(MallocGraph *g, size_t bytes) {
 }
 
 bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
+#ifdef AIMDO_XPU
+    last_allocation_driver_error = CUDA_SUCCESS;
+#endif
     MallocGraph *g = active_graph;
 
     if (!g || graph_failed(g) || g->paused || stream != g->stream) {

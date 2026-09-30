@@ -160,6 +160,12 @@ caller's queue wrapper is released, and snapshots the binding under a mutex
 before context synchronization. Queue waits run after the registry lock is
 released. These dispatch rules do not enable public memory compilation.
 
+The diagnostic compiler retains the last allocation driver error per thread.
+Its matching sidecar translates device-memory allocation failures to Torch's
+`OutOfMemoryError`, so callers can recognize OOM independently of unsupported
+scope or other driver errors. Abort/owner cleanup remains required after a
+failed allocation; this does not change public compiler availability.
+
 ComfyUI-OmniXPU activates this provider only when DynamicVRAM is explicitly
 enabled and the official AIMDO attempt has left no live native or allocator
 state. The provider defaults to `native_hook` on Linux and Windows, keeping

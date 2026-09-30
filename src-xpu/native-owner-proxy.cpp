@@ -1,5 +1,6 @@
 #include <c10/core/Allocator.h>
 #include <c10/xpu/XPUCachingAllocator.h>
+#include <c10/util/Exception.h>
 
 // Optional Linux Torch 2.14 diagnostic sidecar. The normal provider never
 // installs it. Public XPU record() and compiler capability remain disabled.
@@ -71,12 +72,14 @@ using CompilerAlloc = bool (*)(uint64_t *, size_t, void *);
 using CompilerFree = bool (*)(uint64_t, void *, int *);
 using CompilerRogue = bool (*)(uint64_t, int *);
 using SetDevice = bool (*)(int);
+using AllocationDriverError = int (*)();
 struct CompilerFunctions {
     CompilerAlloc alloc;
     CompilerFree free;
     CompilerFree free_owned;
     CompilerRogue rogue;
     SetDevice set_device;
+    AllocationDriverError allocation_error;
 };
 std::mutex g_compiler_binding_mutex;
 std::atomic<const CompilerFunctions *> g_compiler_functions{nullptr};
@@ -407,10 +410,18 @@ public:
             if (synthetic_duplicate) {
                 address = reinterpret_cast<uintptr_t>(synthetic_duplicate);
             } else {
-                if (!functions->alloc(&address, bytes,
-                                      reinterpret_cast<void *>(g_compiler_scope_stream)) ||
-                    !address) {
+                const bool handled = functions->alloc(&address, bytes,
+                    reinterpret_cast<void *>(g_compiler_scope_stream));
+                if (!address && functions->allocation_error &&
+                    functions->allocation_error() == 2) {
+                    C10_THROW_ERROR(OutOfMemoryError,
+                        "AIMDO XPU out of memory allocating " + std::to_string(bytes) + " bytes");
+                }
+                if (!handled) {
                     throw std::runtime_error("AIMDO compiler allocation was not handled");
+                }
+                if (!address) {
+                    throw std::runtime_error("AIMDO compiler allocation failed");
                 }
             }
             std::shared_ptr<Owner> owner;
@@ -733,6 +744,8 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler
         dlsym(RTLD_DEFAULT, "free_rogue"));
     auto set_device = reinterpret_cast<SetDevice>(
         dlsym(RTLD_DEFAULT, "set_devctx_for_device"));
+    auto allocation_error = reinterpret_cast<AllocationDriverError>(
+        dlsym(RTLD_DEFAULT, "malloc_graph_last_allocation_driver_error"));
     if (!source || !alloc || !free || !free_owned || !rogue || !set_device ||
         std::strcmp(source(), expected_revision) != 0) return false;
     {
@@ -742,10 +755,11 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler
         if (bound) {
             if (bound->alloc != alloc || bound->free != free ||
                 bound->free_owned != free_owned || bound->rogue != rogue ||
-                bound->set_device != set_device) return false;
+                bound->set_device != set_device ||
+                bound->allocation_error != allocation_error) return false;
         } else {
             auto *created = new (std::nothrow) CompilerFunctions{
-                alloc, free, free_owned, rogue, set_device};
+                alloc, free, free_owned, rogue, set_device, allocation_error};
             if (!created) return false;
             // The table is immutable and retained for the sidecar's lifetime.
             g_compiler_functions.store(created, std::memory_order_release);
