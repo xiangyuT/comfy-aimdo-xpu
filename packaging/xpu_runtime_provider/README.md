@@ -154,6 +154,12 @@ contexts. Hook teardown clears active before native calls and stays inactive
 after a failed teardown attempt.
 The query remains read-only before initialization and after `deinit()`.
 
+Linux queue dispatch validates the Level Zero context and device before binding
+or submitting work. It retains owned SYCL queue handles, including after the
+caller's queue wrapper is released, and snapshots the binding under a mutex
+before context synchronization. Queue waits run after the registry lock is
+released. These dispatch rules do not enable public memory compilation.
+
 ComfyUI-OmniXPU activates this provider only when DynamicVRAM is explicitly
 enabled and the official AIMDO attempt has left no live native or allocator
 state. The provider defaults to `native_hook` on Linux and Windows, keeping

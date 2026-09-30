@@ -22,6 +22,7 @@ extern "C" {
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -49,7 +50,9 @@ constexpr CUresult kCudaErrorUnknown = 999;
 
 struct XpuDeviceState {
     int id;
-    sycl::queue *queue;
+    // Own the queue implementation independently of the caller's wrapper.
+    std::shared_ptr<sycl::queue> queue;
+    uintptr_t source_queue;
     ze_context_handle_t context;
     ze_device_handle_t device;
 };
@@ -272,6 +275,17 @@ XpuDeviceState *current_device() {
     return find_device(aimdo_xpu_current_device());
 }
 
+std::optional<XpuDeviceState> snapshot_device(int id) {
+    std::lock_guard<std::mutex> guard(g_devices_mutex);
+    auto *state = find_device(id);
+    if (!state) return std::nullopt;
+    return *state;
+}
+
+std::optional<XpuDeviceState> snapshot_current_device() {
+    return snapshot_device(aimdo_xpu_current_device());
+}
+
 int device_from_native_handle(uintptr_t native_handle) {
     std::lock_guard<std::mutex> guard(g_devices_mutex);
     auto found = std::find_if(
@@ -309,7 +323,8 @@ size_t aimdo_xpu_note_queue_locked(sycl::queue *queue, int expected_device) {
 
         for (size_t index = 0; index < g_retire_queue_count; ++index) {
             RetireQueue &retire_queue = g_retire_queues[index];
-            if (retire_queue.source_pointer == queue && retire_queue.queue &&
+            // Copied SYCL wrappers still name the same underlying queue.
+            if (retire_queue.queue &&
                 retire_queue.device_id == expected_device &&
                 retire_queue.context == context &&
                 retire_queue.device == device &&
@@ -362,26 +377,48 @@ void aimdo_xpu_note_queue(sycl::queue *queue, int expected_device) {
     (void)aimdo_xpu_note_queue_locked(queue, expected_device);
 }
 
-sycl::queue *resolve_queue(CUstream stream) {
-    if (stream) {
-        auto *queue = reinterpret_cast<sycl::queue *>(stream);
-        // Torch's current XPU stream is thread-local. ComfyUI initializes
-        // AIMDO on the server thread but faults and consumes model weights on
-        // a worker thread, so the queue seen by file-to-device copies is the
-        // authoritative owner for subsequent VBAR synchronization.
-        auto *state = current_device();
-        if (state && state->queue != queue) {
-            state->queue = queue;
-            g_stats[kQueueRebindCalls].fetch_add(1, std::memory_order_relaxed);
+std::shared_ptr<sycl::queue> resolve_queue(CUstream stream) {
+    const auto snapshot = snapshot_current_device();
+    if (!snapshot || !snapshot->queue) return {};
+    auto *source = stream ? reinterpret_cast<sycl::queue *>(stream)
+                          : snapshot->queue.get();
+    try {
+        // Reject a foreign backend/context/device before changing the binding
+        // or submitting any work to the queue.
+        if (source->get_backend() != sycl::backend::ext_oneapi_level_zero ||
+            sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+                source->get_context()) != snapshot->context ||
+            sycl::get_native<sycl::backend::ext_oneapi_level_zero>(
+                source->get_device()) != snapshot->device) {
+            g_stats[kRetireQueueIdentityMismatches].fetch_add(
+                1, std::memory_order_relaxed);
+            return {};
         }
-        aimdo_xpu_note_queue(queue, state ? state->id : -1);
-        return queue;
+        std::shared_ptr<sycl::queue> selected;
+        {
+            std::lock_guard<std::mutex> guard(g_retire_mutex);
+            const size_t index = aimdo_xpu_note_queue_locked(source, snapshot->id);
+            if (index >= kMaxTrackedQueues) return {};
+            selected = g_retire_queues[index].queue;
+        }
+        if (stream) {
+            std::lock_guard<std::mutex> guard(g_devices_mutex);
+            auto *state = find_device(snapshot->id);
+            if (!state || state->context != snapshot->context ||
+                state->device != snapshot->device) return {};
+            const auto identity = reinterpret_cast<uintptr_t>(source);
+            if (state->source_queue != identity || *state->queue != *selected) {
+                state->queue = selected;
+                state->source_queue = identity;
+                g_stats[kQueueRebindCalls].fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        return selected;
+    } catch (...) {
+        g_stats[kRetireQueueRegistrationFailures].fetch_add(
+            1, std::memory_order_relaxed);
+        return {};
     }
-    auto *state = current_device();
-    if (state && state->queue) {
-        aimdo_xpu_note_queue(state->queue, state->id);
-    }
-    return state ? state->queue : nullptr;
 }
 
 CUresult from_ze(ze_result_t result) {
@@ -418,21 +455,22 @@ CUresult xpu_get_error_string(CUresult error, const char **description) {
 }
 
 CUresult xpu_context_get_device(CUdevice *device) {
-    if (!device || !current_device()) {
+    const auto state = snapshot_current_device();
+    if (!device || !state) {
         return kCudaErrorUnknown;
     }
-    *device = current_device()->id;
+    *device = state->id;
     return CUDA_SUCCESS;
 }
 
 CUresult xpu_context_synchronize() {
-    auto *state = current_device();
+    const auto state = snapshot_current_device();
     if (!state) {
         return kCudaErrorUnknown;
     }
     const uint64_t call =
         g_stats[kContextSyncCalls].fetch_add(1, std::memory_order_relaxed) + 1;
-    trace_sync("context", "begin", call, state->queue);
+    trace_sync("context", "begin", call, state->queue.get());
     try {
         std::vector<sycl::queue> queues;
 
@@ -457,16 +495,16 @@ CUresult xpu_context_synchronize() {
         }
         g_stats[kContextSyncCompletions].fetch_add(
             1, std::memory_order_relaxed);
-        trace_sync("context", "end", call, state->queue);
+        trace_sync("context", "end", call, state->queue.get());
         return CUDA_SUCCESS;
     } catch (...) {
-        trace_sync("context", "error", call, state->queue);
+        trace_sync("context", "error", call, state->queue.get());
         return kCudaErrorUnknown;
     }
 }
 
 CUresult xpu_device_get(CUdevice *device, int ordinal) {
-    if (!device || !find_device(ordinal)) {
+    if (!device || !snapshot_device(ordinal)) {
         return kCudaErrorUnknown;
     }
     *device = ordinal;
@@ -475,7 +513,7 @@ CUresult xpu_device_get(CUdevice *device, int ordinal) {
 
 CUresult xpu_device_get_attribute(int *value, CUdevice_attribute attribute,
                                   CUdevice device) {
-    auto *state = find_device(device);
+    const auto state = snapshot_device(device);
     if (!value || !state || attribute != CU_DEVICE_ATTRIBUTE_INTEGRATED) {
         return kCudaErrorUnknown;
     }
@@ -484,7 +522,7 @@ CUresult xpu_device_get_attribute(int *value, CUdevice_attribute attribute,
 }
 
 CUresult xpu_device_total_memory(size_t *bytes, CUdevice device) {
-    auto *state = find_device(device);
+    const auto state = snapshot_device(device);
     if (!bytes || !state) {
         return kCudaErrorUnknown;
     }
@@ -498,7 +536,7 @@ CUresult xpu_device_total_memory(size_t *bytes, CUdevice device) {
 }
 
 CUresult xpu_device_get_name(char *name, int length, CUdevice device) {
-    auto *state = find_device(device);
+    const auto state = snapshot_device(device);
     if (!name || length <= 0 || !state) {
         return kCudaErrorUnknown;
     }
@@ -514,7 +552,7 @@ CUresult xpu_device_get_name(char *name, int length, CUdevice device) {
 }
 
 CUresult xpu_device_get_uuid(CUuuid *uuid, CUdevice device) {
-    if (!uuid || !find_device(device)) {
+    if (!uuid || !snapshot_device(device)) {
         return kCudaErrorUnknown;
     }
     std::memset(uuid, 0, sizeof(*uuid));
@@ -524,7 +562,7 @@ CUresult xpu_device_get_uuid(CUuuid *uuid, CUdevice device) {
 }
 
 CUresult xpu_memory_info(size_t *free_bytes, size_t *total_bytes) {
-    auto *state = current_device();
+    const auto state = snapshot_current_device();
     if (!free_bytes || !total_bytes || !state) {
         return kCudaErrorUnknown;
     }
@@ -543,7 +581,7 @@ CUresult xpu_memory_info(size_t *free_bytes, size_t *total_bytes) {
 }
 
 CUresult xpu_malloc(CUdeviceptr *pointer, size_t size) {
-    auto *state = current_device();
+    const auto state = snapshot_current_device();
     if (!pointer || !state) {
         return kCudaErrorUnknown;
     }
@@ -560,7 +598,7 @@ CUresult xpu_malloc(CUdeviceptr *pointer, size_t size) {
 }
 
 CUresult xpu_free(CUdeviceptr pointer) {
-    auto *state = current_device();
+    const auto state = snapshot_current_device();
     if (!state) {
         return kCudaErrorUnknown;
     }
@@ -573,7 +611,7 @@ CUresult xpu_free(CUdeviceptr pointer) {
 }
 
 CUresult xpu_malloc_async(CUdeviceptr *pointer, size_t size, CUstream stream) {
-    sycl::queue *queue = resolve_queue(stream);
+    auto queue = resolve_queue(stream);
     if (!pointer || !queue) {
         return kCudaErrorUnknown;
     }
@@ -590,7 +628,7 @@ CUresult xpu_malloc_async(CUdeviceptr *pointer, size_t size, CUstream stream) {
 }
 
 CUresult xpu_free_async(CUdeviceptr pointer, CUstream stream) {
-    sycl::queue *queue = resolve_queue(stream);
+    auto queue = resolve_queue(stream);
     if (!queue) {
         return kCudaErrorUnknown;
     }
@@ -728,14 +766,14 @@ CUresult xpu_physical_release(CUmemGenericAllocationHandle handle) {
 
 CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
                                    size_t size, CUstream stream) {
-    sycl::queue *queue = resolve_queue(stream);
+    auto queue = resolve_queue(stream);
     if (!queue) {
         return kCudaErrorUnknown;
     }
     const uint64_t call = g_stats[kSynchronousHostToDeviceCalls].fetch_add(
                               1, std::memory_order_relaxed) +
                           1;
-    trace_sync("h2d", "begin", call, queue, size);
+    trace_sync("h2d", "begin", call, queue.get(), size);
     try {
         // XPU phase 1 uses ordinary malloc-backed host buffers rather than
         // pinned host allocations. Keep their lifetime unambiguous across
@@ -746,7 +784,7 @@ CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
         g_stats[kHostToDeviceBytes].fetch_add(size, std::memory_order_relaxed);
         g_stats[kSynchronousHostToDeviceCompletions].fetch_add(
             1, std::memory_order_relaxed);
-        trace_sync("h2d", "end", call, queue, size);
+        trace_sync("h2d", "end", call, queue.get(), size);
         return CUDA_SUCCESS;
     } catch (const sycl::exception &error) {
         const std::error_code code = error.code();
@@ -773,7 +811,7 @@ CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
                     1, std::memory_order_relaxed);
                 g_stats[kHostToDeviceSplitRetries].fetch_add(
                     1, std::memory_order_relaxed);
-                trace_sync("h2d", "end_split", call, queue, size);
+                trace_sync("h2d", "end_split", call, queue.get(), size);
                 return CUDA_SUCCESS;
             } catch (...) {
                 // Fall through and report the original failure.
@@ -823,7 +861,7 @@ CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
             "sycl_code=%d category=%s driver_free=%zu driver_total=%zu "
             "dest_kind=%s vbar=%d all_mapped=%d min_pin=%u first_page=%llu "
             "span=%llu first_unmapped=%lld message=%s\n",
-            static_cast<void *>(queue), reinterpret_cast<void *>(destination),
+            static_cast<void *>(queue.get()), reinterpret_cast<void *>(destination),
             size, code.value(), code.category().name(),
             free_bytes, total_bytes, destination_kind, vbar_hit, vbar_mapped,
             vbar_pin, static_cast<unsigned long long>(vbar_page),
@@ -832,27 +870,27 @@ CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
                                         : static_cast<long long>(vbar_unmapped),
             error.what());
         std::fflush(stderr);
-        trace_sync("h2d", "error", call, queue, size);
+        trace_sync("h2d", "error", call, queue.get(), size);
         return kCudaErrorUnknown;
     } catch (const std::exception &error) {
         std::fprintf(
             stderr,
             "[AIMDO XPU ERROR] op=h2d queue=%p destination=%p size=%zu "
             "exception=%s\n",
-            static_cast<void *>(queue), reinterpret_cast<void *>(destination),
+            static_cast<void *>(queue.get()), reinterpret_cast<void *>(destination),
             size, error.what());
         std::fflush(stderr);
-        trace_sync("h2d", "error", call, queue, size);
+        trace_sync("h2d", "error", call, queue.get(), size);
         return kCudaErrorUnknown;
     } catch (...) {
         std::fprintf(
             stderr,
             "[AIMDO XPU ERROR] op=h2d queue=%p destination=%p size=%zu "
             "exception=<non-standard>\n",
-            static_cast<void *>(queue), reinterpret_cast<void *>(destination),
+            static_cast<void *>(queue.get()), reinterpret_cast<void *>(destination),
             size);
         std::fflush(stderr);
-        trace_sync("h2d", "error", call, queue, size);
+        trace_sync("h2d", "error", call, queue.get(), size);
         return kCudaErrorUnknown;
     }
 }
@@ -875,7 +913,7 @@ CUresult xpu_event_destroy(CUevent event) {
 }
 
 CUresult xpu_event_record(CUevent event, CUstream stream) {
-    sycl::queue *queue = resolve_queue(stream);
+    auto queue = resolve_queue(stream);
     if (!event || !queue) {
         return kCudaErrorUnknown;
     }
@@ -956,7 +994,9 @@ void *allocate_torch_block(size_t size, int device, sycl::queue *queue) {
     if (!queue || size == 0) {
         return nullptr;
     }
-    resolve_queue(reinterpret_cast<CUstream>(queue));
+    const auto selected = resolve_queue(reinterpret_cast<CUstream>(queue));
+    if (!selected) return nullptr;
+    queue = selected.get();
     g_stats[kTorchAllocatorAllocCalls].fetch_add(
         1, std::memory_order_relaxed);
 
@@ -1078,7 +1118,9 @@ void *allocate_raw_torch_segment(
     if (!queue || size == 0) {
         return nullptr;
     }
-    resolve_queue(reinterpret_cast<CUstream>(queue));
+    const auto selected = resolve_queue(reinterpret_cast<CUstream>(queue));
+    if (!selected) return nullptr;
+    queue = selected.get();
     g_stats[kTorchAllocatorAllocCalls].fetch_add(
         1, std::memory_order_relaxed);
 
@@ -1151,7 +1193,7 @@ void free_raw_torch_segment(
 CUresult xpu_device_get_luid(char *luid, unsigned int *node_mask,
                              CUdevice device) {
 #if defined(_WIN32) || defined(_WIN64)
-    auto *state = find_device(device);
+    const auto state = snapshot_device(device);
     if (!luid || !node_mask || !state) {
         return kCudaErrorUnknown;
     }
@@ -1525,9 +1567,23 @@ AIMDO_XPU_EXPORT bool xpu_set_queues(
                 return false;
             }
             g_devices.push_back(
-                XpuDeviceState{device_ids[i], queue, context, device});
+                XpuDeviceState{device_ids[i], std::make_shared<sycl::queue>(*queue),
+                               reinterpret_cast<uintptr_t>(queue), context, device});
         }
         g_retire_accepting.store(true, std::memory_order_release);
+        // Keep every initial queue in the owned registry before any worker
+        // can rebind the device's current queue.
+        {
+            std::lock_guard<std::mutex> retire_guard(g_retire_mutex);
+            for (const auto &state : g_devices) {
+                if (aimdo_xpu_note_queue_locked(state.queue.get(), state.id) >=
+                    kMaxTrackedQueues) {
+                    g_retire_accepting.store(false, std::memory_order_release);
+                    g_devices.clear();
+                    return false;
+                }
+            }
+        }
         return true;
     } catch (...) {
         g_devices.clear();
@@ -1552,7 +1608,7 @@ extern "C" AIMDO_XPU_EXPORT bool aimdo_xpu_copy_host_to_vbar(
     void *destination, const void *source, size_t size, int device) {
     constexpr size_t kBrokenCopyMaximum = 2ULL * 1024 * 1024;
     constexpr size_t kSafeStagingSize = kBrokenCopyMaximum + 1;
-    auto *state = find_device(device);
+    const auto state = snapshot_device(device);
     unsigned char *host_staging = nullptr;
     unsigned char *device_staging = nullptr;
     bool copied = false;
@@ -1650,7 +1706,7 @@ aimdo_xpu_needs_small_vbar_copy_workaround(int device) {
 #if defined(_WIN32) || defined(_WIN64)
     const char *override_value =
         std::getenv("AIMDO_XPU_SMALL_VBAR_COPY_FALLBACK");
-    auto *state = find_device(device);
+    const auto state = snapshot_device(device);
 
     if (override_value) {
         if (std::strcmp(override_value, "0") == 0) {
