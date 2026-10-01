@@ -68,6 +68,9 @@ struct State {
     uint32_t depth;
     bool recording;
     bool broken;
+#ifdef AIMDO_XPU
+    size_t excluded_allocations;
+#endif
 
     State *next;
 };
@@ -121,6 +124,9 @@ typedef struct {
     size_t used;
     size_t peak_used;
     size_t rogue_count;
+#ifdef AIMDO_XPU
+    uint64_t skipped_root_replays;
+#endif
 
     bool failed;
     bool complete;
@@ -1038,6 +1044,16 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
     return true;
 }
 
+#ifdef AIMDO_XPU
+SHARED_EXPORT void malloc_graph_note_excluded_allocation(CUstream owner_stream) {
+    MallocGraph *g = active_graph;
+    if (g && g->stream == owner_stream && !g->paused && !graph_failed(g) && g->state &&
+        !g->state->recording && !g->state->next && g->state->cursor == &g->root) {
+        g->state->excluded_allocations++;
+    }
+}
+#endif
+
 bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
     MallocGraph *g = active_graph;
 
@@ -1288,6 +1304,22 @@ SHARED_EXPORT int malloc_graph_pop(void *handle) {
         return false;
     }
 
+#ifdef AIMDO_XPU
+    // This root received only requests excluded by the owner queue. It did
+    // not participate in compilation, so preserve the previous event tree.
+    // A partial compiler sequence or ordinary missing-allocation frame still
+    // follows the existing break rules below.
+    if (!g->state->recording && !g->state->next &&
+        g->state->cursor == &g->root && g->state->excluded_allocations) {
+        free(g->state);
+        g->state = NULL;
+        g->complete = true;
+        active_graph = NULL;
+        g->skipped_root_replays++;
+        return 1;
+    }
+#endif
+
     if (!g->state->recording) {
         Event *end = find_event(g, EV_END, 0, 0, NULL);
         if (end) {
@@ -1341,6 +1373,10 @@ SHARED_EXPORT uint64_t malloc_graph_stat(void *handle, int which) {
         return (g->phys_count + g->small_pages) * MG_PAGE;
     case 3:
         return g->rogue_count;
+#ifdef AIMDO_XPU
+    case 4:
+        return g->skipped_root_replays;
+#endif
     default:
         return 0;
     }

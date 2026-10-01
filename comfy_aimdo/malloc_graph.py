@@ -99,6 +99,7 @@ class MallocGraph:
     virtual_bytes = property(lambda self: self._stat(1))
     physical_bytes = property(lambda self: self._stat(2))
     rogue_count = property(lambda self: self._stat(3))
+    skipped_replays = property(lambda self: self._stat(4))
 
     def close(self):
         """Close on the owner thread, or queue a diagnostic close to that thread."""

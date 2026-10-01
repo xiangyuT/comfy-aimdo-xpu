@@ -180,6 +180,15 @@ adopted into the new budget before the hook becomes active. Separate retirement
 statistics report this lifetime, including external oneDNN cache storage.
 The default hook path without the diagnostic retains its strict disable rule.
 
+An unrestricted diagnostic compiler scope excludes another queue on the same
+device/context through the ordinary native allocator, retaining its native
+owner and cache behavior. Exact-size scopes and foreign device/context queues
+remain strict. A replay root with only successfully excluded requests preserves
+its previous event tree and increments `MallocGraph.skipped_replays`; this is
+not counted as compiler replay. Partial compiler sequences and ordinary missing
+allocation frames keep the existing break rules. Cross-queue input consumers
+still require explicit `record_stream` registration before work is submitted.
+
 ComfyUI-OmniXPU activates this provider only when DynamicVRAM is explicitly
 enabled and the official AIMDO attempt has left no live native or allocator
 state. The provider defaults to `native_hook` on Linux and Windows, keeping

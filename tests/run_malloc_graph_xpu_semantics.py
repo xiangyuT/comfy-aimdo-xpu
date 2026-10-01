@@ -5,6 +5,7 @@ unchanged. Every observed tensor is compared completely against a nonuniform
 reference and retained as a compressed complete capture.
 """
 import argparse
+import contextlib
 import ctypes
 import gc
 import hashlib
@@ -22,7 +23,8 @@ M = 1024 * 1024
 CASES = ('empty', 'empty_subgraph', 'different_subgraph', 'optional_subgraph',
          'subgraph_order', 'variable_subgraph_replay', 'deep_nesting',
          'subgraph_phases', 'reordered_free', 'nested_stats', 'long_run',
-         'multiple_graphs', 'small', 'odd_sizes', 'fragmentation')
+         'multiple_graphs', 'small', 'odd_sizes', 'fragmentation', 'off_stream',
+         'different_stream')
 
 
 def digest(data):
@@ -37,29 +39,33 @@ def expected_bytes(size, seed):
 
 
 class Allocation:
-    def __init__(self, suite, size):
+    def __init__(self, suite, size, compiler=True):
         self.suite = suite
         self.seed = suite.next_seed
         suite.next_seed += 1
         self.expected = expected_bytes(size, self.seed)
-        with suite.owner.compiler_scope(suite.stream):
+        self.stream = suite.torch.xpu.current_stream(0)
+        active = next((g for g in reversed(suite.graphs) if g.depth), None)
+        target = active.graph._stream if active is not None else suite.stream
+        with suite.owner.compiler_scope(target):
             self.tensor = suite.torch.empty(size, dtype=suite.torch.uint8, device='xpu:0')
         self.pointer = self.tensor.data_ptr()
+        self.compiler = bool(suite.owner.is_compiler_owner(self.pointer)) if size else False
         if size:
-            assert suite.owner.is_compiler_owner(self.pointer)
+            assert suite.owner.is_compiler_owner(self.pointer) == compiler
             self.tensor.copy_(suite.torch.frombuffer(bytearray(self.expected), dtype=suite.torch.uint8))
         else:
             assert self.pointer == 0
         self.check()
 
     def check(self):
-        self.suite.stream.synchronize()
+        self.stream.synchronize()
         actual = self.tensor.cpu().numpy().tobytes()
         assert actual == self.expected, 'complete tensor contents changed'
         name = f'payload-{len(self.suite.checks):04d}.zlib'
         (self.suite.output / name).write_bytes(zlib.compress(actual, level=1))
         self.suite.checks.append({'file': name, 'bytes': len(actual), 'seed': self.seed,
-                                  'sha256': digest(actual)})
+                                  'sha256': digest(actual), 'compiler_owner': self.compiler})
 
 
 VMM_CHANGE_COUNTERS = ('virtual_reserve_calls', 'virtual_reserve_bytes',
@@ -74,6 +80,7 @@ class ObservedGraph:
         self.suite, self.graph = suite, graph
         self.depth = 1  # record_diagnostic() starts the first root.
         self.before = None
+        self.before_skipped = 0
 
     def __getattr__(self, name):
         return getattr(self.graph, name)
@@ -84,6 +91,7 @@ class ObservedGraph:
             assert self.depth == 0
             self.depth = 1
             self.before = self.suite.control.get_xpu_vmm_stats()
+            self.before_skipped = self.graph.skipped_replays
         else:
             self.depth += 1
 
@@ -93,8 +101,10 @@ class ObservedGraph:
         if self.depth == 0 and self.before is not None:
             after = self.suite.control.get_xpu_vmm_stats()
             delta = {key: after[key] - self.before[key] for key in VMM_CHANGE_COUNTERS}
-            stable = not broken and self.graph.rogue_count == 0
-            self.suite.replays.append({'stable': stable, 'broken': broken, 'vmm_delta': delta})
+            skipped = self.graph.skipped_replays > self.before_skipped
+            stable = not broken and self.graph.rogue_count == 0 and not skipped
+            self.suite.replays.append({'stable': stable, 'broken': broken,
+                                       'skipped': skipped, 'vmm_delta': delta})
             self.before = None
             if stable:
                 assert all(value == 0 for value in delta.values()), delta
@@ -116,8 +126,8 @@ class Suite:
         self.graphs.append(graph)
         return graph
 
-    def alloc(self, size):
-        return Allocation(self, size)
+    def alloc(self, size, compiler=True):
+        return Allocation(self, size, compiler)
 
     def stat(self, graph, expected):
         observed = (graph.peak_used, graph.virtual_bytes, graph.physical_bytes)
@@ -352,6 +362,48 @@ def fragmentation(s):
         del first, last, extended
         assert not g.pop()
         s.stat(g, (40 * M, 56 * M, 40 * M))
+
+
+def off_stream(s):
+    g = s.graph()
+    other = s.torch.xpu.Stream(device=0)
+    with s.torch.xpu.stream(other):
+        ordinary = s.alloc(8 * M, compiler=False)
+        del ordinary
+        with g.use_stream(other):
+            compiled = s.alloc(8 * M)
+            pointer = compiled.pointer
+            del compiled
+    assert not g.pop()
+    other.synchronize()
+    s.stat(g, (8 * M, 8 * M, 8 * M))
+    g.push()
+    with s.torch.xpu.stream(other), g.use_stream(other):
+        compiled = s.alloc(8 * M)
+        assert compiled.pointer == pointer
+        del compiled
+    assert not g.pop()
+
+
+def different_stream(s):
+    g = s.graph()
+    value = s.alloc(8 * M)
+    pointer = value.pointer
+    del value
+    assert not g.pop()
+    other = s.torch.xpu.Stream(device=0)
+    with s.torch.xpu.stream(other):
+        g.push()
+        value = s.alloc(8 * M, compiler=False)
+        del value
+        assert not g.pop()
+    other.synchronize()
+    assert g.skipped_replays == 1
+    g.push()
+    value = s.alloc(8 * M)
+    assert value.pointer == pointer
+    del value
+    assert not g.pop() and g.skipped_replays == 1
 
 
 def vmm(control):

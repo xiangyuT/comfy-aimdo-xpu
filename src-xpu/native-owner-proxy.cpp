@@ -74,6 +74,7 @@ using CompilerFree = bool (*)(uint64_t, void *, int *);
 using CompilerRogue = bool (*)(uint64_t, int *);
 using SetDevice = bool (*)(int);
 using AllocationDriverError = int (*)();
+using ExcludedAllocation = void (*)(void *);
 struct CompilerFunctions {
     CompilerAlloc alloc;
     CompilerFree free;
@@ -81,6 +82,7 @@ struct CompilerFunctions {
     CompilerRogue rogue;
     SetDevice set_device;
     AllocationDriverError allocation_error;
+    ExcludedAllocation excluded_allocation;
 };
 std::mutex g_compiler_binding_mutex;
 std::atomic<const CompilerFunctions *> g_compiler_functions{nullptr};
@@ -413,8 +415,25 @@ public:
             const auto device = c10::xpu::current_device();
             sycl::queue queue = c10::xpu::getCurrentXPUStream(device).queue();
             auto *supplied = reinterpret_cast<sycl::queue *>(g_compiler_scope_stream);
-            if (!supplied || *supplied != queue ||
-                !functions->set_device(device)) {
+            if (!supplied) {
+                throw std::runtime_error("compiler queue or device differs");
+            }
+            if (*supplied != queue) {
+                // A generic owner-stream scope excludes another queue on the
+                // same device/context. Preserve native cache and its owner.
+                // Exact-size diagnostics and foreign identities stay strict.
+                if (!g_compiler_scope_bytes &&
+                    supplied->get_device() == queue.get_device() &&
+                    supplied->get_context() == queue.get_context()) {
+                    auto native = allocate_native(bytes);
+                    if (functions->excluded_allocation) {
+                        functions->excluded_allocation(reinterpret_cast<void *>(g_compiler_scope_stream));
+                    }
+                    return native;
+                }
+                throw std::runtime_error("compiler queue or device differs");
+            }
+            if (!functions->set_device(device)) {
                 throw std::runtime_error("compiler queue or device differs");
             }
             uint64_t address = 0;
@@ -505,6 +524,9 @@ public:
             return {pointer, pointer, &proxy_delete,
                     c10::Device(c10::DeviceType::XPU, device)};
         }
+        return allocate_native(bytes);
+    }
+    c10::DataPtr allocate_native(size_t bytes) {
         c10::DataPtr native = native_->allocate(bytes);
         void *pointer = native.get();
         if (!pointer) return native;
@@ -787,6 +809,8 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler
         dlsym(RTLD_DEFAULT, "set_devctx_for_device"));
     auto allocation_error = reinterpret_cast<AllocationDriverError>(
         dlsym(RTLD_DEFAULT, "malloc_graph_last_allocation_driver_error"));
+    auto excluded_allocation = reinterpret_cast<ExcludedAllocation>(
+        dlsym(RTLD_DEFAULT, "malloc_graph_note_excluded_allocation"));
     if (!source || !alloc || !free || !free_owned || !rogue || !set_device ||
         std::strcmp(source(), expected_revision) != 0) return false;
     {
@@ -797,10 +821,11 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler
             if (bound->alloc != alloc || bound->free != free ||
                 bound->free_owned != free_owned || bound->rogue != rogue ||
                 bound->set_device != set_device ||
-                bound->allocation_error != allocation_error) return false;
+                bound->allocation_error != allocation_error ||
+                bound->excluded_allocation != excluded_allocation) return false;
         } else {
             auto *created = new (std::nothrow) CompilerFunctions{
-                alloc, free, free_owned, rogue, set_device, allocation_error};
+                alloc, free, free_owned, rogue, set_device, allocation_error, excluded_allocation};
             if (!created) return false;
             // The table is immutable and retained for the sidecar's lifetime.
             g_compiler_functions.store(created, std::memory_order_release);
