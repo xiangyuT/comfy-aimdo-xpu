@@ -11,6 +11,7 @@ import hashlib
 import importlib.metadata as metadata
 import importlib.util
 import json
+import os
 from pathlib import Path
 import sys
 import traceback
@@ -61,17 +62,57 @@ class Allocation:
                                   'sha256': digest(actual)})
 
 
+VMM_CHANGE_COUNTERS = ('virtual_reserve_calls', 'virtual_reserve_bytes',
+                       'physical_create_calls', 'physical_create_bytes',
+                       'map_calls', 'map_bytes', 'unmap_calls', 'unmap_bytes',
+                       'physical_release_calls')
+
+
+class ObservedGraph:
+    """Observe completed root replay without changing graph operations."""
+    def __init__(self, suite, graph):
+        self.suite, self.graph = suite, graph
+        self.depth = 1  # record_diagnostic() starts the first root.
+        self.before = None
+
+    def __getattr__(self, name):
+        return getattr(self.graph, name)
+
+    def push(self, name=None):
+        self.graph.push(name)
+        if name is None:
+            assert self.depth == 0
+            self.depth = 1
+            self.before = self.suite.control.get_xpu_vmm_stats()
+        else:
+            self.depth += 1
+
+    def pop(self):
+        broken = self.graph.pop()
+        self.depth -= 1
+        if self.depth == 0 and self.before is not None:
+            after = self.suite.control.get_xpu_vmm_stats()
+            delta = {key: after[key] - self.before[key] for key in VMM_CHANGE_COUNTERS}
+            stable = not broken and self.graph.rogue_count == 0
+            self.suite.replays.append({'stable': stable, 'broken': broken, 'vmm_delta': delta})
+            self.before = None
+            if stable:
+                assert all(value == 0 for value in delta.values()), delta
+        return broken
+
+
 class Suite:
-    def __init__(self, torch, owner, output):
-        self.torch, self.owner, self.output = torch, owner, output
+    def __init__(self, torch, owner, control, output):
+        self.torch, self.owner, self.control, self.output = torch, owner, control, output
         self.stream = torch.xpu.current_stream(0)
         self.next_seed = 1
         self.checks = []
         self.graphs = []
         self.stats = []
+        self.replays = []
 
     def graph(self):
-        graph = self.owner.record_diagnostic(self.stream)
+        graph = ObservedGraph(self, self.owner.record_diagnostic(self.stream))
         self.graphs.append(graph)
         return graph
 
@@ -340,11 +381,19 @@ def run(case, output, plan):
     props = torch.xpu.get_device_properties(0)
     assert torch.xpu.device_count() == 1 and props.device_id == 0xE223
     assert str(props.uuid) == plan['device_uuid']
+    driver = Path(os.environ['ZE_ENABLE_ALT_DRIVERS']).resolve()
+    driver_sha = digest(driver.read_bytes())
+    assert driver_sha == plan['driver_sha256']
+    driver_mappings = [line for line in Path('/proc/self/maps').read_text().splitlines()
+                       if line.rstrip().endswith(str(driver))]
+    assert driver_mappings, 'selected driver is not loaded in the device process'
+    avoid_alias = os.environ.get('AIMDO_XPU_GRAPH_AVOID_ALIAS', '0') == '1'
+    assert avoid_alias == plan['avoid_physical_alias']
     native_hash = digest(Path(control.lib._name).read_bytes())
     assert native_hash == plan['native_sha256']
     assert not control.get_memory_compiler_capability()['available']
     assert native_owner.snapshot() == [0] * 17 and vmm(control) == [0] * 7
-    suite = Suite(torch, native_owner, output)
+    suite = Suite(torch, native_owner, control, output)
     error = None
     try:
         globals()[case](suite)
@@ -366,7 +415,9 @@ def run(case, output, plan):
     return {'status': 'passed' if error is None else 'failed', 'case': case,
             'native_source_revision': manifest['source']['revision'], 'native_sha256': native_hash,
             'torch': torch.__version__, 'device_uuid': str(props.uuid), 'physical_xpu': 0,
-            'checks': suite.checks, 'stats': suite.stats, 'error': error,
+            'driver_sha256': driver_sha, 'driver_path': str(driver), 'driver_mappings': driver_mappings,
+            'avoid_physical_alias': avoid_alias,
+            'checks': suite.checks, 'stats': suite.stats, 'replays': suite.replays, 'error': error,
             'final': final, 'final_vmm': final_vmm, 'deinit_succeeded': True,
             'public_compiler_available': False}
 
