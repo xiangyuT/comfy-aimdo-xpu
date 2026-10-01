@@ -1,5 +1,6 @@
 #include <c10/core/Allocator.h>
 #include <c10/xpu/XPUCachingAllocator.h>
+#include <c10/xpu/XPUFunctions.h>
 #include <c10/util/Exception.h>
 
 // Optional Linux Torch 2.14 diagnostic sidecar. The normal provider never
@@ -143,6 +144,16 @@ thread_local size_t g_compiler_scope_bytes = 0;
 thread_local uint64_t g_compiler_scope_stream = 0;
 thread_local bool g_fail_next_compiler_owner_insert = false;
 thread_local void *g_duplicate_next_compiler_pointer = nullptr;
+std::recursive_mutex &g_lifecycle_mutex = *new std::recursive_mutex();
+thread_local bool g_transition = false;
+std::atomic<uint64_t> g_active_scopes{0};
+
+struct AllocationOperation {
+    std::unique_lock<std::recursive_mutex> guard{g_lifecycle_mutex};
+    AllocationOperation() {
+        if (g_transition) throw std::runtime_error("native-owner lifecycle transition is active");
+    }
+};
 
 bool Owner::wait_consumers() {
     if (fenced) return true;
@@ -304,6 +315,7 @@ public:
         return native_->getMemoryInfo(device);
     }
     void *raw_alloc(size_t bytes) override {
+        AllocationOperation operation;
         if (g_custom_scope) {
             throw std::runtime_error("raw allocation is unsupported inside custom scope");
         }
@@ -384,6 +396,7 @@ public:
     }
 
     c10::DataPtr allocate(size_t bytes) override {
+        AllocationOperation operation;
         if (g_compiler_scope) {
             if (g_compiler_terminal.load(std::memory_order_acquire)) {
                 throw std::runtime_error(
@@ -508,6 +521,14 @@ public:
         g_allocations.fetch_add(1, std::memory_order_relaxed);
         return {pointer, pointer, &proxy_delete, device};
     }
+    bool native_cache_empty() {
+        if (!native_->initialized()) return true;
+        for (c10::DeviceIndex device = 0; device < c10::xpu::device_count(); ++device) {
+            const auto stats = native_->getDeviceStats(device);
+            if (stats.allocated_bytes[0].current || stats.reserved_bytes[0].current) return false;
+        }
+        return true;
+    }
     c10::DeleterFnPtr raw_deleter() const override { return &proxy_delete; }
     void copy_data(void *dest, const void *src, size_t count) const override {
         native_->copy_data(dest, src, count);
@@ -556,6 +577,19 @@ private:
 };
 
 ForwardingXpuAllocator *g_proxy = nullptr;
+
+bool allocation_owners_clear() {
+    if (!g_proxy || g_active_scopes.load() || g_compiler_terminal.load() ||
+        g_custom_live_bytes.load() || g_compiler_live_bytes.load() ||
+        g_custom_failures.load() ||
+        g_raw_allocations.load() != g_raw_releases.load()) return false;
+    {
+        std::lock_guard<std::mutex> guard(g_owner_mutex);
+        if (!g_owners.empty() || g_deferred_free_count.load()) return false;
+    }
+    std::lock_guard<std::mutex> guard(g_scoped_raw_mutex);
+    return g_scoped_raw.empty();
+}
 
 } // namespace
 
@@ -712,21 +746,28 @@ aimdo_full_proxy_is_compiler_owner(void *pointer) {
 
 extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_scope_begin(
     size_t bytes) {
+    std::lock_guard<std::recursive_mutex> lifecycle(g_lifecycle_mutex);
+    if (g_transition) return false;
     if (!g_proxy || g_custom_scope || !bytes) return false;
     g_custom_scope_bytes = bytes;
     g_custom_scope = true;
+    g_active_scopes.fetch_add(1);
     return true;
 }
 
 extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_scope_end() {
+    std::lock_guard<std::recursive_mutex> lifecycle(g_lifecycle_mutex);
     if (!g_custom_scope) return false;
     g_custom_scope = false;
     g_custom_scope_bytes = 0;
+    g_active_scopes.fetch_sub(1);
     return true;
 }
 
 extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler_begin(
     size_t bytes, uint64_t stream, const char *expected_revision) {
+    std::lock_guard<std::recursive_mutex> lifecycle(g_lifecycle_mutex);
+    if (g_transition) return false;
     // Zero selects every positive-size Torch tensor request in this scope.
     if (!g_proxy || g_custom_scope || g_compiler_scope ||
         g_compiler_terminal.load(std::memory_order_acquire) ||
@@ -768,15 +809,54 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler
     g_compiler_scope_bytes = bytes;
     g_compiler_scope_stream = stream;
     g_compiler_scope = true;
+    g_active_scopes.fetch_add(1);
     return true;
 }
 
 extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler_end() {
+    std::lock_guard<std::recursive_mutex> lifecycle(g_lifecycle_mutex);
     if (!g_compiler_scope) return false;
     g_fail_next_compiler_owner_insert = false;
     g_duplicate_next_compiler_pointer = nullptr;
     g_compiler_scope = false;
     g_compiler_scope_bytes = 0;
     g_compiler_scope_stream = 0;
+    g_active_scopes.fetch_sub(1);
+    return true;
+}
+
+extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_transition_begin() {
+    g_lifecycle_mutex.lock();
+    if (g_transition || !allocation_owners_clear()) {
+        g_lifecycle_mutex.unlock();
+        return false;
+    }
+    g_transition = true;
+    return true;
+}
+
+extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_transition_end() {
+    if (!g_transition) return false;
+    g_transition = false;
+    g_lifecycle_mutex.unlock();
+    return true;
+}
+
+extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_native_cache_empty() {
+    return g_transition && allocation_owners_clear() && g_proxy->native_cache_empty();
+}
+
+extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_transition_ready() {
+    if (!aimdo_full_proxy_native_cache_empty()) return false;
+    using GraphCount = uint64_t (*)();
+    auto count = reinterpret_cast<GraphCount>(dlsym(RTLD_DEFAULT, "malloc_graph_live_handles"));
+    if (!count || count()) return false;
+    using BridgeStats = bool (*)(int, uint64_t *, size_t);
+    auto bridge = reinterpret_cast<BridgeStats>(dlsym(RTLD_DEFAULT, "xpu_allocator_get_memory_stats"));
+    if (!bridge) return false;
+    for (int device = 0; device < c10::xpu::device_count(); ++device) {
+        uint64_t stats[4]{};
+        if (!bridge(device, stats, 4) || stats[0] || stats[1]) return false;
+    }
     return true;
 }

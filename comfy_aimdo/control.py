@@ -1,4 +1,5 @@
 import os
+import contextlib
 import ctypes
 import platform
 import sys
@@ -608,7 +609,23 @@ def init(
 
     return True
 
+def _native_lifecycle_module():
+    if implementation == "xpu":
+        from . import native_owner
+        if native_owner.installed():
+            return native_owner
+    return None
+
+
 def init_devices(device_ids):
+    owner = _native_lifecycle_module()
+    lock = (owner.lifecycle_guard() if owner is not None and
+            hasattr(owner, "lifecycle_guard") else contextlib.nullcontext())
+    with lock:
+        return _init_devices(device_ids, owner)
+
+
+def _init_devices(device_ids, owner=None):
     global devctxs, _xpu_native_hook_active
 
     if lib is None:
@@ -651,9 +668,23 @@ def init_devices(device_ids):
 
         device_array = (ctypes.c_int * len(requested))(*requested)
         queue_array = (ctypes.c_uint64 * len(queue_ptrs))(*queue_ptrs)
-        if not lib.xpu_set_queues(device_array, queue_array, len(requested)):
-            return False
 
+    transition = (owner.allocator_transition() if owner is not None and
+                  hasattr(owner, "allocator_transition") else contextlib.nullcontext(False))
+    with transition as quiescent:
+        if quiescent:
+            torch.xpu.empty_cache()
+            torch.xpu.synchronize()
+            if not owner.native_cache_empty():
+                raise RuntimeError("native-owner lifecycle requires an empty native cache")
+        return _init_device_contexts(requested, headrooms,
+            (device_array, queue_array) if implementation == "xpu" else None)
+
+
+def _init_device_contexts(requested, headrooms, queues):
+    global devctxs, _xpu_native_hook_active
+    if queues is not None and not lib.xpu_set_queues(*queues, len(requested)):
+        return False
     if not lib.plat_init():
         return False
 
@@ -722,9 +753,20 @@ def get_simple_vram_headroom():
     return int(lib.get_simple_vram_headroom())
 
 def deinit():
+    owner = _native_lifecycle_module()
+    lock = (owner.lifecycle_guard() if owner is not None and
+            hasattr(owner, "lifecycle_guard") else contextlib.nullcontext())
+    with lock:
+        _deinit(owner)
+
+
+def _deinit(owner=None):
     global lib, devctxs, _log_callback, _xpu_allocator_ready
     global _xpu_native_hook_active
     global _memory_compiler_native
+    if lib is None:
+        _finish_deinit()
+        return
     if lib is not None:
         if implementation == "xpu":
             from . import native_owner
@@ -741,6 +783,16 @@ def deinit():
                     raise RuntimeError(
                         "cannot deinitialize AIMDO while native-owner allocations remain live"
                     )
+        transition = (owner.allocator_transition() if owner is not None and
+                      hasattr(owner, "allocator_transition") else contextlib.nullcontext(False))
+        with transition as quiescent:
+            _finish_deinit(owner, quiescent)
+
+
+def _finish_deinit(owner=None, quiescent=False):
+    global lib, devctxs, _log_callback, _xpu_allocator_ready
+    global _xpu_native_hook_active, _memory_compiler_native
+    if lib is not None:
         if implementation == "xpu" and _xpu_allocator_ready:
             if _xpu_allocator_mode == "native_hook":
                 _xpu_native_hook_active = False
@@ -748,7 +800,16 @@ def deinit():
 
                 torch.xpu.empty_cache()
                 torch.xpu.synchronize()
-                if not lib.xpu_ur_hook_disable():
+                retire = getattr(lib, "xpu_ur_hook_retire_borrowed", None)
+                if quiescent and retire is not None:
+                    if not owner.native_cache_empty():
+                        raise RuntimeError("cannot deinitialize AIMDO while native cache remains live")
+                    retire.argtypes = []
+                    retire.restype = ctypes.c_bool
+                    disabled = bool(retire())
+                else:
+                    disabled = bool(lib.xpu_ur_hook_disable())
+                if not disabled:
                     raise RuntimeError(
                         "cannot disable AIMDO XPU native hook while "
                         "tracked native segments remain live"
@@ -884,6 +945,16 @@ def get_xpu_ur_hook_stats():
         result["cache_lever_skipped_calls"] = int(
             lib.xpu_ur_hook_get_cache_lever_skipped_calls()
         )
+    retirement = getattr(lib, "xpu_ur_hook_get_retirement_stats", None)
+    if retirement is not None:
+        retirement.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t]
+        retirement.restype = ctypes.c_bool
+        values = (ctypes.c_uint64 * 7)()
+        if not retirement(values, 7):
+            raise RuntimeError("failed to query UR retirement statistics")
+        result.update(zip(("retire_calls", "retired_allocations", "retired_bytes",
+                           "retired_frees", "retired_free_bytes", "live_retired_allocations",
+                           "live_retired_bytes"), map(int, values)))
     return result
 
 

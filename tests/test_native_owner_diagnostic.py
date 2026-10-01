@@ -124,6 +124,9 @@ def test_compiler_scope_suspension_restores_native_binding_after_nested_pause(mo
             pytest.fail("suspended without a compiler scope")
     with native_owner.compiler_scope(stream):
         with native_owner.suspend_compiler_scope():
+            with pytest.raises(RuntimeError, match="no live allocations or scopes"):
+                with native_owner.allocator_transition():
+                    pytest.fail("lifecycle changed during a suspended compiler scope")
             with native_owner.suspend_compiler_scope():
                 with pytest.raises(RuntimeError, match="nested native-owner"):
                     with native_owner.compiler_scope(stream):

@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import sys
 import threading
 import weakref
 
@@ -25,6 +26,8 @@ _library = None
 _scope_context = threading.local()
 _scope_terminal = False
 _graph_lock = threading.Lock()
+_lifecycle_lock = threading.RLock()
+_active_scope_owners = set()
 _live_graphs = weakref.WeakSet()
 _deferred_graphs = {}
 _DEAD_OWNER_ERROR = "AIMDO graph owner thread exited; process must exit"
@@ -131,6 +134,56 @@ def requested() -> bool:
 
 def installed() -> bool:
     return bool(_library is not None and _library.aimdo_full_proxy_is_installed())
+
+
+@contextlib.contextmanager
+def lifecycle_guard():
+    """Serialize provider lifecycle with creation of diagnostic graph handles."""
+    with _lifecycle_lock:
+        yield
+
+
+@contextlib.contextmanager
+def allocator_transition():
+    """Prevent new C10 allocations/scopes while the provider changes context."""
+    with _lifecycle_lock:
+        with _allocator_transition() as ready:
+            yield ready
+
+
+@contextlib.contextmanager
+def _allocator_transition():
+    if _scope_terminal:
+        raise RuntimeError("native-owner compiler scope failed; process must exit")
+    if _active_scope_owners:
+        if any(not owner.is_alive() for owner in _active_scope_owners):
+            raise RuntimeError(_DEAD_OWNER_ERROR)
+        raise RuntimeError("native-owner lifecycle requires no live allocations or scopes")
+    begin = getattr(_library, "aimdo_full_proxy_transition_begin", None)
+    end = getattr(_library, "aimdo_full_proxy_transition_end", None)
+    if begin is None or end is None:
+        yield False
+        return
+    begin.argtypes = []
+    begin.restype = ctypes.c_bool
+    end.argtypes = []
+    end.restype = ctypes.c_bool
+    if not begin():
+        raise RuntimeError("native-owner lifecycle requires no live allocations or scopes")
+    try:
+        yield True
+    finally:
+        if not end():
+            raise RuntimeError("native-owner lifecycle transition could not end; process must exit")
+
+
+def native_cache_empty() -> bool:
+    check = getattr(_library, "aimdo_full_proxy_native_cache_empty", None)
+    if check is None:
+        return False
+    check.argtypes = []
+    check.restype = ctypes.c_bool
+    return bool(check())
 
 
 def _validate_torch_abi_identity(torch_module, package_root: Path) -> None:
@@ -515,6 +568,11 @@ def consumer_scope(tensor, stream):
 
 def record_diagnostic(stream, assert_graph_breaks: bool = False):
     """Create a memory-only XPU graph for the opt-in diagnostic route."""
+    with _lifecycle_lock:
+        return _record_diagnostic(stream, assert_graph_breaks)
+
+
+def _record_diagnostic(stream, assert_graph_breaks=False):
     if not installed():
         raise RuntimeError("native-owner diagnostic is not installed")
     from . import control
@@ -559,6 +617,23 @@ def record_diagnostic(stream, assert_graph_breaks: bool = False):
 
 @contextlib.contextmanager
 def _compiler_scope(size: int, stream):
+    owner = threading.current_thread()
+    with _lifecycle_lock:
+        scope = _compiler_scope_context(size, stream)
+        scope.__enter__()
+        _active_scope_owners.add(owner)
+    try:
+        yield
+    finally:
+        with _lifecycle_lock:
+            try:
+                scope.__exit__(*sys.exc_info())
+            finally:
+                _active_scope_owners.discard(owner)
+
+
+@contextlib.contextmanager
+def _compiler_scope_context(size: int, stream):
     global _scope_terminal
     if _scope_terminal:
         raise RuntimeError("native-owner compiler scope failed; process must exit")

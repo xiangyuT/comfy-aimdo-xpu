@@ -31,6 +31,23 @@ extern "C" {
 extern "C" bool aimdo_xpu_prepare_allocation(int device, size_t size);
 extern "C" bool aimdo_xpu_retry_allocation(int device, size_t size);
 extern "C" bool aimdo_xpu_account_allocation(int device, int64_t delta);
+#if !defined(_WIN32) && !defined(_WIN64)
+extern "C" void aimdo_xpu_owned_usm_enter();
+extern "C" void aimdo_xpu_owned_usm_leave();
+#endif
+
+struct AimdoUsmOwnerScope {
+    AimdoUsmOwnerScope() {
+#if !defined(_WIN32) && !defined(_WIN64)
+        aimdo_xpu_owned_usm_enter();
+#endif
+    }
+    ~AimdoUsmOwnerScope() {
+#if !defined(_WIN32) && !defined(_WIN64)
+        aimdo_xpu_owned_usm_leave();
+#endif
+    }
+};
 extern "C" int aimdo_vbar_describe_range(uint64_t address, uint64_t size, int *mapped, unsigned *pin, uint64_t *page_index, uint64_t *unmapped_page, uint64_t *pages_spanned);
 
 #if defined(_WIN32) || defined(_WIN64)
@@ -581,6 +598,7 @@ CUresult xpu_memory_info(size_t *free_bytes, size_t *total_bytes) {
 }
 
 CUresult xpu_malloc(CUdeviceptr *pointer, size_t size) {
+    AimdoUsmOwnerScope owned_usm;
     const auto state = snapshot_current_device();
     if (!pointer || !state) {
         return kCudaErrorUnknown;
@@ -611,6 +629,7 @@ CUresult xpu_free(CUdeviceptr pointer) {
 }
 
 CUresult xpu_malloc_async(CUdeviceptr *pointer, size_t size, CUstream stream) {
+    AimdoUsmOwnerScope owned_usm;
     auto queue = resolve_queue(stream);
     if (!pointer || !queue) {
         return kCudaErrorUnknown;
@@ -991,6 +1010,7 @@ void release_cached_torch_blocks(int device, bool wait) {
 }
 
 void *allocate_torch_block(size_t size, int device, sycl::queue *queue) {
+    AimdoUsmOwnerScope owned_usm;
     if (!queue || size == 0) {
         return nullptr;
     }
@@ -1115,6 +1135,7 @@ void free_torch_block(void *pointer, sycl::queue *queue) {
 
 void *allocate_raw_torch_segment(
     size_t size, int device, sycl::queue *queue) {
+    AimdoUsmOwnerScope owned_usm;
     if (!queue || size == 0) {
         return nullptr;
     }

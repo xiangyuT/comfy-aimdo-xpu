@@ -1,6 +1,13 @@
 #include "plat.h"
 #include "malloc-rogue.h"
 #include "vmm-ref.h"
+#if defined(AIMDO_XPU) && !defined(_WIN32) && !defined(_WIN64)
+#include <stdatomic.h>
+static _Atomic uint64_t live_graph_handles;
+SHARED_EXPORT uint64_t malloc_graph_live_handles(void) {
+    return atomic_load(&live_graph_handles);
+}
+#endif
 
 #define MG_PAGE (8ULL * M)
 #define MG_PAGES 8192ULL
@@ -1184,6 +1191,9 @@ SHARED_EXPORT void *malloc_graph_create(void *devctx, CUstream stream, bool asse
         goto fail_small_address;
     }
     active_graph = g;
+#if defined(AIMDO_XPU) && !defined(_WIN32) && !defined(_WIN64)
+    atomic_fetch_add(&live_graph_handles, 1);
+#endif
     return g;
 
 fail_small_address:
@@ -1480,6 +1490,9 @@ static bool destroy_graph(void *handle) {
     free_small_ranges(g->small_unusable);
     free(g->root.snapshot);
     free_events(g->root.next, g->root.next_count);
+#if defined(AIMDO_XPU) && !defined(_WIN32) && !defined(_WIN64)
+    atomic_fetch_sub(&live_graph_handles, 1);
+#endif
     free(g);
     return true;
 }

@@ -166,6 +166,20 @@ Its matching sidecar translates device-memory allocation failures to Torch's
 scope or other driver errors. Abort/owner cleanup remains required after a
 failed allocation; this does not change public compiler availability.
 
+The Linux Torch 2.14 diagnostic closes contexts under a lifecycle gate. New
+logical allocations, raw allocations, scopes and graph creation are excluded
+during this transition; live owners and native cache storage still prevent it.
+Native graph handles are counted independently of Python graph references.
+
+After those checks, remaining caller-owned UR buffers can move to a non-owning
+retired ledger. AIMDO's direct USM allocations are explicitly marked and cannot
+be retired. Retirement does not free an external buffer or increment physical
+free counters. A late free continues through the original UR interface without
+accessing the destroyed context. On re-initialization, surviving records are
+adopted into the new budget before the hook becomes active. Separate retirement
+statistics report this lifetime, including external oneDNN cache storage.
+The default hook path without the diagnostic retains its strict disable rule.
+
 ComfyUI-OmniXPU activates this provider only when DynamicVRAM is explicitly
 enabled and the official AIMDO attempt has left no live native or allocator
 state. The provider defaults to `native_hook` on Linux and Windows, keeping

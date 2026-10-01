@@ -67,6 +67,9 @@ enum HookStat : size_t {
 struct Allocation {
     size_t size;
     int device;
+    bool accounted = true;
+    bool retired = false;
+    bool aimdo_owned = false;
 };
 
 enum class RetryReason {
@@ -89,8 +92,15 @@ struct RetryState {
 std::atomic<bool> g_enabled{false};
 std::atomic<uint64_t> g_generation{0};
 std::atomic<uint64_t> g_stats[kHookStatCount];
-std::mutex g_hook_mutex;
-std::unordered_map<void *, Allocation> g_allocations;
+// Retired caller-owned USM can be freed during Torch's process teardown.
+// Keep this non-owning ledger and its lock alive for those late callbacks.
+std::mutex &g_hook_mutex = *new std::mutex();
+std::unordered_map<void *, Allocation> &g_allocations =
+    *new std::unordered_map<void *, Allocation>();
+std::atomic<bool> g_owned_shutdown{false};
+thread_local unsigned g_owned_usm_depth = 0;
+std::atomic<uint64_t> g_retirement_stats[5];
+std::atomic<uint64_t> g_retired_live_count{0};
 // Published only at Python/model-owner boundaries, never by re-entering the
 // native allocator from its UR callback. A hint is not a releasability proof.
 std::unordered_map<int, uint64_t> g_torch_cached_bytes;
@@ -109,6 +119,7 @@ FreeFn g_test_free = nullptr;
 DeviceGetNativeHandleFn g_test_device_get_native_handle = nullptr;
 std::atomic<TestRequestKind> g_test_request_kind{TestRequestKind::kAutomatic};
 void (*g_test_after_fast_enabled_check)() = nullptr;
+bool g_test_retirement_ready = false;
 #endif
 
 void *open_ur_loader() {
@@ -256,7 +267,8 @@ AccountResult account_success(void *pointer, size_t size, int device) {
     }
     try {
         const auto inserted =
-            g_allocations.emplace(pointer, Allocation{size, device});
+            g_allocations.emplace(pointer, Allocation{size, device, true, false,
+                                                       g_owned_usm_depth != 0});
         if (!inserted.second) {
             g_stats[kDuplicatePointerCalls].fetch_add(
                 1, std::memory_order_relaxed);
@@ -365,7 +377,15 @@ extern "C" ur_result_t urUSMDeviceAlloc(
         return UR_RESULT_ERROR_UNINITIALIZED;
     }
     g_stats[kAllocCalls].fetch_add(1, std::memory_order_relaxed);
+    if (g_owned_usm_depth && g_owned_shutdown.load(std::memory_order_acquire)) {
+        if (pointer) *pointer = nullptr;
+        return UR_RESULT_ERROR_UNINITIALIZED;
+    }
     if (!g_enabled.load(std::memory_order_acquire)) {
+        if (g_owned_usm_depth && g_owned_shutdown.load(std::memory_order_acquire)) {
+            if (pointer) *pointer = nullptr;
+            return UR_RESULT_ERROR_UNINITIALIZED;
+        }
         g_stats[kPassThroughAllocCalls].fetch_add(
             1, std::memory_order_relaxed);
         return real(context, device, description, pool, size, pointer);
@@ -377,6 +397,10 @@ extern "C" ur_result_t urUSMDeviceAlloc(
 #endif
 
     std::lock_guard<std::mutex> guard(g_hook_mutex);
+    if (g_owned_usm_depth && g_owned_shutdown.load(std::memory_order_relaxed)) {
+        if (pointer) *pointer = nullptr;
+        return UR_RESULT_ERROR_UNINITIALIZED;
+    }
     if (!g_enabled.load(std::memory_order_relaxed)) {
         clear_retry();
         g_stats[kPassThroughAllocCalls].fetch_add(
@@ -493,14 +517,15 @@ extern "C" ur_result_t urUSMFree(
         return UR_RESULT_ERROR_UNINITIALIZED;
     }
     g_stats[kFreeCalls].fetch_add(1, std::memory_order_relaxed);
-    if (!g_enabled.load(std::memory_order_acquire)) {
+    if (!g_enabled.load(std::memory_order_acquire) &&
+        !g_retired_live_count.load(std::memory_order_acquire)) {
         return real(context, pointer);
     }
 
     std::lock_guard<std::mutex> guard(g_hook_mutex);
-    if (!g_enabled.load(std::memory_order_relaxed)) {
+    const bool enabled = g_enabled.load(std::memory_order_relaxed);
+    if (!enabled) {
         clear_retry();
-        return real(context, pointer);
     }
     ur_result_t result = real(context, pointer);
     if (result != UR_RESULT_SUCCESS) {
@@ -508,13 +533,20 @@ extern "C" ur_result_t urUSMFree(
     }
     auto found = g_allocations.find(pointer);
     if (found == g_allocations.end()) {
-        g_stats[kUnknownFreeCalls].fetch_add(
-            1, std::memory_order_relaxed);
+        if (enabled) {
+            g_stats[kUnknownFreeCalls].fetch_add(1, std::memory_order_relaxed);
+        }
         return result;
     }
-    aimdo_xpu_account_allocation(
-        found->second.device, -static_cast<int64_t>(found->second.size));
-    if (g_retry.reason != RetryReason::kNone &&
+    if (found->second.accounted) {
+        aimdo_xpu_account_allocation(
+            found->second.device, -static_cast<int64_t>(found->second.size));
+    }
+    if (found->second.retired) {
+        g_retirement_stats[3].fetch_add(1, std::memory_order_relaxed);
+        g_retirement_stats[4].fetch_add(found->second.size, std::memory_order_relaxed);
+        g_retired_live_count.fetch_sub(1, std::memory_order_release);
+    } else if (g_retry.reason != RetryReason::kNone &&
         g_retry.context == context &&
         g_retry.aimdo_device == found->second.device &&
         g_retry.generation ==
@@ -546,6 +578,25 @@ extern "C" AIMDO_XPU_EXPORT bool xpu_ur_hook_is_interposed() {
     return active == reinterpret_cast<void *>(&urUSMDeviceAlloc);
 }
 
+namespace {
+void enable_locked() {
+    g_generation.fetch_add(1, std::memory_order_relaxed);
+    // A new context borrows the accounting of surviving external buffers.
+    // Their later free is charged only if this adoption succeeded.
+    for (auto &[pointer, allocation] : g_allocations) {
+        (void)pointer;
+        if (allocation.retired && !allocation.accounted) {
+            allocation.accounted = aimdo_xpu_account_allocation(
+                allocation.device, static_cast<int64_t>(allocation.size));
+        }
+    }
+    g_owned_shutdown.store(false, std::memory_order_release);
+    g_torch_cached_bytes.clear();
+    clear_retry();
+    g_enabled.store(true, std::memory_order_release);
+}
+}  // namespace
+
 extern "C" AIMDO_XPU_EXPORT bool xpu_ur_hook_enable() {
     if (!xpu_ur_hook_is_interposed() || !real_device_alloc() ||
         !real_free() || !real_device_get_native_handle()) {
@@ -555,10 +606,7 @@ extern "C" AIMDO_XPU_EXPORT bool xpu_ur_hook_enable() {
     if (g_enabled.load(std::memory_order_relaxed)) {
         return true;
     }
-    g_generation.fetch_add(1, std::memory_order_relaxed);
-    g_torch_cached_bytes.clear();
-    clear_retry();
-    g_enabled.store(true, std::memory_order_release);
+    enable_locked();
     return true;
 }
 
@@ -571,6 +619,76 @@ extern "C" AIMDO_XPU_EXPORT bool xpu_ur_hook_disable() {
     g_generation.fetch_add(1, std::memory_order_relaxed);
     g_torch_cached_bytes.clear();
     clear_retry();
+    return true;
+}
+
+namespace {
+bool retirement_ready() {
+#ifdef AIMDO_XPU_TESTING
+    return g_test_retirement_ready;
+#else
+    using Ready = bool (*)();
+    auto ready = reinterpret_cast<Ready>(dlsym(
+        RTLD_DEFAULT, "aimdo_full_proxy_transition_ready"));
+    // The sidecar checks ownership/cache while holding its allocation gate.
+    // Do not call it while holding the UR lock (native allocator lock order).
+    return ready && ready();
+#endif
+}
+
+bool retire_borrowed_locked() {
+    for (const auto &[pointer, allocation] : g_allocations) {
+        (void)pointer;
+        if (allocation.aimdo_owned) return false;
+    }
+    g_owned_shutdown.store(true, std::memory_order_release);
+    g_enabled.store(false, std::memory_order_release);
+    g_generation.fetch_add(1, std::memory_order_relaxed);
+    g_torch_cached_bytes.clear();
+    clear_retry();
+    for (auto &[pointer, allocation] : g_allocations) {
+        (void)pointer;
+        if (!allocation.retired) {
+            allocation.retired = true;
+            g_retirement_stats[1].fetch_add(1, std::memory_order_relaxed);
+            g_retirement_stats[2].fetch_add(allocation.size, std::memory_order_relaxed);
+            g_retired_live_count.fetch_add(1, std::memory_order_release);
+        }
+        // The old context is closed next. Keep physical-free counts honest.
+        allocation.accounted = false;
+    }
+    g_retirement_stats[0].fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+}  // namespace
+
+extern "C" AIMDO_XPU_EXPORT bool xpu_ur_hook_retire_borrowed() {
+    if (!retirement_ready()) return false;
+    std::lock_guard<std::mutex> guard(g_hook_mutex);
+    return retire_borrowed_locked();
+}
+
+extern "C" AIMDO_XPU_EXPORT void aimdo_xpu_owned_usm_enter() {
+    ++g_owned_usm_depth;
+}
+
+extern "C" AIMDO_XPU_EXPORT void aimdo_xpu_owned_usm_leave() {
+    if (g_owned_usm_depth) --g_owned_usm_depth;
+}
+
+extern "C" AIMDO_XPU_EXPORT bool xpu_ur_hook_get_retirement_stats(
+    uint64_t *values, size_t count) {
+    if (!values || count != 7) return false;
+    std::lock_guard<std::mutex> guard(g_hook_mutex);
+    for (size_t index = 0; index != 5; ++index) {
+        values[index] = g_retirement_stats[index].load(std::memory_order_relaxed);
+    }
+    values[5] = g_retired_live_count.load(std::memory_order_relaxed);
+    values[6] = 0;
+    for (const auto &[pointer, allocation] : g_allocations) {
+        (void)pointer;
+        if (allocation.retired) values[6] += allocation.size;
+    }
     return true;
 }
 
