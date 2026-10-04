@@ -79,6 +79,9 @@ allocation is initialized; `control.init()` performs that installation.
 
 ### Build the Intel XPU backend on Windows
 
+For a detailed Chinese Windows and ComfyUI deployment guide, see
+[`docs/WINDOWS_XPU_BUILD_CN.md`](docs/WINDOWS_XPU_BUILD_CN.md).
+
 Install [Visual Studio Build Tools 2022](https://visualstudio.microsoft.com/visual-cpp-build-tools/)
 with the Desktop C++ workload and the
 [Intel oneAPI DPC++/C++ Compiler 2025.3](https://www.intel.com/content/www/us/en/developer/tools/oneapi/dpc-compiler-download.html).
