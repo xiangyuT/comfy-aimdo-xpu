@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import ast
 import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import types
@@ -305,3 +307,40 @@ def test_torch214_native_owner_sidecar_is_explicit_and_version_bound(tmp_path, m
             source_wheel=source, output_directory=tmp_path / "wrong-torch",
             source_revision="e" * 40, torch_version="2.13.0+xpu", xpu_target="bmg",
         )
+
+
+@pytest.mark.parametrize("payload", ("sidecar", "core"))
+def test_native_owner_payload_rejects_each_missing_required_export(tmp_path, monkeypatch, payload):
+    builder = _load_builder()
+    required = builder._NATIVE_OWNER_SYMBOLS if payload == "sidecar" else builder._NATIVE_OWNER_CORE_SYMBOLS
+    files = {
+        "comfy_aimdo/native_owner.py": b"diagnostic",
+        "comfy_aimdo/aimdo_xpu_native_owner.so": b"sidecar",
+        "comfy_aimdo/aimdo_xpu.so": b"core",
+        "comfy_aimdo/aimdo_xpu_native_owner_abi.json": _FAKE_TORCH_ABI_IDENTITY,
+    }
+    monkeypatch.setattr(builder.shutil, "which", lambda _: "nm")
+    for missing in required:
+        def inspect(command, **kwargs):
+            selected = (builder._NATIVE_OWNER_SYMBOLS if command[-1].endswith("native_owner.so")
+                        else builder._NATIVE_OWNER_CORE_SYMBOLS)
+            return subprocess.CompletedProcess(command, 0, stdout="\n".join(set(selected) - {missing}))
+        monkeypatch.setattr(builder.subprocess, "run", inspect)
+        with pytest.raises(RuntimeError, match=missing):
+            builder._native_owner_diagnostic_contract("0.5.5", "2.14.0+xpu", files)
+
+
+def test_packaging_exports_cover_python_and_native_runtime_dependencies():
+    builder = _load_builder()
+    root = Path(__file__).parents[1]
+    tree = ast.parse((root / "comfy_aimdo/native_owner.py").read_text())
+    # Derive dependencies from the consumers, so an omitted declaration does
+    # not also disappear from the test's expected ABI.
+    python_symbols = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+                      and node.attr.startswith("aimdo_full_proxy_")}
+    python_symbols |= {node.value for node in ast.walk(tree) if isinstance(node, ast.Constant)
+                       and isinstance(node.value, str) and node.value.startswith("aimdo_full_proxy_")}
+    assert python_symbols <= set(builder._NATIVE_OWNER_SYMBOLS)
+    native_source = (root / "src-xpu/native-owner-proxy.cpp").read_text()
+    core_symbols = set(re.findall(r'dlsym\(\s*RTLD_DEFAULT,\s*"([A-Za-z0-9_]+)"', native_source))
+    assert core_symbols <= set(builder._NATIVE_OWNER_CORE_SYMBOLS) | set(builder._COMPILER_SYMBOLS)

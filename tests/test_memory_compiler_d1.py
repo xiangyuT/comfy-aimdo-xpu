@@ -283,6 +283,23 @@ def test_duplicate_device_init_rejected_before_native_or_queue_use(monkeypatch):
     assert control.devctxs == [0x1234]
 
 
+@pytest.mark.parametrize("backend", ("cuda", "rocm"))
+@pytest.mark.parametrize("new_core", (False, True))
+def test_cuda_rocm_router_survives_new_core_abi_exports(monkeypatch, backend, new_core):
+    native = (library() if new_core else types.SimpleNamespace(
+        **{name: Function() for name in control._MEMORY_COMPILER_SIGNATURES}))
+    native._name = "/not-a-real-library"
+    bound = control._bind_memory_compiler(native, backend)
+    assert bound["router_available"] is True
+    assert bound["feature_bits"] == (1 if new_core else None)
+    monkeypatch.setattr(control, "lib", native)
+    monkeypatch.setattr(control, "implementation", backend)
+    monkeypatch.setattr(control, "_memory_compiler_native", bound)
+    capability = control.get_memory_compiler_capability()
+    assert capability["core_built"] and capability["available"] and capability["memory_only"]
+    assert capability["reason"] is None
+
+
 def test_linux_build_inputs_include_complete_core():
     root = Path(__file__).parents[1]
     linux = (root / "scripts/build-linux-xpu.sh").read_text()

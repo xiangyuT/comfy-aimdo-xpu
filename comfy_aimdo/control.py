@@ -66,7 +66,9 @@ def _bind_memory_compiler(library, backend):
             function.argtypes, function.restype = [], ctypes.c_char_p
             identity[field] = function().decode("ascii")
     return {"abi_revision": abi, "feature_bits": flags, "symbols_complete": True,
-            "router_available": flags is None and backend in ("cuda", "rocm"), **identity}
+            # Core feature bits describe the ABI, not the backend's allocator
+            # hooks. CUDA/ROCm retain their router with either core ABI.
+            "router_available": backend in ("cuda", "rocm"), **identity}
 
 
 def _xpu_native_owner_context_ready():

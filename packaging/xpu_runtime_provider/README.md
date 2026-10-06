@@ -96,6 +96,10 @@ The sidecar also exposes diagnostic scoped-raw counters and a live
 compiler-owner query. Backend `raw_alloc` workspaces used inside an opt-in
 compiler scope remain owned by Torch's native allocator; the compiler owns
 only positive-size tensor requests served through its `DataPtr` route.
+The wheel builder requires the complete deferred-free and lifecycle transition
+exports as well as the matching core allocation, ownership and retirement
+exports. An older or incomplete sidecar cannot pass this check solely by
+matching the distribution and Torch versions.
 The diagnostic graph also requires `malloc_graph_destroy_checked` from its
 matching D1 library. A foreign-thread close is queued to the graph's creator;
 deinitialization fails while any graph handle remains live or deferred.

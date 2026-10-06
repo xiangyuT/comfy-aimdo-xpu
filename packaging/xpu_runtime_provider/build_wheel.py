@@ -43,6 +43,10 @@ _NATIVE_OWNER_SYMBOLS = (
     "aimdo_full_proxy_compiler_begin",
     "aimdo_full_proxy_compiler_end", "aimdo_full_proxy_snapshot",
     "aimdo_full_proxy_scoped_raw_snapshot", "aimdo_full_proxy_is_compiler_owner",
+    "aimdo_full_proxy_drain_deferred_frees",
+    "aimdo_full_proxy_deferred_free_count", "aimdo_full_proxy_dead_deferred_free_count",
+    "aimdo_full_proxy_transition_begin", "aimdo_full_proxy_transition_end",
+    "aimdo_full_proxy_native_cache_empty", "aimdo_full_proxy_transition_ready",
 )
 _NATIVE_OWNER_CORE_SYMBOLS = (
     "malloc_graph_free_owned", "malloc_graph_test_fail_next_page_creates",
@@ -51,6 +55,10 @@ _NATIVE_OWNER_CORE_SYMBOLS = (
     "malloc_graph_test_fail_next_destroy_release",
     "malloc_graph_test_arm_driver_release",
     "aimdo_xpu_test_arm_vmm_release", "aimdo_xpu_test_pending_vmm_release",
+    "malloc_graph_alloc", "malloc_graph_free", "free_rogue",
+    "set_devctx_for_device", "malloc_graph_live_handles",
+    "malloc_graph_last_allocation_driver_error", "malloc_graph_note_excluded_allocation",
+    "xpu_allocator_get_memory_stats", "xpu_ur_hook_retire_borrowed",
 )
 
 

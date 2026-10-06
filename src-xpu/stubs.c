@@ -1,7 +1,24 @@
 #include "plat.h"
 
-/* The shared memory compiler core supplies its public entry points. XPU
- * recording remains unavailable until a logical-allocation router exists. */
+/* Linux links the shared compiler core. Windows retains the ordinary
+ * allocator route until its compiler build and lifetime contract are ported. */
+#if defined(_WIN32) || defined(_WIN64)
+bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
+    return false;
+}
+
+bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
+    return false;
+}
+
+bool malloc_graph_sync_paused(void) {
+    return false;
+}
+
+bool free_rogue(CUdeviceptr ptr, int *result) {
+    return false;
+}
+#endif
 
 #if !defined(_WIN32) && !defined(_WIN64)
 bool aimdo_setup_hooks(void) {
