@@ -23,13 +23,6 @@ _BUILDER = (
     / "xpu_runtime_provider"
     / "build_wheel.py"
 )
-_FAKE_TORCH_ABI_IDENTITY = (
-    json.dumps({
-        "schema_version": 1, "torch_version": "2.14.0+xpu", "cxx11_abi": True,
-        "libraries": {name: "a" * 64 for name in
-                      ("libc10.so", "libc10_xpu.so", "libtorch_xpu.so")},
-    }, sort_keys=True) + "\n"
-).encode()
 
 
 def _load_builder():
@@ -50,7 +43,6 @@ def _source_wheel(
     include_native: bool = True,
     include_compiler_api: bool = False,
     include_native_owner: bool = False,
-    include_native_owner_abi: bool = True,
     version: str = "0.5.5",
 ) -> Path:
     dist_info = f"comfy_aimdo-{version}.dist-info"
@@ -76,9 +68,6 @@ def _source_wheel(
         if include_native_owner:
             archive.writestr("comfy_aimdo/native_owner.py", "VALUE = 'diagnostic'\n")
             archive.writestr("comfy_aimdo/aimdo_xpu_native_owner.so", b"fake-native-owner")
-            if include_native_owner_abi:
-                archive.writestr("comfy_aimdo/aimdo_xpu_native_owner_abi.json",
-                                 _FAKE_TORCH_ABI_IDENTITY)
         if include_native:
             archive.writestr("comfy_aimdo/aimdo_xpu.so", b"fake-level-zero")
         archive.writestr(f"{dist_info}/RECORD", "")
@@ -275,38 +264,27 @@ def test_torch214_native_owner_sidecar_is_explicit_and_version_bound(tmp_path, m
         names = set(archive.namelist())
         manifest = json.loads(archive.read("comfy_aimdo_xpu_runtime/provider.json"))
     sidecar = "comfy_aimdo_xpu_runtime/_vendor/comfy_aimdo/aimdo_xpu_native_owner.so"
-    abi_identity = "comfy_aimdo_xpu_runtime/_vendor/comfy_aimdo/aimdo_xpu_native_owner_abi.json"
     diagnostic = manifest["native_owner_diagnostic"]
-    assert sidecar in names and abi_identity in names
+    assert sidecar in names
+    assert not any(name.endswith("aimdo_xpu_native_owner_abi.json") for name in names)
     assert diagnostic == {
         "enabled_by_default": False,
         "environment_flag": "AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC",
         "torch_version": "2.14.0+xpu",
         "path": sidecar,
         "sha256": hashlib.sha256(b"fake-native-owner").hexdigest(),
-        "abi_identity_path": abi_identity,
-        "abi_identity_sha256": hashlib.sha256(_FAKE_TORCH_ABI_IDENTITY).hexdigest(),
     }
     assert manifest["api_compatibility"]["xpu_recording_supported"] is False
     assert {item["path"] for item in manifest["native_artifacts"]} == {
         "comfy_aimdo_xpu_runtime/_vendor/comfy_aimdo/aimdo_xpu.so", sidecar,
     }
-    (tmp_path / "missing-abi").mkdir()
-    missing_abi = _source_wheel(
-        tmp_path / "missing-abi/comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl",
-        include_compiler_api=True, include_native_owner=True,
-        include_native_owner_abi=False,
+    declared_release = builder.build_provider_wheel(
+        source_wheel=source, output_directory=tmp_path / "declared-release",
+        source_revision="e" * 40, torch_version="2.13.0+xpu", xpu_target="bmg",
     )
-    with pytest.raises(RuntimeError, match="Torch ABI identity is missing"):
-        builder.build_provider_wheel(
-            source_wheel=missing_abi, output_directory=tmp_path / "missing-abi-provider",
-            source_revision="e" * 40, torch_version="2.14.0+xpu", xpu_target="bmg",
-        )
-    with pytest.raises(RuntimeError, match="requires AIMDO 0.5.5 and Torch 2.14.0"):
-        builder.build_provider_wheel(
-            source_wheel=source, output_directory=tmp_path / "wrong-torch",
-            source_revision="e" * 40, torch_version="2.13.0+xpu", xpu_target="bmg",
-        )
+    with zipfile.ZipFile(declared_release) as archive:
+        declared = json.loads(archive.read("comfy_aimdo_xpu_runtime/provider.json"))
+    assert declared["native_owner_diagnostic"]["torch_version"] == "2.13.0+xpu"
 
 
 @pytest.mark.parametrize("payload", ("sidecar", "core"))
@@ -317,7 +295,6 @@ def test_native_owner_payload_rejects_each_missing_required_export(tmp_path, mon
         "comfy_aimdo/native_owner.py": b"diagnostic",
         "comfy_aimdo/aimdo_xpu_native_owner.so": b"sidecar",
         "comfy_aimdo/aimdo_xpu.so": b"core",
-        "comfy_aimdo/aimdo_xpu_native_owner_abi.json": _FAKE_TORCH_ABI_IDENTITY,
     }
     monkeypatch.setattr(builder.shutil, "which", lambda _: "nm")
     for missing in required:

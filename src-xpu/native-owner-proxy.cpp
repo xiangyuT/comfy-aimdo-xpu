@@ -25,6 +25,10 @@
 
 #include <sycl/sycl.hpp>
 
+#ifndef AIMDO_TORCH_VERSION
+#define AIMDO_TORCH_VERSION "unknown"
+#endif
+
 namespace {
 
 uint64_t current_thread_token();
@@ -617,7 +621,7 @@ bool allocation_owners_clear() {
 
 extern "C" __attribute__((visibility("default"))) const char *
 aimdo_full_proxy_torch_version() {
-    return "2.14.0+xpu";
+    return AIMDO_TORCH_VERSION;
 }
 
 extern "C" __attribute__((visibility("default"))) bool

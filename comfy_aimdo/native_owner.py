@@ -1,4 +1,4 @@
-"""Opt-in Linux Torch 2.14 native-owner diagnostic for the XPU provider.
+"""Opt-in Linux native-owner diagnostic for the XPU provider.
 
 The allocator proxy has process lifetime. This module is deliberately separate
 from public malloc_graph.record(), whose XPU capability remains unavailable.
@@ -8,19 +8,14 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
-import hashlib
-import json
 import os
 from pathlib import Path
 import platform
-import re
 import sys
 import threading
 import weakref
 
 
-_TORCH_VERSION = "2.14.0+xpu"
-_TORCH_ABI_LIBRARIES = ("libc10.so", "libc10_xpu.so", "libtorch_xpu.so")
 _ENVIRONMENT_FLAG = "AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC"
 _library = None
 _scope_context = threading.local()
@@ -186,49 +181,11 @@ def native_cache_empty() -> bool:
     return bool(check())
 
 
-def _validate_torch_abi_identity(torch_module, package_root: Path) -> None:
-    """Bind the private C10/XPU proxy to its exact built library bytes."""
-    identity_path = package_root / "aimdo_xpu_native_owner_abi.json"
-    try:
-        identity = json.loads(identity_path.read_text())
-        torch_root = Path(torch_module.__file__).resolve().parent
-    except (OSError, TypeError, ValueError, AttributeError) as error:
-        raise RuntimeError("native-owner Torch ABI identity is missing or invalid") from error
-    libraries = identity.get("libraries") if isinstance(identity, dict) else None
-    if (not isinstance(identity, dict)
-            or set(identity) != {"schema_version", "torch_version", "cxx11_abi", "libraries"}
-            or identity["schema_version"] != 1
-            or identity["torch_version"] != _TORCH_VERSION
-            or identity["cxx11_abi"] is not True
-            or not isinstance(libraries, dict)
-            or set(libraries) != set(_TORCH_ABI_LIBRARIES)
-            or getattr(getattr(torch_module, "_C", None),
-                       "_GLIBCXX_USE_CXX11_ABI", None) is not True):
-        raise RuntimeError("native-owner Torch C10/XPU ABI identity does not match")
-    for name in _TORCH_ABI_LIBRARIES:
-        expected = libraries[name]
-        if not isinstance(expected, str) or not re.fullmatch(r"[0-9a-f]{64}", expected):
-            raise RuntimeError("native-owner Torch ABI digest is invalid: " + name)
-        digest = hashlib.sha256()
-        try:
-            with (torch_root / "lib" / name).open("rb") as source:
-                for chunk in iter(lambda: source.read(1024 * 1024), b""):
-                    digest.update(chunk)
-        except OSError as error:
-            raise RuntimeError("native-owner Torch ABI library is missing: " + name) from error
-        if digest.hexdigest() != expected:
-            raise RuntimeError("native-owner Torch ABI library mismatch: " + name)
-
-
 def install(torch_module) -> None:
     """Install once, before the first XPU device allocation."""
     global _library
     if platform.system() != "Linux":
         raise RuntimeError("native-owner diagnostic is Linux-only")
-    if torch_module.__version__ != _TORCH_VERSION:
-        raise RuntimeError(
-            f"native-owner diagnostic requires Torch {_TORCH_VERSION}"
-        )
     if _library is not None:
         if not installed():
             raise RuntimeError("native-owner diagnostic lost its process owner")
@@ -239,7 +196,6 @@ def install(torch_module) -> None:
     path = Path(__file__).resolve().parent / "aimdo_xpu_native_owner.so"
     if not path.is_file():
         raise RuntimeError("native-owner diagnostic DSO is missing from this provider")
-    _validate_torch_abi_identity(torch_module, path.parent)
     library = ctypes.CDLL(str(path), mode=ctypes.RTLD_GLOBAL)
     library.aimdo_full_proxy_torch_version.argtypes = []
     library.aimdo_full_proxy_torch_version.restype = ctypes.c_char_p
@@ -276,8 +232,6 @@ def install(torch_module) -> None:
     library.aimdo_full_proxy_dead_deferred_free_count.argtypes = []
     library.aimdo_full_proxy_dead_deferred_free_count.restype = ctypes.c_uint64
 
-    if library.aimdo_full_proxy_torch_version() != _TORCH_VERSION.encode():
-        raise RuntimeError("native-owner DSO Torch ABI does not match the runtime")
     if not library.aimdo_full_proxy_is_installed() and not library.aimdo_full_proxy_install():
         raise RuntimeError(
             "native-owner proxy installation failed; the process must exit"

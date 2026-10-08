@@ -31,9 +31,9 @@ now includes upstream `disk-id.c` and its required libraries, providing the
 and runtime test are still required before this 0.5.5 API and the existing
 Windows allocator route can be claimed as validated.
 
-For the opt-in Linux B70 Torch 2.14 native-owner diagnostic, build from an
-environment with the exact official `torch==2.14.0+xpu` wheel and oneAPI C++20
-compiler:
+For the opt-in Linux B70 native-owner diagnostic, build against the selected
+Torch XPU release and oneAPI C++20 compiler. The llm-scaler integration currently
+selects official `torch==2.14.0+xpu`:
 
 ```bash
 UR_INCLUDE_DIR=/opt/intel/oneapi/compiler/2026.1/include/unified-runtime \
@@ -53,11 +53,12 @@ python packaging/xpu_runtime_provider/build_wheel.py \
 ```
 
 This adds `aimdo_xpu_native_owner.so` as a second, privately vendored native
-artifact and `aimdo_xpu_native_owner_abi.json` with SHA-256 for the C10,
-C10/XPU and Torch/XPU libraries used by the build. The provider manifest binds
-both files. Installation checks the runtime Torch CXX11 ABI flag and these
-three library bytes before loading the sidecar; a same-version different build
-fails closed. The diagnostic remains disabled by default. Only an explicitly
+artifact. The build uses the selected Torch headers and CXX11 ABI compiler flag,
+and the native export reports its build release. The provider manifest records
+the declared release and sidecar artifact identity. Release support policy is
+owned by the caller; llm-scaler checks its supported release before building or
+installing this diagnostic. AIMDO does not generate an ABI JSON file or compare
+Torch library hashes. The diagnostic remains disabled by default. Only an explicitly
 set `AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC=1` with Linux
 `native_hook` can install it before XPU initialization. The process-lifetime
 proxy cannot be unloaded or switched off in the same process. This diagnostic
