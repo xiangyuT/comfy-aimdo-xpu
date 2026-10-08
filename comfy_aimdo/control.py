@@ -680,10 +680,11 @@ def _init_devices(device_ids, owner=None):
             if not owner.native_cache_empty():
                 raise RuntimeError("native-owner lifecycle requires an empty native cache")
         return _init_device_contexts(requested, headrooms,
-            (device_array, queue_array) if implementation == "xpu" else None)
+            (device_array, queue_array) if implementation == "xpu" else None,
+            quiescent=quiescent)
 
 
-def _init_device_contexts(requested, headrooms, queues):
+def _init_device_contexts(requested, headrooms, queues, *, quiescent=False):
     global devctxs, _xpu_native_hook_active
     if queues is not None and not lib.xpu_set_queues(*queues, len(requested)):
         return False
@@ -696,6 +697,17 @@ def _init_device_contexts(requested, headrooms, queues):
         devctxs = [get_devctx(device_id) for device_id in requested]
         if implementation == "xpu" and _xpu_allocator_mode == "native_hook":
             if not lib.xpu_ur_hook_enable():
+                if quiescent:
+                    # The failed context is about to be destroyed. Detach any
+                    # partially adopted accounting first, including a failed
+                    # rollback, so late frees never access that context.
+                    retire = getattr(lib, "xpu_ur_hook_retire_borrowed", None)
+                    if retire is None:
+                        raise RuntimeError("failed native-hook adoption requires retirement before cleanup")
+                    retire.argtypes = []
+                    retire.restype = ctypes.c_bool
+                    if not retire():
+                        raise RuntimeError("cannot clean failed native-hook adoption while borrowed owners remain attached")
                 lib.cleanup()
                 devctxs = []
                 lib.plat_cleanup()

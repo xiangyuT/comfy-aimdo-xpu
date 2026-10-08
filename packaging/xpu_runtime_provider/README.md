@@ -183,6 +183,11 @@ free counters. A late free continues through the original UR interface without
 accessing the destroyed context. On re-initialization, surviving records are
 adopted into the new budget before the hook becomes active. Separate retirement
 statistics report this lifetime, including external oneDNN cache storage.
+An adoption failure keeps the hook disabled and rolls back completed budget
+charges where possible. Retained charges are not repeated on retry. Before a
+failed diagnostic initialization destroys its new contexts, it retires those
+accounting markers again; failure to detach them retains the contexts and
+reports an error instead of proceeding with cleanup.
 The default hook path without the diagnostic retains its strict disable rule.
 
 An unrestricted diagnostic compiler scope excludes another queue on the same

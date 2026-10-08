@@ -321,3 +321,24 @@ def test_packaging_exports_cover_python_and_native_runtime_dependencies():
     native_source = (root / "src-xpu/native-owner-proxy.cpp").read_text()
     core_symbols = set(re.findall(r'dlsym\(\s*RTLD_DEFAULT,\s*"([A-Za-z0-9_]+)"', native_source))
     assert core_symbols <= set(builder._NATIVE_OWNER_CORE_SYMBOLS) | set(builder._COMPILER_SYMBOLS)
+
+
+@pytest.mark.parametrize("diagnostic", [False, True])
+def test_retirement_stats_are_required_for_the_private_diagnostic_only(tmp_path, monkeypatch, diagnostic):
+    builder = _load_builder()
+    source = _source_wheel(
+        tmp_path / "comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl",
+        include_compiler_api=True, include_native_owner=diagnostic,
+    )
+    exports = set((*builder._COMPILER_SYMBOLS, *builder._NATIVE_OWNER_SYMBOLS,
+                   *builder._NATIVE_OWNER_CORE_SYMBOLS)) - {"xpu_ur_hook_get_retirement_stats"}
+    monkeypatch.setattr(builder.shutil, "which", lambda _: "nm")
+    monkeypatch.setattr(builder.subprocess, "run", lambda command, **kwargs:
+        subprocess.CompletedProcess(command, 0, stdout="\n".join(exports)))
+    args = dict(source_wheel=source, output_directory=tmp_path / "provider",
+                source_revision="e" * 40, torch_version="2.14.0+xpu", xpu_target="bmg")
+    if diagnostic:
+        with pytest.raises(RuntimeError, match="xpu_ur_hook_get_retirement_stats"):
+            builder.build_provider_wheel(**args)
+    else:
+        assert builder.build_provider_wheel(**args).is_file()

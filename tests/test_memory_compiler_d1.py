@@ -95,6 +95,34 @@ def test_capability_query_before_init_is_read_only(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("retired", [True, False])
+def test_failed_diagnostic_adoption_detaches_before_context_cleanup(monkeypatch, retired):
+    calls = []
+    native = types.SimpleNamespace(
+        plat_init=lambda: True, init=lambda *args: True,
+        get_devctx=lambda device: 0x1234,
+        xpu_ur_hook_enable=lambda: calls.append("enable") or False,
+        xpu_ur_hook_retire_borrowed=lambda: calls.append("retire") or retired,
+        cleanup=lambda: calls.append("cleanup"),
+        plat_cleanup=lambda: calls.append("plat_cleanup"),
+    )
+    monkeypatch.setattr(control, "lib", native)
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "_xpu_allocator_mode", "native_hook")
+    monkeypatch.setattr(control, "_xpu_native_hook_active", False)
+    monkeypatch.setattr(control, "devctxs", [])
+    if retired:
+        assert control._init_device_contexts([0], [0], None, quiescent=True) is False
+        assert calls == ["enable", "retire", "cleanup", "plat_cleanup"]
+        assert control.devctxs == []
+    else:
+        with pytest.raises(RuntimeError, match="cannot clean failed native-hook adoption"):
+            control._init_device_contexts([0], [0], None, quiescent=True)
+        assert calls == ["enable", "retire"]
+        assert control.devctxs == [0x1234]
+    assert not control._xpu_native_hook_active
+
+
 def test_native_owner_diagnostic_capability_is_separate_from_public_record(monkeypatch):
     native = library()
     native._name = "/no-library-loaded-by-this-fixture"

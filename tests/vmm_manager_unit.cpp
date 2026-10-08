@@ -15,12 +15,17 @@ const VmmOwner owner{0, reinterpret_cast<ze_context_handle_t>(1), reinterpret_ca
 const VmmOwner other_context{0, reinterpret_cast<ze_context_handle_t>(3), owner.device};
 const VmmOwner other_device{1, owner.context, reinterpret_cast<ze_device_handle_t>(4)};
 
+using ContextKey = std::pair<uintptr_t, uintptr_t>;
+ContextKey context_key(ze_context_handle_t context, const void *value) {
+    return {reinterpret_cast<uintptr_t>(context), reinterpret_cast<uintptr_t>(value)};
+}
+
 struct Driver {
-    uintptr_t next_va = 0x20200000;
-    uintptr_t next_handle = 32;
-    std::map<uintptr_t, size_t> reservations;
-    std::map<ze_physical_mem_handle_t, size_t> backing;
-    std::map<uintptr_t, std::pair<size_t, ze_physical_mem_handle_t>> mappings;
+    std::map<uintptr_t, uintptr_t> next_va;
+    std::map<uintptr_t, uintptr_t> next_handle;
+    std::map<ContextKey, size_t> reservations;
+    std::map<ContextKey, size_t> backing;
+    std::map<ContextKey, std::pair<size_t, ze_physical_mem_handle_t>> mappings;
     std::string fail;
     int fail_after = 0;
     ze_result_t error = ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY;
@@ -33,56 +38,64 @@ struct Driver {
 } driver;
 
 ze_result_t ZE_APICALL query(ze_context_handle_t c, ze_device_handle_t d, size_t, size_t *out) {
-    assert(c == owner.context && d == owner.device);
+    assert((c == owner.context || c == other_context.context) && d == owner.device);
     auto r = driver.call("page"); if (r) return r;
     *out = page; return ZE_RESULT_SUCCESS;
 }
 ze_result_t ZE_APICALL reserve(ze_context_handle_t c, const void *start, size_t bytes, void **out) {
-    assert(c == owner.context && !start && bytes % page == 0);
+    assert(!start && bytes % page == 0);
     auto r = driver.call("reserve"); if (r) return r;
-    *out = reinterpret_cast<void *>(driver.next_va);
-    driver.reservations[driver.next_va] = bytes;
-    driver.next_va += bytes + page;
+    auto &next = driver.next_va[reinterpret_cast<uintptr_t>(c)];
+    if (!next) next = 0x20200000;
+    *out = reinterpret_cast<void *>(next);
+    assert(driver.reservations.emplace(context_key(c, *out), bytes).second);
+    next += bytes + page;
     return ZE_RESULT_SUCCESS;
 }
 ze_result_t ZE_APICALL release(ze_context_handle_t c, const void *address, size_t bytes) {
-    assert(c == owner.context);
-    const auto key = reinterpret_cast<uintptr_t>(address);
+    const auto key = context_key(c, address);
     assert(driver.reservations.count(key) && driver.reservations.at(key) == bytes);
-    for (auto [p, m] : driver.mappings) assert(p < key || p >= key + bytes);
+    for (auto [p, m] : driver.mappings)
+        assert(p.first != key.first || p.second < key.second || p.second >= key.second + bytes);
     auto r = driver.call("free"); if (r) return r;
     driver.reservations.erase(key); return ZE_RESULT_SUCCESS;
 }
 ze_result_t ZE_APICALL create(ze_context_handle_t c, ze_device_handle_t d,
                               ze_physical_mem_desc_t *desc, ze_physical_mem_handle_t *out) {
-    assert(c == owner.context && d == owner.device && desc->size % page == 0);
+    assert(d == owner.device && desc->size % page == 0);
     auto r = driver.call("create"); if (r) return r;
-    *out = reinterpret_cast<ze_physical_mem_handle_t>(driver.next_handle++);
-    driver.backing[*out] = desc->size; return ZE_RESULT_SUCCESS;
+    auto &next = driver.next_handle[reinterpret_cast<uintptr_t>(c)];
+    if (!next) next = 32;
+    *out = reinterpret_cast<ze_physical_mem_handle_t>(next++);
+    assert(driver.backing.emplace(context_key(c, *out), desc->size).second);
+    return ZE_RESULT_SUCCESS;
 }
 ze_result_t ZE_APICALL destroy(ze_context_handle_t c, ze_physical_mem_handle_t h) {
-    assert(c == owner.context && driver.backing.count(h));
-    for (auto [p, m] : driver.mappings) assert(m.second != h);
+    const auto key = context_key(c, h);
+    assert(driver.backing.count(key));
+    for (auto [p, m] : driver.mappings) assert(p.first != key.first || m.second != h);
     auto r = driver.call("destroy"); if (r) return r;
-    driver.backing.erase(h); return ZE_RESULT_SUCCESS;
+    driver.backing.erase(key); return ZE_RESULT_SUCCESS;
 }
 ze_result_t ZE_APICALL map(ze_context_handle_t c, const void *p, size_t n,
                            ze_physical_mem_handle_t h, size_t offset, ze_memory_access_attribute_t access) {
-    assert(c == owner.context && driver.backing.count(h) && n + offset <= driver.backing.at(h));
+    const auto key = context_key(c, h);
+    assert(driver.backing.count(key) && n + offset <= driver.backing.at(key));
     assert(access == ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE);
     auto r = driver.call("map"); if (r) return r;
-    assert(driver.mappings.emplace(reinterpret_cast<uintptr_t>(p), std::make_pair(n, h)).second);
+    assert(driver.mappings.emplace(context_key(c, p), std::make_pair(n, h)).second);
     return ZE_RESULT_SUCCESS;
 }
 ze_result_t ZE_APICALL unmap(ze_context_handle_t c, const void *p, size_t n) {
-    auto key = reinterpret_cast<uintptr_t>(p);
-    assert(c == owner.context && driver.mappings.at(key).first == n);
+    auto key = context_key(c, p);
+    assert(driver.mappings.at(key).first == n);
     auto r = driver.call("unmap"); if (r) return r;
     driver.mappings.erase(key); return ZE_RESULT_SUCCESS;
 }
 ze_result_t ZE_APICALL access(ze_context_handle_t c, const void *, size_t,
                               ze_memory_access_attribute_t flags) {
-    assert(c == owner.context && flags == ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE);
+    assert((c == owner.context || c == other_context.context) &&
+           flags == ZE_MEMORY_ACCESS_ATTRIBUTE_READWRITE);
     return driver.call("access");
 }
 aimdo_xpu::VmmApi api{query, reserve, release, create, destroy, map, unmap, access};
@@ -234,10 +247,52 @@ void concurrency() {
     std::cout << "PASS concurrent_independent_owners\n";
 }
 
+void independent_contexts(const std::string &operation) {
+    driver = {}; VmmManager manager(api);
+    uintptr_t a = 0, b = 0;
+    ze_physical_mem_handle_t ha = nullptr, hb = nullptr;
+    const auto bytes = operation == "partial_cleanup" ? 2 * block : block;
+    assert(manager.reserve(owner, &a, bytes, block, 0, 0) == ZE_RESULT_SUCCESS);
+    assert(manager.reserve(other_context, &b, bytes, block, 0, 0) == ZE_RESULT_SUCCESS);
+    assert(manager.create(owner, &ha, bytes) == ZE_RESULT_SUCCESS);
+    assert(manager.create(other_context, &hb, bytes) == ZE_RESULT_SUCCESS);
+    assert(a == b && ha == hb); // Deliberate numeric reuse in separate mock contexts.
+    assert(manager.map(owner, a, block, ha, 0, 0) == ZE_RESULT_SUCCESS);
+    if (operation == "partial_cleanup") {
+        assert(manager.map(owner, a + block, block, ha, block, 0) == ZE_RESULT_SUCCESS);
+        driver.fail = "unmap"; driver.fail_after = 1;
+        assert(manager.unmap(owner, a, bytes) == driver.error);
+    }
+    if (operation == "map_unmap" || operation == "partial_cleanup") {
+        assert(manager.map(other_context, b, bytes, hb, 0, 0) == ZE_RESULT_SUCCESS);
+        assert(manager.access(other_context, b, bytes) == ZE_RESULT_SUCCESS);
+        // The second context's own mapping still blocks premature release.
+        const auto calls = driver.calls;
+        assert(manager.free(other_context, b, bytes) == ZE_RESULT_ERROR_HANDLE_OBJECT_IN_USE);
+        assert(manager.destroy(other_context, hb) == ZE_RESULT_ERROR_HANDLE_OBJECT_IN_USE);
+        assert(driver.calls == calls);
+        assert(manager.unmap(other_context, b, bytes) == ZE_RESULT_SUCCESS);
+    }
+    if (operation == "free") {
+        assert(manager.free(other_context, b, bytes) == ZE_RESULT_SUCCESS);
+        assert(manager.destroy(other_context, hb) == ZE_RESULT_SUCCESS);
+    } else {
+        assert(manager.destroy(other_context, hb) == ZE_RESULT_SUCCESS);
+        assert(manager.free(other_context, b, bytes) == ZE_RESULT_SUCCESS);
+    }
+    assert(manager.unmap(owner, a, bytes) == ZE_RESULT_SUCCESS);
+    assert(manager.destroy(owner, ha) == ZE_RESULT_SUCCESS);
+    assert(manager.free(owner, a, bytes) == ZE_RESULT_SUCCESS);
+    check(manager, 0, 0, 0);
+    std::cout << "PASS independent_contexts_" << operation << '\n';
+}
+
 int main() {
     for (auto operation : {"page", "reserve", "create", "map", "access", "unmap", "destroy", "free"})
         for (auto error : {ZE_RESULT_ERROR_OUT_OF_DEVICE_MEMORY, ZE_RESULT_ERROR_DEVICE_LOST})
             failure_case(operation, error);
     bounds_and_identity(); partial_cleanup(); concurrency();
-    std::cout << "19 cases passed\n";
+    for (auto operation : {"free", "destroy", "map_unmap", "partial_cleanup"})
+        independent_contexts(operation);
+    std::cout << "23 cases passed\n";
 }

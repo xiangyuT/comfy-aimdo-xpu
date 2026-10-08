@@ -59,6 +59,7 @@ _NATIVE_OWNER_CORE_SYMBOLS = (
     "set_devctx_for_device", "malloc_graph_live_handles",
     "malloc_graph_last_allocation_driver_error", "malloc_graph_note_excluded_allocation",
     "xpu_allocator_get_memory_stats", "xpu_ur_hook_retire_borrowed",
+    "xpu_ur_hook_get_retirement_stats",
 )
 
 

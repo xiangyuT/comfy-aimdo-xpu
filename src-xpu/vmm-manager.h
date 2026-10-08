@@ -121,7 +121,8 @@ public:
         if (r == reservations.end() || r->address != address || r->bytes != bytes)
             return ZE_RESULT_ERROR_INVALID_ARGUMENT;
         for (const auto &m : mappings)
-            if (overlaps(address, bytes, m.address, m.bytes)) return ZE_RESULT_ERROR_HANDLE_OBJECT_IN_USE;
+            if (m.owner.context == owner.context && overlaps(address, bytes, m.address, m.bytes))
+                return ZE_RESULT_ERROR_HANDLE_OBJECT_IN_USE;
         auto result = api.free(owner.context, r->outer, r->outer_bytes);
         if (result == ZE_RESULT_SUCCESS) reservations.erase(r);
         return result;
@@ -156,6 +157,7 @@ public:
             offset > p->bytes - bytes || address % p->page || bytes % p->page || offset % p->page)
             return ZE_RESULT_ERROR_INVALID_ARGUMENT;
         for (const auto &m : mappings) {
+            if (m.owner.context != owner.context) continue;
             if (overlaps(address, bytes, m.address, m.bytes) ||
                 (m.cleanup_bytes && overlaps(address, bytes, m.cleanup_address, m.cleanup_bytes)))
                 return ZE_RESULT_ERROR_HANDLE_OBJECT_IN_USE;
@@ -184,6 +186,7 @@ public:
         if (reservation(owner, address, bytes) == reservations.end()) return ZE_RESULT_ERROR_INVALID_ARGUMENT;
         bool retry = false;
         for (const auto &m : mappings) {
+            if (m.owner.context != owner.context) continue;
             if (m.owner == owner && m.cleanup_address == address && m.cleanup_bytes == bytes) retry = true;
             if (overlaps(address, bytes, m.address, m.bytes) &&
                 (!(m.owner == owner) || !contains(address, bytes, m.address, m.bytes) ||
@@ -213,7 +216,8 @@ public:
         });
         if (p == physical.end()) return ZE_RESULT_ERROR_INVALID_ARGUMENT;
         for (const auto &m : mappings)
-            if (m.handle == handle) return ZE_RESULT_ERROR_HANDLE_OBJECT_IN_USE;
+            if (m.owner.context == owner.context && m.handle == handle)
+                return ZE_RESULT_ERROR_HANDLE_OBJECT_IN_USE;
         auto result = api.destroy(owner.context, handle);
         if (result == ZE_RESULT_SUCCESS) physical.erase(p);
         return result;

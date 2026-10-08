@@ -26,11 +26,13 @@ have a separate owner. This process-lifetime experiment does not change the
 default `native_hook` route or public memory-compiler capability. The proxy's
 private C10/XPU ABI, stream and failure contracts need separate validation
 before it can become a supported allocator path.
-The opt-in sidecar build records SHA-256 for Torch's C10, C10/XPU and
-Torch/XPU shared libraries. Before loading the private proxy, installation
-checks those exact runtime bytes and Torch's CXX11 ABI flag in addition to the
-`2.14.0+xpu` version. A same-version ABI mismatch is rejected before allocator
-installation; this does not make the private ABI a public Torch interface.
+The opt-in sidecar uses the selected Torch headers and CXX11 ABI compiler flag,
+and exports its build release. Torch release support and build admission belong
+to the caller: llm-scaler selects `2.14.0+xpu` and, before packaging, checks that
+the exported release matches installed Torch and the provider declaration.
+AIMDO does not generate an ABI JSON file, compare Torch library hashes, or
+reject same-release Torch binaries based on their bytes. The private C10/XPU
+interface still requires the caller's scoped validation.
 On Linux, `AIMDO_XPU_GRAPH_AVOID_ALIAS=1` makes each newly assigned large
 graph VA use a distinct physical page. This diagnostic option avoids a second
 map of one physical handle on drivers that reject it. It is sampled when a

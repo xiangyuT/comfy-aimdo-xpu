@@ -579,8 +579,7 @@ extern "C" AIMDO_XPU_EXPORT bool xpu_ur_hook_is_interposed() {
 }
 
 namespace {
-void enable_locked() {
-    g_generation.fetch_add(1, std::memory_order_relaxed);
+bool enable_locked() {
     // A new context borrows the accounting of surviving external buffers.
     // Their later free is charged only if this adoption succeeded.
     for (auto &[pointer, allocation] : g_allocations) {
@@ -588,12 +587,27 @@ void enable_locked() {
         if (allocation.retired && !allocation.accounted) {
             allocation.accounted = aimdo_xpu_account_allocation(
                 allocation.device, static_cast<int64_t>(allocation.size));
+            if (!allocation.accounted) {
+                // Roll back completed adoptions. A failed rollback keeps its
+                // accounting marker, so a retry cannot charge it twice.
+                for (auto &[adopted_pointer, adopted] : g_allocations) {
+                    (void)adopted_pointer;
+                    if (adopted.retired && adopted.accounted &&
+                        aimdo_xpu_account_allocation(
+                            adopted.device, -static_cast<int64_t>(adopted.size))) {
+                        adopted.accounted = false;
+                    }
+                }
+                return false;
+            }
         }
     }
+    g_generation.fetch_add(1, std::memory_order_relaxed);
     g_owned_shutdown.store(false, std::memory_order_release);
     g_torch_cached_bytes.clear();
     clear_retry();
     g_enabled.store(true, std::memory_order_release);
+    return true;
 }
 }  // namespace
 
@@ -606,8 +620,7 @@ extern "C" AIMDO_XPU_EXPORT bool xpu_ur_hook_enable() {
     if (g_enabled.load(std::memory_order_relaxed)) {
         return true;
     }
-    enable_locked();
-    return true;
+    return enable_locked();
 }
 
 extern "C" AIMDO_XPU_EXPORT bool xpu_ur_hook_disable() {
