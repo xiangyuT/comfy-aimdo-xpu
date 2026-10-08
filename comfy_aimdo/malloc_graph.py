@@ -1,17 +1,36 @@
 import contextlib
 import ctypes
+from pathlib import Path
+import threading
 
 from . import control
 
+if Path(control.__file__).resolve().parent != Path(__file__).resolve().parent:
+    raise ImportError("AIMDO malloc_graph and control must come from the same provider")
+
 
 class MallocGraph:
-    def __init__(self, handle, stream):
+    def __init__(self, handle, stream, *, owner_thread=None, native_lib=None):
         self._handle = handle
         self._stream = stream
         self._scopes = []
+        self._owner_thread = owner_thread
+        self._native_lib = native_lib
+        self._lifecycle_lock = threading.RLock()
+
+    def _check_owner(self):
+        if self._owner_thread is not None:
+            if threading.current_thread() is not self._owner_thread:
+                raise RuntimeError("AIMDO diagnostic graph requires its owner thread")
+            from . import native_owner
+            native_owner.drain_deferred_graphs()
+        if not self._handle:
+            raise RuntimeError("AIMDO memory graph is closed")
 
     def _call(self, function, *args):
-        result = function(self._handle, *args)
+        with self._lifecycle_lock:
+            self._check_owner()
+            result = function(self._handle, *args)
         if not result:
             raise RuntimeError("aimdo memory compile error")
         return result
@@ -28,8 +47,14 @@ class MallocGraph:
         return broken
 
     def abort(self):
-        self._call(control.lib.malloc_graph_abort)
-        self._scopes.clear()
+        with self._lifecycle_lock:
+            if self._owner_thread is threading.current_thread() and not self._handle:
+                from . import native_owner
+                native_owner.drain_deferred_graphs()
+                self._scopes.clear()
+                return
+            self._call(control.lib.malloc_graph_abort)
+            self._scopes.clear()
 
     def pause(self, sync=False):
         self._call(control.lib.malloc_graph_pause, True, sync)
@@ -39,14 +64,19 @@ class MallocGraph:
 
     @contextlib.contextmanager
     def use_stream(self, stream):
-        previous = self._stream
-        self._call(control.lib.malloc_graph_set_stream, ctypes.c_void_p(stream.cuda_stream))
-        self._stream = stream
-        try:
-            yield
-        finally:
-            self._call(control.lib.malloc_graph_set_stream, ctypes.c_void_p(previous.cuda_stream))
-            self._stream = previous
+        with self._lifecycle_lock:
+            previous = self._stream
+            pointer = (int(stream.sycl_queue) if control.implementation == "xpu"
+                       else int(stream.cuda_stream))
+            self._call(control.lib.malloc_graph_set_stream, ctypes.c_void_p(pointer))
+            self._stream = stream
+            try:
+                yield
+            finally:
+                pointer = (int(previous.sycl_queue) if control.implementation == "xpu"
+                           else int(previous.cuda_stream))
+                self._call(control.lib.malloc_graph_set_stream, ctypes.c_void_p(pointer))
+                self._stream = previous
 
     def iterate(self, name=None):
         broken = False
@@ -61,18 +91,72 @@ class MallocGraph:
         return broken
 
     def _stat(self, which):
-        return control.lib.malloc_graph_stat(self._handle, which)
+        with self._lifecycle_lock:
+            self._check_owner()
+            return control.lib.malloc_graph_stat(self._handle, which)
 
     peak_used = property(lambda self: self._stat(0))
     virtual_bytes = property(lambda self: self._stat(1))
     physical_bytes = property(lambda self: self._stat(2))
     rogue_count = property(lambda self: self._stat(3))
+    skipped_replays = property(lambda self: self._stat(4))
+
+    def close(self):
+        """Close on the owner thread, or queue a diagnostic close to that thread."""
+        with self._lifecycle_lock:
+            handle = self._handle
+            if not handle:
+                if self._owner_thread is threading.current_thread():
+                    from . import native_owner
+                    native_owner.drain_deferred_graphs()
+                return True
+            if self._owner_thread is not None:
+                from . import native_owner
+
+                if threading.current_thread() is not self._owner_thread:
+                    native_owner._defer_graph_destroy(
+                        self._owner_thread, self._native_lib, handle
+                    )
+                    self._handle = None
+                    if not self._owner_thread.is_alive():
+                        raise RuntimeError(native_owner._DEAD_OWNER_ERROR)
+                    return False
+                native_owner.drain_deferred_graphs()
+                if native_owner._destroy_graph_terminal(self._native_lib, handle):
+                    raise RuntimeError(
+                        "terminal AIMDO graph destroy error; process must exit"
+                    )
+                if not native_owner._destroy_graph_checked(self._native_lib, handle):
+                    if native_owner._destroy_graph_terminal(self._native_lib, handle):
+                        raise RuntimeError(
+                            "terminal AIMDO graph destroy error; process must exit"
+                        )
+                    raise RuntimeError("AIMDO diagnostic graph destroy failed")
+            else:
+                if control.lib is None:
+                    raise RuntimeError("AIMDO library is no longer initialized")
+                control.lib.malloc_graph_destroy(handle)
+            self._handle = None
+            return True
 
     def __del__(self):
         handle = getattr(self, "_handle", None)
-        if handle and control.lib is not None:
-            control.lib.malloc_graph_destroy(handle)
-            self._handle = None
+        if not handle:
+            return
+        try:
+            self.close()
+        except Exception:
+            if getattr(self, "_handle", None) != handle:
+                return
+            owner = getattr(self, "_owner_thread", None)
+            library = getattr(self, "_native_lib", None)
+            if owner is not None and library is not None:
+                try:
+                    from . import native_owner
+                    native_owner._defer_graph_destroy(owner, library, handle)
+                    self._handle = None
+                except Exception:
+                    pass
 
 
 def record(stream, assert_graph_breaks=False):

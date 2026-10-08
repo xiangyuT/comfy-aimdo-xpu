@@ -11,6 +11,8 @@ import io
 import json
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import time
 import zipfile
@@ -27,6 +29,120 @@ ENTRY_POINT_GROUP = "comfyui_omnixpu.runtime_providers"
 SOURCE_REPOSITORY = "https://github.com/xiangyuT/comfy-aimdo-xpu.git"
 SUPPORTED_PLATFORMS = ("linux", "win32")
 _REVISION_PATTERN = re.compile(r"[0-9a-f]{40}")
+_COMPILER_SYMBOLS = (
+    "malloc_graph_create", "malloc_graph_push", "malloc_graph_pop",
+    "malloc_graph_pause", "malloc_graph_set_stream", "malloc_graph_abort",
+    "malloc_graph_stat", "malloc_graph_destroy", "malloc_graph_abi_version",
+    "malloc_graph_capabilities", "malloc_graph_source_revision",
+    "malloc_graph_source_content_sha256",
+)
+_NATIVE_OWNER_SYMBOLS = (
+    "aimdo_full_proxy_torch_version", "aimdo_full_proxy_is_installed",
+    "aimdo_full_proxy_install", "aimdo_full_proxy_test_fail_next_compiler_owner_insert",
+    "aimdo_full_proxy_test_duplicate_next_compiler_pointer",
+    "aimdo_full_proxy_compiler_begin",
+    "aimdo_full_proxy_compiler_end", "aimdo_full_proxy_snapshot",
+    "aimdo_full_proxy_scoped_raw_snapshot", "aimdo_full_proxy_is_compiler_owner",
+    "aimdo_full_proxy_drain_deferred_frees",
+    "aimdo_full_proxy_deferred_free_count", "aimdo_full_proxy_dead_deferred_free_count",
+    "aimdo_full_proxy_transition_begin", "aimdo_full_proxy_transition_end",
+    "aimdo_full_proxy_native_cache_empty", "aimdo_full_proxy_transition_ready",
+)
+_NATIVE_OWNER_CORE_SYMBOLS = (
+    "malloc_graph_free_owned", "malloc_graph_test_fail_next_page_creates",
+    "malloc_graph_destroy_checked",
+    "malloc_graph_destroy_terminal",
+    "malloc_graph_test_fail_next_destroy_release",
+    "malloc_graph_test_arm_driver_release",
+    "aimdo_xpu_test_arm_vmm_release", "aimdo_xpu_test_pending_vmm_release",
+    "malloc_graph_alloc", "malloc_graph_free", "free_rogue",
+    "set_devctx_for_device", "malloc_graph_live_handles",
+    "malloc_graph_last_allocation_driver_error", "malloc_graph_note_excluded_allocation",
+    "xpu_allocator_get_memory_stats", "xpu_ur_hook_retire_borrowed",
+    "xpu_ur_hook_get_retirement_stats",
+)
+
+
+def _compiler_api_contract(source_version, files):
+    """Admit the finite D0 API boundary only with a complete native payload.
+
+    This records API compatibility, not an executable memory compiler. Runtime
+    control.init() separately checks the ABI and keeps XPU recording disabled.
+    Legacy payloads retain their original exact-version contract.
+    """
+    prefix = CANONICAL_PACKAGE + "/"
+    if prefix + "malloc_graph.py" not in files:
+        return None
+    required = {prefix + name + ".py" for name in
+                ("control", "malloc_graph", "host_buffer", "model_vbar", "vram_buffer", "torch")}
+    if not required.issubset(files):
+        raise RuntimeError("compiler-aware provider has an incomplete Python module set")
+    native = [(name, data) for name, data in files.items()
+              if PurePosixPath(name).name == "aimdo_xpu.so"]
+    if not native:
+        # This task integrates the Linux D1 payload only. Preserve the existing
+        # exact-version Windows provider until its native build is reviewed.
+        return None
+    if source_version != "0.5.5":
+        raise RuntimeError("Linux compiler API compatibility requires reviewed AIMDO 0.5.5")
+    for name, data in native:
+        with tempfile.TemporaryDirectory(prefix="aimdo-abi-inspect-") as temporary:
+            path = Path(temporary) / PurePosixPath(name).name
+            path.write_bytes(data)
+            tool = shutil.which("nm")
+            command = [tool, "-D", "--defined-only", str(path)] if tool else None
+            if command is None:
+                raise RuntimeError("Linux native export inspection requires nm")
+            inspected = subprocess.run(command, capture_output=True, text=True, check=True)
+            symbols = set(inspected.stdout.split())
+            missing = set(_COMPILER_SYMBOLS) - symbols
+            if missing:
+                raise RuntimeError("compiler-aware provider is missing native exports: " + ", ".join(sorted(missing)))
+    return {"schema_version": 1, "compiler_abi_revision": 1,
+            "upstream_reference_revision": "3b8e8c162efeb9470d912609a7a6e7a2b1c693ec",
+            "canonical_versions": ["0.5.5"],
+            "required_modules": sorted(required), "required_native_symbols": list(_COMPILER_SYMBOLS),
+            "xpu_recording_supported": False}
+
+
+def _native_owner_diagnostic_contract(source_version, torch_version, files):
+    """Bind the optional D2 sidecar without declaring compiler availability."""
+    native = f"{CANONICAL_PACKAGE}/aimdo_xpu_native_owner.so"
+    if native not in files:
+        return None
+    if source_version != "0.5.5":
+        raise RuntimeError("native-owner diagnostic requires the AIMDO 0.5.5 compiler core")
+    if f"{CANONICAL_PACKAGE}/native_owner.py" not in files:
+        raise RuntimeError("native-owner diagnostic Python module is missing")
+    with tempfile.TemporaryDirectory(prefix="aimdo-native-owner-inspect-") as temporary:
+        tool = shutil.which("nm")
+        if tool is None:
+            raise RuntimeError("native-owner export inspection requires nm")
+        for filename, required in (
+            (native, _NATIVE_OWNER_SYMBOLS),
+            (f"{CANONICAL_PACKAGE}/aimdo_xpu.so", _NATIVE_OWNER_CORE_SYMBOLS),
+        ):
+            if filename not in files:
+                raise RuntimeError("native-owner diagnostic is missing " + filename)
+            path = Path(temporary) / PurePosixPath(filename).name
+            path.write_bytes(files[filename])
+            inspected = subprocess.run(
+                [tool, "-D", "--defined-only", str(path)],
+                capture_output=True, text=True, check=True,
+            )
+            missing = set(required) - set(inspected.stdout.split())
+            if missing:
+                raise RuntimeError(
+                    "native-owner diagnostic is missing exports: " +
+                    ", ".join(sorted(missing))
+                )
+    return {
+        "enabled_by_default": False,
+        "environment_flag": "AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC",
+        "torch_version": torch_version,
+        "path": f"{PROVIDER_PACKAGE}/_vendor/{native}",
+        "sha256": _sha256(files[native]),
+    }
 
 
 def _sha256(data: bytes) -> str:
@@ -147,6 +263,8 @@ def _manifest(
     torch_version: str,
     xpu_target: str,
     vendored_files: dict[str, bytes],
+    compiler_api: dict | None = None,
+    native_owner_diagnostic: dict | None = None,
 ) -> dict[str, object]:
     file_hashes = {
         name: _sha256(data) for name, data in sorted(vendored_files.items())
@@ -166,7 +284,7 @@ def _manifest(
         "provider_package": PROVIDER_PACKAGE,
         "canonical_distribution": {
             "name": CANONICAL_DISTRIBUTION,
-            "compatible_versions": [source_version],
+            "compatible_versions": compiler_api["canonical_versions"] if compiler_api else [source_version],
         },
         "canonical_import": CANONICAL_PACKAGE,
         "source": {
@@ -194,6 +312,9 @@ def _manifest(
         "vendor_root": f"{PROVIDER_PACKAGE}/_vendor",
         "vendored_files": file_hashes,
         "native_artifacts": native_artifacts,
+        **({"api_compatibility": compiler_api} if compiler_api else {}),
+        **({"native_owner_diagnostic": native_owner_diagnostic}
+           if native_owner_diagnostic else {}),
     }
 
 
@@ -222,6 +343,10 @@ def build_provider_wheel(
         tags,
         source_files,
     ) = _source_wheel_contract(source_wheel)
+    compiler_api = _compiler_api_contract(source_version, source_files)
+    native_owner_diagnostic = _native_owner_diagnostic_contract(
+        source_version, torch_version, source_files
+    )
     vendored_files = {
         f"{PROVIDER_PACKAGE}/_vendor/{name}": data
         for name, data in source_files.items()
@@ -233,6 +358,8 @@ def build_provider_wheel(
         torch_version=torch_version,
         xpu_target=xpu_target,
         vendored_files=vendored_files,
+        compiler_api=compiler_api,
+        native_owner_diagnostic=native_owner_diagnostic,
     )
 
     dist_info = (
@@ -301,6 +428,9 @@ def build_provider_wheel(
         ) as archive:
             for name, data in sorted(contents.items()):
                 archive.writestr(_zip_info(name), data)
+        # The temporary file starts at 0600. The wheel is a distributable
+        # artifact and must remain readable outside a root-run build container.
+        temporary_path.chmod(0o644)
         temporary_path.replace(destination)
     finally:
         if temporary_path.exists():

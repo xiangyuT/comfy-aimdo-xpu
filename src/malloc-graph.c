@@ -1,6 +1,13 @@
 #include "plat.h"
 #include "malloc-rogue.h"
 #include "vmm-ref.h"
+#if defined(AIMDO_XPU) && !defined(_WIN32) && !defined(_WIN64)
+#include <stdatomic.h>
+static _Atomic uint64_t live_graph_handles;
+SHARED_EXPORT uint64_t malloc_graph_live_handles(void) {
+    return atomic_load(&live_graph_handles);
+}
+#endif
 
 #define MG_PAGE (8ULL * M)
 #define MG_PAGES 8192ULL
@@ -50,6 +57,7 @@ struct Event {
     Event *previous;
     Event *allocation_previous;
     bool rogue_owned;
+    bool freed_out_of_scope;
     AllocationState *snapshot;
     SmallRange *small_snapshot;
 };
@@ -60,6 +68,9 @@ struct State {
     uint32_t depth;
     bool recording;
     bool broken;
+#ifdef AIMDO_XPU
+    size_t excluded_allocations;
+#endif
 
     State *next;
 };
@@ -113,6 +124,9 @@ typedef struct {
     size_t used;
     size_t peak_used;
     size_t rogue_count;
+#ifdef AIMDO_XPU
+    uint64_t skipped_root_replays;
+#endif
 
     bool failed;
     bool complete;
@@ -121,6 +135,12 @@ typedef struct {
     bool assert_breaks;
     bool handoff_attempted;
     bool aborted;
+#ifdef AIMDO_XPU
+    bool avoid_physical_alias;
+    unsigned test_page_create_oom_attempts;
+    unsigned test_destroy_release_stage;
+    bool destroy_terminal;
+#endif
 } MallocGraph;
 
 static _Thread_local MallocGraph *active_graph;
@@ -301,12 +321,21 @@ static bool collect_rogue_candidates(MallocGraph *g) {
 
     while (allocation) {
         Event *previous = allocation->allocation_previous;
-        if (!register_rogue_candidate(candidate_ptr(g, allocation))) {
+        CUdeviceptr pointer = candidate_ptr(g, allocation);
+        if (!register_rogue_candidate(pointer)) {
             g->failed = true;
             return false;
         }
+        if (allocation->freed_out_of_scope) {
+            int result = -1;
+            if (!free_rogue(pointer, &result) || result != CUDA_SUCCESS) {
+                unregister_rogue_candidate(pointer);
+                g->failed = true;
+                return false;
+            }
+        }
         if (!sever_event(g, allocation)) {
-            unregister_rogue_candidate(candidate_ptr(g, allocation));
+            unregister_rogue_candidate(pointer);
             return false;
         }
         allocation->allocation_previous = g->rogue_candidates;
@@ -420,15 +449,35 @@ static bool push_stack(MallocGraph *g, Event *scope, bool recording) {
     return true;
 }
 
+static CUresult alloc_graph_page(MallocGraph *g, PhysicalPage **page) {
+#ifdef AIMDO_XPU
+    if (g->test_page_create_oom_attempts) {
+        g->test_page_create_oom_attempts--;
+        return CUDA_ERROR_OUT_OF_MEMORY;
+    }
+#endif
+    return physical_page_alloc(page, MG_PAGE, g->device);
+}
+
+#ifdef AIMDO_XPU
+static _Thread_local CUresult last_allocation_driver_error;
+SHARED_EXPORT int malloc_graph_last_allocation_driver_error(void) {
+    return (int)last_allocation_driver_error;
+}
+#endif
+
 static CUresult create_page(MallocGraph *g, PhysicalPage **page) {
     CUresult r;
 
     vbars_free(budget_deficit(MG_PAGE));
-    r = physical_page_alloc(page, MG_PAGE, g->device);
+    r = alloc_graph_page(g, page);
     if (r == CUDA_ERROR_OUT_OF_MEMORY) {
         vbars_free(MG_PAGE);
-        r = physical_page_alloc(page, MG_PAGE, g->device);
+        r = alloc_graph_page(g, page);
     }
+#ifdef AIMDO_XPU
+    if (r) last_allocation_driver_error = r;
+#endif
     return r;
 }
 
@@ -447,6 +496,9 @@ static CUresult map_reference(MallocGraph *g, CUdeviceptr address,
         result = cuMemSetAccess(address, MG_PAGE, &access, 1);
     }
     if (result) {
+#ifdef AIMDO_XPU
+        last_allocation_driver_error = result;
+#endif
         physical_page_unref(reference);
     } else {
         *mapping = reference;
@@ -864,6 +916,9 @@ static size_t small_allocation_offset(MallocGraph *g, size_t bytes) {
 }
 
 bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
+#ifdef AIMDO_XPU
+    last_allocation_driver_error = CUDA_SUCCESS;
+#endif
     MallocGraph *g = active_graph;
 
     if (!g || graph_failed(g) || g->paused || stream != g->stream) {
@@ -964,11 +1019,16 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
 
     for (size_t j = 0; j < pages; j++) {
         if (g->va_phys[va + j] < 0) {
-            size_t p = 0;
-            while (p < g->phys_count &&
+            bool reuse_physical = true;
+#ifdef AIMDO_XPU
+            reuse_physical = !g->avoid_physical_alias;
+#endif
+            size_t p = reuse_physical ? 0 : g->phys_count;
+            while (reuse_physical && p < g->phys_count &&
                    (g->allocations.physical_live[p] || rogue_phys(g, p))) {
                 p++;
             }
+            RETURN_G_FAILED(p >= MG_PAGES, true);
             RETURN_G_FAILED(map_page(g, va + j, p), true);
         }
         g->allocations.physical_live[g->va_phys[va + j]] = true;
@@ -983,6 +1043,16 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
     *ptr = virtual_range_get(g->base) + va * MG_PAGE;
     return true;
 }
+
+#ifdef AIMDO_XPU
+SHARED_EXPORT void malloc_graph_note_excluded_allocation(CUstream owner_stream) {
+    MallocGraph *g = active_graph;
+    if (g && g->stream == owner_stream && !g->paused && !graph_failed(g) && g->state &&
+        !g->state->recording && !g->state->next && g->state->cursor == &g->root) {
+        g->state->excluded_allocations++;
+    }
+}
+#endif
 
 bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
     MallocGraph *g = active_graph;
@@ -1016,8 +1086,15 @@ bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
         while (*entry && (*entry)->offset != value) {
             entry = &(*entry)->next;
         }
-        RETURN_G_FAILED(!*entry || (*entry)->owner_depth != g->state->depth ||
-                        !event(g, EV_FREE_SMALL, value, 0) ||
+        RETURN_G_FAILED(!*entry || !(*entry)->allocation, true);
+        if ((*entry)->owner_depth != g->state->depth) {
+            /* The DataPtr has gone away even though this graph event is invalid.
+             * Abort must hand off a freed candidate, not an orphaned rogue. */
+            (*entry)->allocation->freed_out_of_scope = true;
+            g->failed = true;
+            return true;
+        }
+        RETURN_G_FAILED(!event(g, EV_FREE_SMALL, value, 0) ||
                         !untrack_allocation(g, (*entry)->allocation), true);
 
         SmallRange *range = *entry;
@@ -1028,8 +1105,13 @@ bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
     }
 
     VirtualPage *first = &g->allocations.virtual_pages[value];
-    RETURN_G_FAILED(first->owner_depth != g->state->depth || !first->va_span ||
-                    !event(g, EV_FREE, value, 0) ||
+    RETURN_G_FAILED(!first->va_span || !first->allocation, true);
+    if (first->owner_depth != g->state->depth) {
+        first->allocation->freed_out_of_scope = true;
+        g->failed = true;
+        return true;
+    }
+    RETURN_G_FAILED(!event(g, EV_FREE, value, 0) ||
                     !untrack_allocation(g, first->allocation), true);
 
     for (size_t j = 0; j < first->va_span; j++) {
@@ -1039,6 +1121,58 @@ bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
     *first = (VirtualPage){};
     return true;
 }
+
+#ifdef AIMDO_XPU
+SHARED_EXPORT bool malloc_graph_test_fail_next_page_creates(unsigned attempts) {
+    MallocGraph *g = active_graph;
+    if (!g || g->owner_thread != &active_graph || g->failed || g->paused ||
+        !g->state || g->test_page_create_oom_attempts ||
+        attempts < 1 || attempts > 2) {
+        return false;
+    }
+    g->test_page_create_oom_attempts = attempts;
+    return true;
+}
+
+SHARED_EXPORT bool malloc_graph_test_fail_next_destroy_release(void *handle,
+                                                                unsigned stage) {
+    MallocGraph *g = handle;
+    if (!g || g->owner_thread != &active_graph || !g->complete || g->state ||
+        g->test_destroy_release_stage || stage < 1 || stage > 3) {
+        return false;
+    }
+    g->test_destroy_release_stage = stage;
+    return true;
+}
+
+SHARED_EXPORT bool malloc_graph_test_arm_driver_release(void *handle,
+                                                         unsigned stage,
+                                                         unsigned error_kind) {
+    MallocGraph *g = handle;
+    if (!g || g->owner_thread != &active_graph || !g->complete || g->state ||
+        stage < 1 || stage > 3 || error_kind < 1 || error_kind > 2) {
+        return false;
+    }
+    return aimdo_xpu_test_arm_vmm_release(stage, error_kind);
+}
+
+SHARED_EXPORT bool malloc_graph_free_owned(CUdeviceptr ptr, CUstream owner_stream,
+                                           int *result) {
+    MallocGraph *g = active_graph;
+    if (!g || g->owner_thread != &active_graph || graph_failed(g) ||
+        g->paused || !owner_stream) {
+        return false;
+    }
+    /* The native-owner sidecar has already waited the allocation queue and
+     * every registered consumer before calling this XPU-only entry point.
+     * Restore graph routing even if the free reports an event mismatch. */
+    CUstream previous = g->stream;
+    g->stream = owner_stream;
+    bool handled = malloc_graph_free(ptr, owner_stream, result);
+    g->stream = previous;
+    return handled;
+}
+#endif
 
 SHARED_EXPORT void *malloc_graph_create(void *devctx, CUstream stream, bool assert_breaks) {
     MallocGraph *g = calloc(1, sizeof(*g));
@@ -1053,6 +1187,10 @@ SHARED_EXPORT void *malloc_graph_create(void *devctx, CUstream stream, bool asse
     g->device = g_devctx->_device_id;
     g->owner_thread = &active_graph;
     g->assert_breaks = assert_breaks;
+#ifdef AIMDO_XPU
+    const char *avoid_alias = getenv("AIMDO_XPU_GRAPH_AVOID_ALIAS");
+    g->avoid_physical_alias = avoid_alias && strcmp(avoid_alias, "1") == 0;
+#endif
 
     if (!(g->base = virtual_range_alloc(MG_PAGES * MG_PAGE, MG_PAGE))) {
         goto fail;
@@ -1069,6 +1207,9 @@ SHARED_EXPORT void *malloc_graph_create(void *devctx, CUstream stream, bool asse
         goto fail_small_address;
     }
     active_graph = g;
+#if defined(AIMDO_XPU) && !defined(_WIN32) && !defined(_WIN64)
+    atomic_fetch_add(&live_graph_handles, 1);
+#endif
     return g;
 
 fail_small_address:
@@ -1163,6 +1304,22 @@ SHARED_EXPORT int malloc_graph_pop(void *handle) {
         return false;
     }
 
+#ifdef AIMDO_XPU
+    // This root received only requests excluded by the owner queue. It did
+    // not participate in compilation, so preserve the previous event tree.
+    // A partial compiler sequence or ordinary missing-allocation frame still
+    // follows the existing break rules below.
+    if (!g->state->recording && !g->state->next &&
+        g->state->cursor == &g->root && g->state->excluded_allocations) {
+        free(g->state);
+        g->state = NULL;
+        g->complete = true;
+        active_graph = NULL;
+        g->skipped_root_replays++;
+        return 1;
+    }
+#endif
+
     if (!g->state->recording) {
         Event *end = find_event(g, EV_END, 0, 0, NULL);
         if (end) {
@@ -1216,6 +1373,10 @@ SHARED_EXPORT uint64_t malloc_graph_stat(void *handle, int which) {
         return (g->phys_count + g->small_pages) * MG_PAGE;
     case 3:
         return g->rogue_count;
+#ifdef AIMDO_XPU
+    case 4:
+        return g->skipped_root_replays;
+#endif
     default:
         return 0;
     }
@@ -1239,15 +1400,38 @@ static void free_events(Event **events, size_t count) {
     free(events);
 }
 
-SHARED_EXPORT void malloc_graph_destroy(void *handle) {
+#ifdef AIMDO_XPU
+static bool release_graph_page(PhysicalPage **page, MallocGraph *g) {
+    CUresult result = physical_page_unref(*page);
+    if (result == CUDA_SUCCESS) {
+        *page = NULL;
+        return true;
+    }
+    if (result != CUDA_ERROR_OUT_OF_MEMORY) {
+        g->destroy_terminal = true;
+    }
+    return false;
+}
+
+SHARED_EXPORT bool malloc_graph_destroy_terminal(void *handle) {
+    MallocGraph *g = handle;
+    return g && g->owner_thread == &active_graph && g->destroy_terminal;
+}
+#endif
+
+static bool destroy_graph(void *handle) {
     MallocGraph *g = handle;
 
     if (!g || g->owner_thread != &active_graph) {
-        return;
+        return false;
     }
 
+#ifdef AIMDO_XPU
+    if (g->destroy_terminal) return false;
+#endif
+
     if (g->state && !abort_graph(g)) {
-        return;
+        return false;
     }
 
     while (g->state) {
@@ -1256,6 +1440,69 @@ SHARED_EXPORT void malloc_graph_destroy(void *handle) {
         free(state);
     }
 
+#ifdef AIMDO_XPU
+    /* Keep failed releases reachable for a later retry on the owner thread. */
+    bool released = true;
+    for (size_t i = 0; i < g->va_count; i++) {
+        if (g->mapped_pages[i]) {
+            if (!release_graph_page(&g->mapped_pages[i], g)) {
+                if (g->destroy_terminal) return false;
+                released = false;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < g->phys_count; i++) {
+        if (g->physical_pages[i]) {
+            if (!release_graph_page(&g->physical_pages[i], g)) {
+                if (g->destroy_terminal) return false;
+                released = false;
+            }
+        }
+    }
+
+    for (size_t i = 0; i < g->small_pages; i++) {
+        if (g->small_mapped_pages[i]) {
+            if (g->test_destroy_release_stage == 1) {
+                g->test_destroy_release_stage = 0;
+                released = false;
+            } else if (!release_graph_page(&g->small_mapped_pages[i], g)) {
+                if (g->destroy_terminal) return false;
+                released = false;
+            }
+        }
+        if (g->small_physical_pages[i]) {
+            if (g->test_destroy_release_stage == 2) {
+                g->test_destroy_release_stage = 0;
+                released = false;
+            } else if (!release_graph_page(&g->small_physical_pages[i], g)) {
+                if (g->destroy_terminal) return false;
+                released = false;
+            }
+        }
+    }
+    if (!released) return false;
+    if (g->test_destroy_release_stage == 3) {
+        g->test_destroy_release_stage = 0;
+        return false;
+    }
+    if (g->base) {
+        CUresult result = virtual_range_unref(g->base);
+        if (result != CUDA_SUCCESS) {
+            if (result != CUDA_ERROR_OUT_OF_MEMORY) g->destroy_terminal = true;
+            return false;
+        }
+        g->base = NULL;
+    }
+    if (g->small_base) {
+        CUresult result = virtual_range_unref(g->small_base);
+        if (result != CUDA_SUCCESS) {
+            if (result != CUDA_ERROR_OUT_OF_MEMORY) g->destroy_terminal = true;
+            return false;
+        }
+        g->small_base = NULL;
+    }
+#else
     for (size_t i = 0; i < g->va_count; i++) {
         if (g->mapped_pages[i]) {
             physical_page_unref(g->mapped_pages[i]);
@@ -1273,10 +1520,36 @@ SHARED_EXPORT void malloc_graph_destroy(void *handle) {
 
     virtual_range_unref(g->base);
     virtual_range_unref(g->small_base);
+#endif
     free_small_ranges(g->root.small_snapshot);
     free_small_ranges(g->small_ranges);
     free_small_ranges(g->small_unusable);
     free(g->root.snapshot);
     free_events(g->root.next, g->root.next_count);
+#if defined(AIMDO_XPU) && !defined(_WIN32) && !defined(_WIN64)
+    atomic_fetch_sub(&live_graph_handles, 1);
+#endif
     free(g);
+    return true;
 }
+
+SHARED_EXPORT void malloc_graph_destroy(void *handle) {
+    (void)destroy_graph(handle);
+}
+
+#ifdef AIMDO_XPU
+SHARED_EXPORT bool malloc_graph_destroy_checked(void *handle) {
+    return destroy_graph(handle);
+}
+#endif
+
+/* A built core is not an installed logical-allocation router. */
+SHARED_EXPORT uint32_t malloc_graph_abi_version(void) { return 1; }
+SHARED_EXPORT uint64_t malloc_graph_capabilities(void) { return 1; }
+
+#ifndef AIMDO_SOURCE_REVISION
+#define AIMDO_SOURCE_REVISION "unrecorded"
+#define AIMDO_SOURCE_CONTENT_SHA256 "unrecorded"
+#endif
+SHARED_EXPORT const char *malloc_graph_source_revision(void) { return AIMDO_SOURCE_REVISION; }
+SHARED_EXPORT const char *malloc_graph_source_content_sha256(void) { return AIMDO_SOURCE_CONTENT_SHA256; }

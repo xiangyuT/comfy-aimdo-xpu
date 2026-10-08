@@ -16,6 +16,9 @@ std::atomic<int64_t> g_evicted_bytes{0};
 std::atomic<uintptr_t> g_next_pointer{0x10000000};
 std::atomic<int> g_alloc_failures{0};
 std::atomic<bool> g_account_fail{false};
+std::atomic<int> g_account_fail_after{-1};
+std::atomic<bool> g_account_rollback_fail{false};
+std::atomic<bool> g_free_fail{false};
 
 ur_result_t fake_device_alloc(
     ur_context_handle_t,
@@ -39,6 +42,7 @@ ur_result_t fake_device_alloc(
 
 ur_result_t fake_free(ur_context_handle_t, void *) {
     g_real_free_calls.fetch_add(1, std::memory_order_relaxed);
+    if (g_free_fail.load()) return UR_RESULT_ERROR_OUT_OF_HOST_MEMORY;
     return UR_RESULT_SUCCESS;
 }
 
@@ -60,6 +64,14 @@ void reset_state() {
     g_cache_lever_skipped_calls.store(0);
     g_alloc_failures.store(0);
     g_account_fail.store(false);
+    g_account_fail_after.store(-1);
+    g_account_rollback_fail.store(false);
+    g_free_fail.store(false);
+    g_owned_shutdown.store(false);
+    g_owned_usm_depth = 0;
+    g_retired_live_count.store(0);
+    for (auto &stat : g_retirement_stats) stat.store(0);
+    g_test_retirement_ready = false;
     clear_retry();
     for (auto &stat : g_stats) {
         stat.store(0, std::memory_order_relaxed);
@@ -79,8 +91,159 @@ void reset_state() {
 }
 
 void enable_for_test(uint64_t generation = 1) {
-    g_generation.store(generation, std::memory_order_relaxed);
-    g_enabled.store(true, std::memory_order_release);
+    std::lock_guard<std::mutex> guard(g_hook_mutex);
+    g_generation.store(generation - 1, std::memory_order_relaxed);
+    assert(enable_locked());
+}
+
+bool try_enable_for_test() {
+    std::lock_guard<std::mutex> guard(g_hook_mutex);
+    return enable_locked();
+}
+
+void test_failed_retired_adoption_keeps_hook_disabled() {
+    reset_state();
+    enable_for_test();
+    void *pointer = reinterpret_cast<void *>(0xf1);
+    assert(account_success(pointer, 8192, 0) == AccountResult::kSuccess);
+    g_test_retirement_ready = true;
+    assert(xpu_ur_hook_retire_borrowed());
+    g_accounted_bytes.store(0);
+    const auto generation = g_generation.load();
+    g_account_fail.store(true);
+    assert(!try_enable_for_test());
+    assert(!g_enabled.load() && g_owned_shutdown.load());
+    assert(g_generation.load() == generation && g_accounted_bytes.load() == 0);
+    assert(!g_allocations.at(pointer).accounted);
+    // An unadopted late free never consults the failed context's budget.
+    assert(urUSMFree(reinterpret_cast<ur_context_handle_t>(0xf2), pointer) == UR_RESULT_SUCCESS);
+    assert(g_allocations.empty() && g_accounted_bytes.load() == 0);
+    g_account_fail.store(false);
+    assert(try_enable_for_test() && g_enabled.load());
+}
+
+void test_partial_retired_adoption_retry(bool rollback_fails, bool retire_failed_context = false) {
+    reset_state();
+    enable_for_test();
+    void *first = reinterpret_cast<void *>(0xf3);
+    void *second = reinterpret_cast<void *>(0xf4);
+    assert(account_success(first, 8192, 0) == AccountResult::kSuccess);
+    assert(account_success(second, 4096, 0) == AccountResult::kSuccess);
+    g_test_retirement_ready = true;
+    assert(xpu_ur_hook_retire_borrowed());
+    g_accounted_bytes.store(0);
+    g_account_fail_after.store(1);
+    g_account_rollback_fail.store(rollback_fails);
+    assert(!try_enable_for_test());
+    assert(!g_enabled.load() && g_owned_shutdown.load());
+    size_t retained = 0;
+    for (const auto &[pointer, allocation] : g_allocations) {
+        (void)pointer;
+        if (allocation.accounted) retained += allocation.size;
+    }
+    assert(g_accounted_bytes.load() == static_cast<int64_t>(retained));
+    assert(rollback_fails ? retained > 0 : retained == 0);
+    const auto context = reinterpret_cast<ur_context_handle_t>(0xf5);
+    if (retire_failed_context) {
+        assert(xpu_ur_hook_retire_borrowed());
+        g_accounted_bytes.store(0); // Failed initialization destroys its context.
+        g_account_fail.store(true);
+        assert(urUSMFree(context, first) == UR_RESULT_SUCCESS);
+        assert(urUSMFree(context, second) == UR_RESULT_SUCCESS);
+        assert(g_allocations.empty() && g_accounted_bytes.load() == 0);
+        return;
+    }
+    g_account_fail_after.store(-1);
+    g_account_rollback_fail.store(false);
+    assert(try_enable_for_test() && g_enabled.load());
+    assert(g_accounted_bytes.load() == 12288); // No duplicate adoption charge.
+    assert(urUSMFree(context, first) == UR_RESULT_SUCCESS);
+    assert(urUSMFree(context, second) == UR_RESULT_SUCCESS);
+    assert(g_allocations.empty() && g_accounted_bytes.load() == 0);
+}
+
+void test_retired_free_does_not_access_destroyed_context() {
+    reset_state();
+    enable_for_test();
+    const auto context = reinterpret_cast<ur_context_handle_t>(0xe1);
+    void *pointer = reinterpret_cast<void *>(0xe2);
+    assert(account_success(pointer, 8192, 0) == AccountResult::kSuccess);
+    assert(!xpu_ur_hook_disable());
+    assert(!xpu_ur_hook_retire_borrowed()); // No sidecar ownership proof.
+    g_test_retirement_ready = true;
+    assert(xpu_ur_hook_retire_borrowed());
+    assert(!g_enabled.load() && g_allocations.size() == 1);
+    assert(g_stats[kTrackedFreeBytes].load() == 0); // Retirement is not a free.
+    g_accounted_bytes.store(0); // The old context has been destroyed.
+    g_account_fail.store(true); // Any late accounting would be invalid.
+    g_free_fail.store(true);
+    assert(urUSMFree(context, pointer) != UR_RESULT_SUCCESS);
+    assert(g_allocations.size() == 1 && g_retired_live_count.load() == 1);
+    g_free_fail.store(false);
+    assert(urUSMFree(context, pointer) == UR_RESULT_SUCCESS);
+    assert(g_accounted_bytes.load() == 0 && g_allocations.empty());
+    assert(g_retirement_stats[3].load() == 1 && g_retirement_stats[4].load() == 8192);
+}
+
+void test_retired_record_is_adopted_once_by_new_context() {
+    reset_state();
+    enable_for_test();
+    const auto context = reinterpret_cast<ur_context_handle_t>(0xe3);
+    const auto device = reinterpret_cast<ur_device_handle_t>(0xe4);
+    void *old = reinterpret_cast<void *>(0xe5);
+    assert(account_success(old, 8192, 0) == AccountResult::kSuccess);
+    g_test_retirement_ready = true;
+    assert(xpu_ur_hook_retire_borrowed());
+    g_accounted_bytes.store(0);
+    enable_for_test(3);
+    assert(g_accounted_bytes.load() == 8192);
+    void *current = nullptr;
+    assert(urUSMDeviceAlloc(context, device, nullptr, nullptr, 4096, &current) == UR_RESULT_SUCCESS);
+    assert(g_accounted_bytes.load() == 12288);
+    arm_retry(context, device, nullptr, 4096, RetryReason::kRuntimeOom, 3, 0);
+    assert(urUSMFree(context, old) == UR_RESULT_SUCCESS);
+    assert(g_accounted_bytes.load() == 4096 && g_retry.returned_bytes == 0);
+    assert(g_stats[kNativeReclaimFreeCalls].load() == 0);
+    assert(urUSMFree(context, current) == UR_RESULT_SUCCESS);
+    assert(g_accounted_bytes.load() == 0);
+}
+
+void test_owned_usm_blocks_retirement_and_shutdown_allocation() {
+    reset_state();
+    enable_for_test();
+    g_test_retirement_ready = true;
+    aimdo_xpu_owned_usm_enter();
+    void *owned = reinterpret_cast<void *>(0xe6);
+    assert(account_success(owned, 8192, 0) == AccountResult::kSuccess);
+    aimdo_xpu_owned_usm_leave();
+    assert(!xpu_ur_hook_retire_borrowed() && g_enabled.load());
+    assert(urUSMFree(reinterpret_cast<ur_context_handle_t>(0xe7), owned) == UR_RESULT_SUCCESS);
+    assert(xpu_ur_hook_retire_borrowed());
+    aimdo_xpu_owned_usm_enter();
+    void *pointer = nullptr;
+    assert(urUSMDeviceAlloc(reinterpret_cast<ur_context_handle_t>(0xe8),
+        reinterpret_cast<ur_device_handle_t>(0xe9), nullptr, nullptr, 4096, &pointer)
+        == UR_RESULT_ERROR_UNINITIALIZED);
+    aimdo_xpu_owned_usm_leave();
+    assert(pointer == nullptr && g_real_alloc_calls.load() == 0);
+}
+
+void test_pointer_reuse_after_retired_free_is_not_duplicate() {
+    reset_state();
+    enable_for_test();
+    void *old = reinterpret_cast<void *>(0x10000000);
+    assert(account_success(old, 4096, 0) == AccountResult::kSuccess);
+    g_test_retirement_ready = true;
+    assert(xpu_ur_hook_retire_borrowed());
+    g_accounted_bytes.store(0);
+    const auto context = reinterpret_cast<ur_context_handle_t>(0xea);
+    assert(urUSMFree(context, old) == UR_RESULT_SUCCESS);
+    enable_for_test(3);
+    void *current = nullptr;
+    assert(urUSMDeviceAlloc(context, reinterpret_cast<ur_device_handle_t>(0xeb),
+        nullptr, nullptr, 4096, &current) == UR_RESULT_SUCCESS);
+    assert(current == old && g_stats[kDuplicatePointerCalls].load() == 0);
+    assert(urUSMFree(context, current) == UR_RESULT_SUCCESS);
 }
 
 void test_direct_request_does_not_require_retry() {
@@ -321,6 +484,9 @@ extern "C" bool aimdo_xpu_evict_for_allocation(int, int64_t deficit) {
 
 extern "C" bool aimdo_xpu_account_allocation(int, int64_t delta) {
     if (g_account_fail.load()) return false;
+    if (delta > 0 && g_account_fail_after.load() >= 0 &&
+        g_account_fail_after.fetch_sub(1) == 0) return false;
+    if (delta < 0 && g_account_rollback_fail.load()) return false;
     g_accounted_bytes.fetch_add(delta, std::memory_order_relaxed);
     return true;
 }
@@ -338,5 +504,13 @@ int main() {
     test_empty_or_consumed_hint_skips_synthetic_oom();
     test_runtime_oom_reclaims_only_residual_after_same_device_free();
     test_failed_account_rolls_back_owned_allocation();
+    test_retired_free_does_not_access_destroyed_context();
+    test_retired_record_is_adopted_once_by_new_context();
+    test_failed_retired_adoption_keeps_hook_disabled();
+    test_partial_retired_adoption_retry(false);
+    test_partial_retired_adoption_retry(true);
+    test_partial_retired_adoption_retry(true, true);
+    test_owned_usm_blocks_retirement_and_shutdown_allocation();
+    test_pointer_reuse_after_retired_free_is_not_duplicate();
     return 0;
 }

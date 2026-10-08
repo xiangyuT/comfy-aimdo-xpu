@@ -284,6 +284,25 @@ int aimdo_cuda_free_async(CUdeviceptr devPtr, CUstream hStream,
 
 bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream);
 bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result);
+#ifdef AIMDO_XPU
+SHARED_EXPORT
+bool malloc_graph_free_owned(CUdeviceptr ptr, CUstream owner_stream, int *result);
+SHARED_EXPORT
+bool malloc_graph_test_fail_next_page_creates(unsigned attempts);
+SHARED_EXPORT
+bool malloc_graph_destroy_checked(void *handle);
+SHARED_EXPORT
+bool malloc_graph_destroy_terminal(void *handle);
+SHARED_EXPORT
+bool malloc_graph_test_fail_next_destroy_release(void *handle, unsigned stage);
+SHARED_EXPORT
+bool malloc_graph_test_arm_driver_release(void *handle, unsigned stage,
+                                        unsigned error_kind);
+SHARED_EXPORT
+bool aimdo_xpu_test_arm_vmm_release(unsigned stage, unsigned error_kind);
+SHARED_EXPORT
+unsigned aimdo_xpu_test_pending_vmm_release(void);
+#endif
 bool malloc_graph_sync_paused(void);
 
 bool allocations_init(void);

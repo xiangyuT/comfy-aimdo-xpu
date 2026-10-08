@@ -1,4 +1,5 @@
 import os
+import contextlib
 import ctypes
 import platform
 import sys
@@ -14,6 +15,7 @@ implementation = None
 _torch_allocator = None
 _torch_allocator_library = None
 _xpu_allocator_ready = False
+_xpu_native_hook_active = False
 _xpu_allocator_mode = None
 _torch_xpu_empty_cache_original = None
 _torch_xpu_memory_stats_original = None
@@ -24,6 +26,106 @@ _xpu_oom_history = []
 _XPU_OOM_HISTORY_LIMIT = 4
 _XPU_OOM_SNAPSHOT_INTERVAL_SECONDS = 2.0
 _xpu_oom_last_snapshot_monotonic = {}
+_memory_compiler_native = None
+
+_MEMORY_COMPILER_SIGNATURES = {
+    "malloc_graph_create": ([ctypes.c_void_p, ctypes.c_void_p, ctypes.c_bool], ctypes.c_void_p),
+    "malloc_graph_push": ([ctypes.c_void_p, ctypes.c_char_p], ctypes.c_bool),
+    "malloc_graph_pause": ([ctypes.c_void_p, ctypes.c_bool, ctypes.c_bool], ctypes.c_bool),
+    "malloc_graph_set_stream": ([ctypes.c_void_p, ctypes.c_void_p], ctypes.c_bool),
+    "malloc_graph_pop": ([ctypes.c_void_p], ctypes.c_int),
+    "malloc_graph_abort": ([ctypes.c_void_p], ctypes.c_bool),
+    "malloc_graph_stat": ([ctypes.c_void_p, ctypes.c_int], ctypes.c_uint64),
+    "malloc_graph_destroy": ([ctypes.c_void_p], None),
+}
+
+
+def _bind_memory_compiler(library, backend):
+    """Validate the whole ABI before installing any allocator callback."""
+    missing = [name for name in _MEMORY_COMPILER_SIGNATURES if not hasattr(library, name)]
+    if missing:
+        if backend == "xpu" and platform.system() == "Linux":
+            raise RuntimeError("AIMDO memory compiler ABI missing: " + ", ".join(missing))
+        return None
+    for name, (arguments, result) in _MEMORY_COMPILER_SIGNATURES.items():
+        function = getattr(library, name)
+        function.argtypes, function.restype = arguments, result
+    abi = flags = None
+    identity = {"source_revision": None, "source_content_sha256": None}
+    if backend == "xpu" or hasattr(library, "malloc_graph_abi_version"):
+        library.malloc_graph_abi_version.argtypes = []
+        library.malloc_graph_abi_version.restype = ctypes.c_uint32
+        library.malloc_graph_capabilities.argtypes = []
+        library.malloc_graph_capabilities.restype = ctypes.c_uint64
+        abi = int(library.malloc_graph_abi_version())
+        flags = int(library.malloc_graph_capabilities())
+        if abi != 1 or flags != 1:
+            raise RuntimeError(f"unsupported AIMDO memory compiler ABI/capabilities: {abi}/{flags}")
+        for field in identity:
+            function = getattr(library, "malloc_graph_" + field)
+            function.argtypes, function.restype = [], ctypes.c_char_p
+            identity[field] = function().decode("ascii")
+    return {"abi_revision": abi, "feature_bits": flags, "symbols_complete": True,
+            # Core feature bits describe the ABI, not the backend's allocator
+            # hooks. CUDA/ROCm retain their router with either core ABI.
+            "router_available": backend in ("cuda", "rocm"), **identity}
+
+
+def _xpu_native_owner_context_ready():
+    """Report a fully initialized, hook-enabled private XPU owner context."""
+    return bool(
+        lib is not None and implementation == "xpu"
+        and _xpu_allocator_mode == "native_hook" and _xpu_allocator_ready
+        and devctxs and _xpu_native_hook_active
+    )
+
+
+def get_memory_compiler_capability():
+    """Query support without loading a library or initializing a device.
+
+    ABI/core availability and execution eligibility are independent. The XPU
+    logical-allocation router is not installed in this build.
+    """
+    import hashlib
+
+    system = platform.system()
+    native = _memory_compiler_native if lib is not None else None
+    available = bool(native and native["router_available"])
+    reason = ("not_initialized" if lib is None else
+              "logical_allocator_router_unavailable" if native and not available else
+              "native_abi_unavailable" if not native else None)
+    path = Path(lib._name).resolve() if lib is not None else None
+    diagnostic_installed = False
+    if system == "Linux":
+        from . import native_owner
+
+        diagnostic_installed = native_owner.installed()
+    diagnostic_active = diagnostic_installed and _xpu_native_owner_context_ready()
+    diagnostic_reason = (
+        "opt_in_component_only" if diagnostic_active else
+        "installed_context_inactive" if diagnostic_installed else
+        "not_installed" if system == "Linux" else "linux_only"
+    )
+    return {
+        "schema_version": 1, "backend": implementation,
+        "platform": system, "allocator_mode": _xpu_allocator_mode,
+        "core_built": bool(native), "abi_revision": native["abi_revision"] if native else None,
+        "native_symbols_complete": bool(native),
+        "source_revision": native["source_revision"] if native else None,
+        "source_content_sha256": native["source_content_sha256"] if native else None,
+        "native_path": str(path) if path else None,
+        "native_sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path and path.is_file() else None,
+        "memory_only": available, "available": available, "reason": reason,
+        "logical_allocation_tracking": available,
+        "execution_graph": False, "xpu_consumer_tracking": False,
+        "native_owner_diagnostic": {
+            "installed": diagnostic_installed, "active": diagnostic_active,
+            "entrypoint": "native_owner.record_diagnostic" if diagnostic_active else None,
+            "consumer_contract": "explicit_record_stream" if diagnostic_active else None,
+            "public_available": False, "reason": diagnostic_reason,
+        },
+    }
+
 
 _LOG_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_int, ctypes.c_char_p)
 _LOG_LEVELS = {
@@ -169,8 +271,16 @@ def init(
     global _torch_xpu_empty_cache_original
     global _torch_xpu_memory_stats_original
     global _torch_xpu_reset_peak_stats_original
+    global _memory_compiler_native
 
     if lib is not None:
+        if globals()["implementation"] == "xpu":
+            from . import native_owner
+
+            if native_owner.requested() != native_owner.installed():
+                raise RuntimeError(
+                    "native-owner diagnostic installation cannot change after initialization"
+                )
         if xpu_allocator_mode is not None:
             requested_mode = _normalize_xpu_allocator_mode(xpu_allocator_mode)
             if implementation == "xpu" or globals()["implementation"] == "xpu":
@@ -199,6 +309,19 @@ def init(
         requested_xpu_allocator_mode = _normalize_xpu_allocator_mode(
             xpu_allocator_mode
         )
+        from . import native_owner
+
+        native_owner_requested = native_owner.requested()
+        if native_owner_requested and platform.system() != "Linux":
+            raise RuntimeError("native-owner diagnostic is Linux-only")
+        if native_owner_requested and requested_xpu_allocator_mode != "native_hook":
+            raise RuntimeError(
+                "native-owner diagnostic requires the XPU native_hook mode"
+            )
+        if native_owner.installed() and not native_owner_requested:
+            raise RuntimeError(
+                "native-owner diagnostic cannot be disabled in this process"
+            )
     elif xpu_allocator_mode is not None:
         raise ValueError(
             "xpu_allocator_mode is valid only for the XPU implementation"
@@ -240,6 +363,8 @@ def init(
 
     try:
         base_path = Path(__file__).parent.resolve()
+        if implementation == "xpu" and not (base_path / "malloc_graph.py").is_file():
+            raise RuntimeError("AIMDO XPU provider is missing its own malloc_graph module")
         system = platform.system()
         if system == "Windows":
             if implementation == "xpu":
@@ -253,7 +378,10 @@ def init(
             logging.info(f"comfy-aimdo unsupported operating system: {system}")
             logging.info(f"NOTE: comfy-aimdo currently only supports Windows and Linux")
             return False
-        lib = ctypes.CDLL(str(base_path / f"{impl}.{ext}"), mode=mode)
+        candidate_lib = ctypes.CDLL(str(base_path / f"{impl}.{ext}"), mode=mode)
+        compiler_native = _bind_memory_compiler(candidate_lib, implementation)
+        lib = candidate_lib
+        _memory_compiler_native = compiler_native
     except Exception as e:
         logging.info(f"comfy-aimdo failed to load: {e}")
         logging.info(f"NOTE: comfy-aimdo currently only supports Nvidia, AMD, and Intel XPU GPUs")
@@ -441,6 +569,8 @@ def init(
                     torch.xpu.reset_peak_memory_stats = (
                         aimdo_xpu_reset_peak_memory_stats
                     )
+                if native_owner_requested:
+                    native_owner.install(torch)
             elif requested_xpu_allocator_mode != _xpu_allocator_mode:
                 raise RuntimeError(
                     "AIMDO XPU allocator mode cannot change after installation"
@@ -481,16 +611,31 @@ def init(
 
     return True
 
+def _native_lifecycle_module():
+    if implementation == "xpu":
+        from . import native_owner
+        if native_owner.installed():
+            return native_owner
+    return None
+
+
 def init_devices(device_ids):
-    global devctxs
+    owner = _native_lifecycle_module()
+    lock = (owner.lifecycle_guard() if owner is not None and
+            hasattr(owner, "lifecycle_guard") else contextlib.nullcontext())
+    with lock:
+        return _init_devices(device_ids, owner)
+
+
+def _init_devices(device_ids, owner=None):
+    global devctxs, _xpu_native_hook_active
 
     if lib is None:
         return False
-    if implementation == "xpu" and not _xpu_allocator_ready:
-        return False
-
     if devctxs:
         logging.warning("comfy-aimdo devices are already initialized, call deinit() first")
+        return False
+    if implementation == "xpu" and not _xpu_allocator_ready:
         return False
 
     requested = []
@@ -525,9 +670,24 @@ def init_devices(device_ids):
 
         device_array = (ctypes.c_int * len(requested))(*requested)
         queue_array = (ctypes.c_uint64 * len(queue_ptrs))(*queue_ptrs)
-        if not lib.xpu_set_queues(device_array, queue_array, len(requested)):
-            return False
 
+    transition = (owner.allocator_transition() if owner is not None and
+                  hasattr(owner, "allocator_transition") else contextlib.nullcontext(False))
+    with transition as quiescent:
+        if quiescent:
+            torch.xpu.empty_cache()
+            torch.xpu.synchronize()
+            if not owner.native_cache_empty():
+                raise RuntimeError("native-owner lifecycle requires an empty native cache")
+        return _init_device_contexts(requested, headrooms,
+            (device_array, queue_array) if implementation == "xpu" else None,
+            quiescent=quiescent)
+
+
+def _init_device_contexts(requested, headrooms, queues, *, quiescent=False):
+    global devctxs, _xpu_native_hook_active
+    if queues is not None and not lib.xpu_set_queues(*queues, len(requested)):
+        return False
     if not lib.plat_init():
         return False
 
@@ -535,16 +695,24 @@ def init_devices(device_ids):
     headroom_array = (ctypes.c_uint64 * len(headrooms))(*headrooms)
     if lib.init(device_array, headroom_array, len(requested)):
         devctxs = [get_devctx(device_id) for device_id in requested]
-        if (
-            implementation == "xpu"
-            and _xpu_allocator_mode == "native_hook"
-            and not lib.xpu_ur_hook_enable()
-        ):
-            lib.cleanup()
-            devctxs = []
-            lib.plat_cleanup()
-            return False
         if implementation == "xpu" and _xpu_allocator_mode == "native_hook":
+            if not lib.xpu_ur_hook_enable():
+                if quiescent:
+                    # The failed context is about to be destroyed. Detach any
+                    # partially adopted accounting first, including a failed
+                    # rollback, so late frees never access that context.
+                    retire = getattr(lib, "xpu_ur_hook_retire_borrowed", None)
+                    if retire is None:
+                        raise RuntimeError("failed native-hook adoption requires retirement before cleanup")
+                    retire.argtypes = []
+                    retire.restype = ctypes.c_bool
+                    if not retire():
+                        raise RuntimeError("cannot clean failed native-hook adoption while borrowed owners remain attached")
+                lib.cleanup()
+                devctxs = []
+                lib.plat_cleanup()
+                return False
+            _xpu_native_hook_active = True
             logging.info(
                 "comfy-aimdo XPU native allocator hook enabled; "
                 "PyTorch caching allocator retained"
@@ -599,15 +767,63 @@ def get_simple_vram_headroom():
     return int(lib.get_simple_vram_headroom())
 
 def deinit():
+    owner = _native_lifecycle_module()
+    lock = (owner.lifecycle_guard() if owner is not None and
+            hasattr(owner, "lifecycle_guard") else contextlib.nullcontext())
+    with lock:
+        _deinit(owner)
+
+
+def _deinit(owner=None):
     global lib, devctxs, _log_callback, _xpu_allocator_ready
+    global _xpu_native_hook_active
+    global _memory_compiler_native
+    if lib is None:
+        _finish_deinit()
+        return
+    if lib is not None:
+        if implementation == "xpu":
+            from . import native_owner
+
+            if native_owner.installed():
+                native_owner.drain_deferred_graphs()
+                graphs = native_owner.graph_ownership_snapshot()
+                if graphs["live"] or graphs["deferred"]:
+                    raise RuntimeError(
+                        "cannot deinitialize AIMDO while diagnostic graphs remain live"
+                    )
+                if (native_owner.snapshot()[0]
+                        or native_owner.scoped_raw_snapshot()[0]):
+                    raise RuntimeError(
+                        "cannot deinitialize AIMDO while native-owner allocations remain live"
+                    )
+        transition = (owner.allocator_transition() if owner is not None and
+                      hasattr(owner, "allocator_transition") else contextlib.nullcontext(False))
+        with transition as quiescent:
+            _finish_deinit(owner, quiescent)
+
+
+def _finish_deinit(owner=None, quiescent=False):
+    global lib, devctxs, _log_callback, _xpu_allocator_ready
+    global _xpu_native_hook_active, _memory_compiler_native
     if lib is not None:
         if implementation == "xpu" and _xpu_allocator_ready:
             if _xpu_allocator_mode == "native_hook":
+                _xpu_native_hook_active = False
                 import torch
 
                 torch.xpu.empty_cache()
                 torch.xpu.synchronize()
-                if not lib.xpu_ur_hook_disable():
+                retire = getattr(lib, "xpu_ur_hook_retire_borrowed", None)
+                if quiescent and retire is not None:
+                    if not owner.native_cache_empty():
+                        raise RuntimeError("cannot deinitialize AIMDO while native cache remains live")
+                    retire.argtypes = []
+                    retire.restype = ctypes.c_bool
+                    disabled = bool(retire())
+                else:
+                    disabled = bool(lib.xpu_ur_hook_disable())
+                if not disabled:
                     raise RuntimeError(
                         "cannot disable AIMDO XPU native hook while "
                         "tracked native segments remain live"
@@ -625,8 +841,10 @@ def deinit():
         lib.set_log_callback(ctypes.cast(None, _LOG_CALLBACK))
         _log_callback = None
     lib = None
+    _memory_compiler_native = None
     globals()["implementation"] = None
     _xpu_allocator_ready = False
+    _xpu_native_hook_active = False
 
 
 def set_log_none(): lib.set_log_level_none()
@@ -741,6 +959,16 @@ def get_xpu_ur_hook_stats():
         result["cache_lever_skipped_calls"] = int(
             lib.xpu_ur_hook_get_cache_lever_skipped_calls()
         )
+    retirement = getattr(lib, "xpu_ur_hook_get_retirement_stats", None)
+    if retirement is not None:
+        retirement.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t]
+        retirement.restype = ctypes.c_bool
+        values = (ctypes.c_uint64 * 7)()
+        if not retirement(values, 7):
+            raise RuntimeError("failed to query UR retirement statistics")
+        result.update(zip(("retire_calls", "retired_allocations", "retired_bytes",
+                           "retired_frees", "retired_free_bytes", "live_retired_allocations",
+                           "live_retired_bytes"), map(int, values)))
     return result
 
 

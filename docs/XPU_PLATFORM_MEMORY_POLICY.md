@@ -18,6 +18,140 @@ The standalone `control.init()` API retains its Linux `global` default; a direct
 native caller must preload the library and select `native_hook` explicitly.
 Windows does not replace PyTorch's allocator.
 
+An optional Linux Torch 2.14 diagnostic build may install the AIMDO native
+owner proxy before XPU initialization when
+`AIMDO_XPU_NATIVE_OWNER_DIAGNOSTIC=1` is explicitly set. Ordinary tensor
+requests still delegate to PyTorch's native cache; selected compiler scopes
+have a separate owner. This process-lifetime experiment does not change the
+default `native_hook` route or public memory-compiler capability. The proxy's
+private C10/XPU ABI, stream and failure contracts need separate validation
+before it can become a supported allocator path.
+The opt-in sidecar uses the selected Torch headers and CXX11 ABI compiler flag,
+and exports its build release. Torch release support and build admission belong
+to the caller: llm-scaler selects `2.14.0+xpu` and, before packaging, checks that
+the exported release matches installed Torch and the provider declaration.
+AIMDO does not generate an ABI JSON file, compare Torch library hashes, or
+reject same-release Torch binaries based on their bytes. The private C10/XPU
+interface still requires the caller's scoped validation.
+On Linux, `AIMDO_XPU_GRAPH_AVOID_ALIAS=1` makes each newly assigned large
+graph VA use a distinct physical page. This diagnostic option avoids a second
+map of one physical handle on drivers that reject it. It is sampled when a
+graph is created; unset or `0` preserves physical-page reuse. Unique pages
+can increase physical memory use, so this option does not establish a public
+compiler route or a performance result.
+
+The read-only `get_memory_compiler_capability()` query reports this path under
+`native_owner_diagnostic`: process installation, active `native_hook` context,
+its opt-in graph entry point and explicit `record_stream` consumer contract are
+separate from public `available=false` and `xpu_consumer_tracking=false`.
+The diagnostic is active only after `init_devices()` has established at least
+one device context and enabled the native hook. It stays inactive during
+initialization and from the start of hook teardown, including if teardown
+fails; the graph and compiler-scope entry points use the same readiness check.
+After `deinit()`, the process-lifetime proxy can remain installed while the
+diagnostic context is inactive. This status query loads no new DSO and performs
+no XPU allocation.
+
+For the opt-in diagnostic, `native_owner.paused_graph_scope(graph)` pairs graph
+pause/resume with temporary native Torch allocation routing, including on an
+exceptional exit. Nested pauses retain the outer pause only for the same graph
+and sync mode. `native_owner.suspend_compiler_scope()` remains the lower-level
+route control for callers managing the graph themselves. Nested compiler scopes
+are rejected; a failed native scope or graph transition is process-terminal.
+These are private caller building blocks, not automatic ComfyUI integration.
+
+The diagnostic sidecar treats a failed owner-map insertion after a fresh
+compiler allocation as a rollback: the unregistered owner releases that new
+allocation. A duplicate live compiler VA is different. Releasing the rejected
+claim could free the existing tensor, so the sidecar preserves the old owner,
+reports a fatal collision, and requires the process to exit after cleanup.
+Neither rule enables public memory compilation or weakens the ordinary native
+allocator's ownership.
+
+For an explicit XPU stream switch inside a diagnostic memory graph, an owner
+may be released after the graph has switched back to another stream. The
+sidecar waits its allocation queue and each registered consumer, then uses
+the XPU-only `malloc_graph_free_owned` entry point to apply the free event on
+the owner's stream and restore the graph's previous stream. The original
+`malloc_graph_free` keeps its strict current-stream check. Unregistered
+external consumers remain outside this contract.
+The opt-in `native_owner.consumer_scope(tensor, stream)` checks an indexed XPU
+device and live compiler ownership at the tensor's storage base, so a view with
+a nonzero storage offset can register its underlying compiler owner. It calls
+Torch `record_stream` **before**
+yielding to the secondary stream, then restores the previous stream on exit.
+Callers must enter it before queuing that stream's first use of the tensor;
+entering later cannot repair work that was already unregistered. Torch's
+explicit stream registration or an equivalent caller-managed completion wait
+is required before compiler backing may be reused. This diagnostic helper does
+not discover arbitrary hidden consumers or enable public graph recording.
+Concurrent diagnostic graph threads bind the sidecar's D1 native entry points
+through one immutable function table. The first valid scope publishes that
+table atomically; later scopes require byte-identical function addresses and
+the expected source revision before routing allocations. Owner destructors
+load only the published table, so a concurrent scope cannot rewrite the
+functions used by an in-flight free.
+
+The opt-in Torch 2.14 diagnostic also exposes a bounded per-graph physical-page
+OOM injection. One failed attempt exercises the existing reclaim/retry path;
+two failed attempts exercise terminal allocation failure and graph abort. This
+hook does not simulate device pressure or establish a production OOM result.
+
+Some Torch XPU operators request temporary buffers through `raw_alloc` while a
+diagnostic compiler scope is active. The optional proxy delegates those buffers
+to Torch's native allocator and tracks their release separately from compiler
+`DataPtr` owners. The diagnostic exposes the scoped raw count and an exact live
+compiler-owner query so operator probes can detect output routing gaps. This
+path does not make unregistered consumers or arbitrary operators supported.
+
+For the optional Torch 2.14 diagnostic graph, native destruction now reports
+whether the owner thread actually released its graph. A close requested from
+another Python thread is retained for the creator thread to drain; AIMDO
+deinitialization refuses outstanding graph handles. This does not make active
+graph cancellation or arbitrary cross-thread consumers public functionality.
+If that creator later calls `close()` or repeats `abort()` on the same Python
+graph object, it first drains its queued native close. A different graph method
+also drains the queue before reporting that the object is closed. An owner-side
+cleanup failure remains visible and retains the queued handle for retry or
+process exit.
+It also refuses live native-owner or scoped raw allocations after a graph has
+handed an escaped compiler tensor to rogue ownership; final tensor free must
+finish before native cleanup.
+
+The optional XPU diagnostic can inject one failed graph-destroy release at a
+completed graph's small mapped page, small physical page or virtual-range
+stage. The checked destroy retains unfinished owners for an owner-thread retry.
+This exercises its recovery contract without claiming a real driver unmap or
+physical-release failure was observed.
+
+For a separate completed-graph Linux diagnostic, the XPU VMM adapter can
+return one OOM or device-lost code at the Level Zero unmap, physical destroy
+or virtual free function-pointer boundary. The core and VMM manager then take
+their normal error path. This tests metadata retention after earlier cleanup
+stages have succeeded; it still does not mean the hardware driver itself
+returned an error or mutated the targeted primitive before failing.
+An OOM-style release error may be retried with retained graph ownership. A
+generic or device-loss release error marks that diagnostic graph terminal:
+subsequent close calls do not re-enter native release, and deinitialization
+continues to refuse the live handle until process exit. The driver state after
+a real device loss is not assumed recoverable.
+The diagnostic queue also treats an exited graph creator as terminal. It keeps
+the handle owned and prevents later scopes, graph creation and deinitialization
+from silently proceeding; no surviving thread adopts a dead thread's native
+graph. Process exit is required for that unresolved owner.
+For a compiler tensor whose final Python reference is released on another
+thread while its graph is still recording, the optional proxy waits its
+allocation and registered consumer queues, then retains the native owner for
+the original graph thread. The owner drains pending tensor frees before graph
+pop, abort or destroy. Pending owners count as live at deinitialization; a
+failed owner-thread free blocks further graph work and requires process exit.
+This does not detect an unregistered asynchronous consumer.
+The proxy also tracks whether a native compiler owner thread has exited while
+its deferred-free queue is nonempty. This is independent of Python graph-object
+tracking: an unclaimed owner cannot be adopted by a later thread with a reused
+thread ID. New graph work and deinitialization fail closed until process exit,
+even when Python no longer has a graph handle to inspect.
+
 Linux native mode keeps Torch's allocator, statistics and cache-management APIs.
 At model prioritization, Python publishes a cached-byte estimate to the hook.
 A budget deficit uses Torch's cache-release retry only when that estimate is
