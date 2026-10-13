@@ -357,3 +357,25 @@ def test_actual_candidate_dso_binds_complete_abi_and_identity():
     assert len(capability["source_content_sha256"]) == 64
     assert int(capability["source_content_sha256"], 16)
     assert path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_actual_candidate_null_page_cleanup_before_device_initialization():
+    """Empty rogue/page slots must be safe even before allocator locks exist."""
+    configured = os.environ.get("AIMDO_D1_LIBRARY")
+    path = Path(configured) if configured else Path(control.__file__).parent / "aimdo_xpu.so"
+    if configured:
+        assert path.is_file(), "configured candidate DSO is missing"
+    if not path.is_file():
+        pytest.skip("requires an actual newly built AIMDO D1 XPU library")
+    # Isolate the native regression: the old function dereferences NULL, and a
+    # segmentation fault must fail this test without terminating pytest itself.
+    subprocess.run(
+        [sys.executable, "-c", "\n".join((
+            "import ctypes, sys",
+            "native = ctypes.CDLL(sys.argv[1])",
+            "native.physical_page_unref.argtypes = [ctypes.c_void_p]",
+            "native.physical_page_unref.restype = ctypes.c_int",
+            "assert native.physical_page_unref(None) == 0",
+        )), str(path.resolve())],
+        check=True, capture_output=True, text=True,
+    )
