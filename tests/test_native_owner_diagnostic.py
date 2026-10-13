@@ -72,6 +72,32 @@ def test_unrestricted_scope_still_requires_opt_in_installation(monkeypatch):
         native_owner.selected_scope(0, stream)
 
 
+def test_scope_identity_uses_validated_loaded_core_without_capability_file_io(monkeypatch):
+    calls = []
+    fake = SimpleNamespace(aimdo_full_proxy_is_installed=lambda: True,
+                           aimdo_full_proxy_compiler_begin=lambda *args: calls.append(args) or True,
+                           aimdo_full_proxy_compiler_end=lambda: True)
+    monkeypatch.setattr(native_owner, '_library', fake)
+    monkeypatch.setattr(native_owner, '_scope_context', threading.local())
+    monkeypatch.setattr(native_owner, '_scope_terminal', False)
+    monkeypatch.setattr(native_owner, 'drain_deferred_graphs', lambda: 0)
+    monkeypatch.setattr(control, 'lib', SimpleNamespace())
+    monkeypatch.setattr(control, '_memory_compiler_native', {'source_revision': 'validated-core'})
+    monkeypatch.setattr(control, '_xpu_native_owner_context_ready', lambda: True)
+    monkeypatch.setattr(control, 'get_memory_compiler_capability',
+                        lambda: pytest.fail('scope binding repeated the full capability query'))
+    with native_owner.compiler_scope(SimpleNamespace(sycl_queue=456)):
+        pass
+    assert calls == [(0, 456, b'validated-core')]
+    monkeypatch.setattr(control, '_memory_compiler_native', None)
+    with pytest.raises(RuntimeError, match='lacks stream or D1 source identity'):
+        with native_owner.compiler_scope(SimpleNamespace(sycl_queue=456)):
+            pytest.fail('scope started without a validated native identity')
+    monkeypatch.setattr(control, '_memory_compiler_native', {'source_revision': 'validated-core'})
+    monkeypatch.setattr(control, 'lib', None)
+    assert control._memory_compiler_source_revision() is None
+
+
 def test_compiler_scope_suspension_restores_native_binding_after_nested_pause(monkeypatch):
     calls = []
     fake = SimpleNamespace(
@@ -88,8 +114,8 @@ def test_compiler_scope_suspension_restores_native_binding_after_nested_pause(mo
     monkeypatch.setattr(control, "implementation", "xpu")
     monkeypatch.setattr(control, "get_xpu_allocator_mode", lambda: "native_hook")
     monkeypatch.setattr(control, "_xpu_native_owner_context_ready", lambda: True)
-    monkeypatch.setattr(control, "get_memory_compiler_capability",
-                        lambda: {"source_revision": "exact-source"})
+    monkeypatch.setattr(control, "_memory_compiler_native",
+                        {"source_revision": "exact-source"})
     stream = SimpleNamespace(sycl_queue=456)
     with pytest.raises(RuntimeError, match="requires an active"):
         with native_owner.suspend_compiler_scope():
@@ -126,8 +152,8 @@ def test_compiler_scope_suspension_exception_restores_route(monkeypatch):
     monkeypatch.setattr(control, "implementation", "xpu")
     monkeypatch.setattr(control, "get_xpu_allocator_mode", lambda: "native_hook")
     monkeypatch.setattr(control, "_xpu_native_owner_context_ready", lambda: True)
-    monkeypatch.setattr(control, "get_memory_compiler_capability",
-                        lambda: {"source_revision": "exact-source"})
+    monkeypatch.setattr(control, "_memory_compiler_native",
+                        {"source_revision": "exact-source"})
     with pytest.raises(KeyError, match="cancel"):
         with native_owner.selected_scope(4097, SimpleNamespace(sycl_queue=456)):
             with native_owner.suspend_compiler_scope():
@@ -158,8 +184,8 @@ def test_failed_compiler_scope_resume_is_process_terminal(monkeypatch):
     monkeypatch.setattr(control, "implementation", "xpu")
     monkeypatch.setattr(control, "get_xpu_allocator_mode", lambda: "native_hook")
     monkeypatch.setattr(control, "_xpu_native_owner_context_ready", lambda: True)
-    monkeypatch.setattr(control, "get_memory_compiler_capability",
-                        lambda: {"source_revision": "exact-source"})
+    monkeypatch.setattr(control, "_memory_compiler_native",
+                        {"source_revision": "exact-source"})
     stream = SimpleNamespace(sycl_queue=456)
     with pytest.raises(RuntimeError, match="process must exit"):
         with native_owner.compiler_scope(stream):
@@ -196,8 +222,8 @@ def test_paused_graph_scope_restores_graph_and_route_after_nested_cancellation(m
     monkeypatch.setattr(native_owner, "drain_deferred_graphs", lambda: 0)
     monkeypatch.setattr(control, "lib", core)
     monkeypatch.setattr(control, "_xpu_native_owner_context_ready", lambda: True)
-    monkeypatch.setattr(control, "get_memory_compiler_capability",
-                        lambda: {"source_revision": "exact-source"})
+    monkeypatch.setattr(control, "_memory_compiler_native",
+                        {"source_revision": "exact-source"})
     with pytest.raises(KeyError, match="cancel"):
         with native_owner.compiler_scope(stream):
             with native_owner.paused_graph_scope(graph, sync=True):
@@ -241,8 +267,8 @@ def test_paused_graph_scope_failed_resume_is_process_terminal(monkeypatch):
     monkeypatch.setattr(native_owner, "drain_deferred_graphs", lambda: 0)
     monkeypatch.setattr(control, "lib", core)
     monkeypatch.setattr(control, "_xpu_native_owner_context_ready", lambda: True)
-    monkeypatch.setattr(control, "get_memory_compiler_capability",
-                        lambda: {"source_revision": "exact-source"})
+    monkeypatch.setattr(control, "_memory_compiler_native",
+                        {"source_revision": "exact-source"})
     with pytest.raises(RuntimeError, match="process must exit"):
         with native_owner.compiler_scope(stream):
             with native_owner.paused_graph_scope(graph):

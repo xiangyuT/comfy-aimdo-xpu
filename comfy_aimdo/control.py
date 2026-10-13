@@ -80,6 +80,12 @@ def _xpu_native_owner_context_ready():
     )
 
 
+def _memory_compiler_source_revision():
+    """Return the loaded core's validated identity without repeating file I/O."""
+    native = _memory_compiler_native if lib is not None else None
+    return native.get("source_revision") if native else None
+
+
 def get_memory_compiler_capability():
     """Query support without loading a library or initializing a device.
 

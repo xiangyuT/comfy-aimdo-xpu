@@ -603,7 +603,7 @@ def _compiler_scope_context(size: int, stream):
     if size < 0:
         raise ValueError("native-owner scope size cannot be negative")
     stream_pointer = int(stream.sycl_queue)
-    source_revision = control.get_memory_compiler_capability()["source_revision"]
+    source_revision = control._memory_compiler_source_revision()
     if not stream_pointer or not source_revision:
         raise RuntimeError("native-owner scope lacks stream or D1 source identity")
     revision_bytes = source_revision.encode("ascii")
