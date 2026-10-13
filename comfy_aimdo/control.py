@@ -86,21 +86,20 @@ def _memory_compiler_source_revision():
     return native.get("source_revision") if native else None
 
 
-def get_memory_compiler_capability():
-    """Query support without loading a library or initializing a device.
+def get_memory_compiler_runtime_status():
+    """Query API availability, allocator installation and context readiness.
 
-    ABI/core availability and execution eligibility are independent. The XPU
-    logical-allocation router is not installed in this build.
+    This reads initialized state without hashing files, loading a library or
+    initializing a device. XPU's opt-in route remains diagnostic-only; its
+    installed proxy is distinct from an active context and public API support.
+    Use get_memory_compiler_capability() for the additional source diagnostics.
     """
-    import hashlib
-
     system = platform.system()
     native = _memory_compiler_native if lib is not None else None
     available = bool(native and native["router_available"])
     reason = ("not_initialized" if lib is None else
               "logical_allocator_router_unavailable" if native and not available else
               "native_abi_unavailable" if not native else None)
-    path = Path(lib._name).resolve() if lib is not None else None
     diagnostic_installed = False
     if system == "Linux":
         from . import native_owner
@@ -115,12 +114,8 @@ def get_memory_compiler_capability():
     return {
         "schema_version": 1, "backend": implementation,
         "platform": system, "allocator_mode": _xpu_allocator_mode,
-        "core_built": bool(native), "abi_revision": native["abi_revision"] if native else None,
+        "core_built": bool(native),
         "native_symbols_complete": bool(native),
-        "source_revision": native["source_revision"] if native else None,
-        "source_content_sha256": native["source_content_sha256"] if native else None,
-        "native_path": str(path) if path else None,
-        "native_sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path and path.is_file() else None,
         "memory_only": available, "available": available, "reason": reason,
         "logical_allocation_tracking": available,
         "execution_graph": False, "xpu_consumer_tracking": False,
@@ -130,6 +125,26 @@ def get_memory_compiler_capability():
             "consumer_contract": "explicit_record_stream" if diagnostic_active else None,
             "public_available": False, "reason": diagnostic_reason,
         },
+    }
+
+
+def get_memory_compiler_capability():
+    """Query runtime support and source diagnostics without device initialization.
+
+    File hashing is deliberate diagnostic work. Repeated execution-path checks
+    should use get_memory_compiler_runtime_status() instead.
+    """
+    import hashlib
+
+    native = _memory_compiler_native if lib is not None else None
+    path = Path(lib._name).resolve() if lib is not None else None
+    return {
+        **get_memory_compiler_runtime_status(),
+        "abi_revision": native["abi_revision"] if native else None,
+        "source_revision": native["source_revision"] if native else None,
+        "source_content_sha256": native["source_content_sha256"] if native else None,
+        "native_path": str(path) if path else None,
+        "native_sha256": hashlib.sha256(path.read_bytes()).hexdigest() if path and path.is_file() else None,
     }
 
 

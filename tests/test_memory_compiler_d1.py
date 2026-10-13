@@ -95,6 +95,54 @@ def test_capability_query_before_init_is_read_only(monkeypatch):
     }
 
 
+@pytest.mark.parametrize("installed,ready,contexts,hook,expected_active", [
+    (False, False, [], False, False),
+    (False, True, [0x1234], True, False),
+    (True, True, [], False, False),
+    (True, True, [0x1234], False, False),
+    (True, True, [0x1234], True, True),
+    (True, False, [0x1234], True, False),
+])
+def test_runtime_status_checks_live_readiness_without_source_io(
+        monkeypatch, installed, ready, contexts, hook, expected_active):
+    native = library()
+    monkeypatch.setattr(control, "lib", native)
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "_memory_compiler_native", control._bind_memory_compiler(native, "xpu"))
+    monkeypatch.setattr(control.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(control, "_xpu_allocator_mode", "native_hook")
+    monkeypatch.setattr(control, "_xpu_allocator_ready", ready)
+    monkeypatch.setattr(control, "devctxs", contexts)
+    monkeypatch.setattr(control, "_xpu_native_hook_active", hook)
+    monkeypatch.setattr(native_owner, "installed", lambda: installed)
+    monkeypatch.setattr(control, "Path", lambda *a: pytest.fail("runtime status accessed a source file"))
+    monkeypatch.setattr(control.ctypes, "CDLL", lambda *a, **k: pytest.fail("runtime status loaded a DSO"))
+    status = control.get_memory_compiler_runtime_status()
+    assert status["native_owner_diagnostic"]["installed"] is installed
+    assert status["native_owner_diagnostic"]["active"] is expected_active
+    assert not status["available"] and not status["memory_only"]
+    assert not native.malloc_graph_create.calls
+
+
+def test_full_capability_keeps_source_diagnostics_and_matches_runtime_status(monkeypatch, tmp_path):
+    import hashlib
+
+    path = tmp_path / "core.so"
+    path.write_bytes(b"capability source fixture")
+    native = library()
+    native._name = str(path)
+    monkeypatch.setattr(control, "lib", native)
+    monkeypatch.setattr(control, "implementation", "cuda")
+    monkeypatch.setattr(control, "_memory_compiler_native", control._bind_memory_compiler(native, "cuda"))
+    monkeypatch.setattr(native_owner, "installed", lambda: False)
+    status = control.get_memory_compiler_runtime_status()
+    capability = control.get_memory_compiler_capability()
+    assert status["available"] and status["memory_only"]
+    assert all(capability[key] == value for key, value in status.items())
+    assert capability["source_revision"] == "c" * 40
+    assert capability["native_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
+
+
 @pytest.mark.parametrize("retired", [True, False])
 def test_failed_diagnostic_adoption_detaches_before_context_cleanup(monkeypatch, retired):
     calls = []

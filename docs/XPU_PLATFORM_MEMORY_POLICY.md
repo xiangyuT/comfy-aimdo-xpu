@@ -52,6 +52,13 @@ After `deinit()`, the process-lifetime proxy can remain installed while the
 diagnostic context is inactive. This status query loads no new DSO and performs
 no XPU allocation.
 
+Execution-path checks can use `control.get_memory_compiler_runtime_status()`.
+It reports the same public API availability and diagnostic installation/context
+state without reading or hashing the native file. The full capability query
+retains source revision, ABI and file diagnostics. Neither query installs an
+allocator or starts graph recording; an installed proxy alone does not enable
+public XPU support, and every graph/scope still checks its own native eligibility.
+
 For the opt-in diagnostic, `native_owner.paused_graph_scope(graph)` pairs graph
 pause/resume with temporary native Torch allocation routing, including on an
 exceptional exit. Nested pauses retain the outer pause only for the same graph
