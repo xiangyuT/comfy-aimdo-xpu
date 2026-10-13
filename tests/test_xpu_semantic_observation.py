@@ -81,3 +81,14 @@ def test_independent_resource_diagnostic_marks_unenforced_assertion():
     graph = SimpleNamespace(peak_used=32, virtual_bytes=48, physical_bytes=48)
     suite.stat(graph, (32, 48, 32))
     assert suite.stats[0]['assertion_enforced'] is False
+
+
+def test_stale_provider_manifest_is_rejected_before_runtime_bootstrap(tmp_path):
+    path = tmp_path / 'provider.json'
+    path.write_text('{"source": {"revision": "current"}}')
+    with pytest.raises(ValueError, match='manifest differs'):
+        semantics.checked_provider_manifest(path, '0' * 64)
+    manifest, observed_hash = semantics.checked_provider_manifest(
+        path, semantics.digest(path.read_bytes()))
+    assert manifest['source']['revision'] == 'current'
+    assert observed_hash == semantics.digest(path.read_bytes())

@@ -38,6 +38,14 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def checked_provider_manifest(path, expected_sha256):
+    data = path.read_bytes()
+    manifest_hash = digest(data)
+    if manifest_hash != expected_sha256:
+        raise ValueError('installed provider manifest differs from frozen plan')
+    return json.loads(data), manifest_hash
+
+
 def expected_bytes(size, seed):
     # Period251 preserves the per-byte formula while avoiding huge Python lists.
     period = bytes((position * (17 + seed % 11) + seed * 13) % 251
@@ -1065,7 +1073,9 @@ def run(case, output, plan, *, statistics_diagnostic=False):
     spec.loader.exec_module(runtime)
     from comfy_aimdo import control  # Official entry must exist before provider activation.
     dist = metadata.distribution('comfy-aimdo-xpu-runtime')
-    manifest = json.loads(Path(dist.locate_file('comfy_aimdo_xpu_runtime/provider.json')).read_text())
+    manifest_path = Path(dist.locate_file('comfy_aimdo_xpu_runtime/provider.json'))
+    manifest, manifest_hash = checked_provider_manifest(
+        manifest_path, plan['provider_manifest_sha256'])
     assert manifest['source']['revision'] == plan['native_source_revision']
     provider = runtime._validate_manifest(SimpleNamespace(name='comfy_aimdo.xpu', dist=dist), manifest)
     runtime.bootstrap(providers_override={provider.provider_id: provider}, dynamic_vram_override=True)
@@ -1116,6 +1126,7 @@ def run(case, output, plan, *, statistics_diagnostic=False):
     return {'status': status if error is None else 'failed', 'case': case,
             'original_statistics_assertions_enforced': not statistics_diagnostic,
             'native_source_revision': manifest['source']['revision'], 'native_sha256': native_hash,
+            'provider_manifest_sha256': manifest_hash,
             'torch': torch.__version__, 'device_uuid': str(props.uuid),
             'physical_xpu': plan['physical_xpu'], 'torch_affinity': plan['torch_affinity'],
             'torch_logical_index': 0, 'sidecar_sha256': sidecar_hash,
