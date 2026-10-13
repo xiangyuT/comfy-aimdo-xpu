@@ -96,6 +96,13 @@ The opt-in Torch 2.14 diagnostic also exposes a bounded per-graph physical-page
 OOM injection. One failed attempt exercises the existing reclaim/retry path;
 two failed attempts exercise terminal allocation failure and graph abort. This
 hook does not simulate device pressure or establish a production OOM result.
+After a graph allocation has failed, a registered tensor's final free can
+precede the caller's abort during Python exception unwinding. The XPU owned-free
+entry point records that known allocation as freed after the sidecar drains its
+queues; backing stays owned until abort's rogue handoff. This permits cleanup
+and reentry without making the failed graph reusable. Unknown pointers, paused
+graphs and an already attempted handoff remain rejected. The ordinary strict
+free and CUDA/ROCm behavior are unchanged.
 
 Some Torch XPU operators request temporary buffers through `raw_alloc` while a
 diagnostic compiler scope is active. The optional proxy delegates those buffers

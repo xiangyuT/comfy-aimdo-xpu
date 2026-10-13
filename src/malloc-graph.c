@@ -1156,13 +1156,41 @@ SHARED_EXPORT bool malloc_graph_test_arm_driver_release(void *handle,
     return aimdo_xpu_test_arm_vmm_release(stage, error_kind);
 }
 
+/* A failed allocation can unwind Python tensor owners before the caller gets
+ * to abort(). Their queues are already drained by the sidecar. Record the
+ * final free for abort's rogue handoff without replaying an event or making
+ * backing reusable in the failed graph. The ordinary strict free is unchanged. */
+static bool retire_failed_graph_owner(MallocGraph *g, CUdeviceptr ptr, int *result) {
+    if (!g->failed || !g->state || g->handoff_attempted || !result) return false;
+    Event *allocation = NULL;
+    CUdeviceptr small_base = virtual_range_get(g->small_base);
+    CUdeviceptr base = virtual_range_get(g->base);
+    if (ptr >= small_base && ptr - small_base < MG_SMALL_PAGES * MG_PAGE) {
+        for (SmallRange *range = g->small_ranges; range; range = range->next) {
+            if (range->offset == ptr - small_base) {
+                allocation = range->allocation;
+                break;
+            }
+        }
+    } else if (ptr >= base && ptr - base < MG_PAGES * MG_PAGE &&
+               (ptr - base) % MG_PAGE == 0) {
+        VirtualPage *page = &g->allocations.virtual_pages[(ptr - base) / MG_PAGE];
+        if (page->va_span) allocation = page->allocation;
+    }
+    if (!allocation || allocation->freed_out_of_scope) return false;
+    allocation->freed_out_of_scope = true;
+    *result = CUDA_SUCCESS;
+    return true;
+}
+
 SHARED_EXPORT bool malloc_graph_free_owned(CUdeviceptr ptr, CUstream owner_stream,
                                            int *result) {
     MallocGraph *g = active_graph;
-    if (!g || g->owner_thread != &active_graph || graph_failed(g) ||
+    if (!g || g->owner_thread != &active_graph ||
         g->paused || !owner_stream) {
         return false;
     }
+    if (graph_failed(g)) return retire_failed_graph_owner(g, ptr, result);
     /* The native-owner sidecar has already waited the allocation queue and
      * every registered consumer before calling this XPU-only entry point.
      * Restore graph routing even if the free reports an event mismatch. */
