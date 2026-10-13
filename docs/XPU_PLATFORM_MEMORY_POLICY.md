@@ -212,6 +212,32 @@ live VBARs before removing allocator hooks or device contexts. These rules do
 not establish safety for unregistered consumers or concurrent Linux VBAR
 metadata mutation. Injected error tests are distinct from actual driver errors.
 
+## Linux VMM compression and bandwidth
+
+Native USM and physical VMM can have different driver compression policies.
+For example, compute-runtime `26.31.39395.13` explicitly selects uncompressed
+GMM storage for Linux physical-device allocations, while its Xe2 USM path can
+select buffer compression. See the upstream
+[physical allocation implementation](https://github.com/intel/compute-runtime/blob/a9808c808165cf0d4ee0789a484e95eb15a9cad2/shared/source/os_interface/linux/drm_memory_manager.cpp#L1016)
+and [USM compression selection](https://github.com/intel/compute-runtime/blob/a9808c808165cf0d4ee0789a484e95eb15a9cad2/shared/source/memory_manager/unified_memory_manager.cpp#L526).
+This can lower memory-operation throughput on compiler-owned VMM backing even
+when allocation is outside the timed operation and the tensor data is correct.
+
+The same driver rejects a compression-hint descriptor passed to
+`zePhysicalMemCreate`; its physical-memory extension handling supports other
+specific descriptors. See the upstream
+[physical-memory descriptor handling](https://github.com/intel/compute-runtime/blob/a9808c808165cf0d4ee0789a484e95eb15a9cad2/level_zero/core/source/context/context.cpp#L1703).
+AIMDO's VMM lifecycle and address-remapping guarantees therefore do not imply
+native-USM compression or bandwidth parity. This capability difference is
+separate from drivers rejecting multiple VA mappings of one physical page.
+
+Compare whole-workflow latency and device memory under the normal driver
+configuration. Driver compression controls can isolate this limitation in a
+diagnostic process. Torch allocator peaks exclude compiler VMM backing, so a
+lower Torch-reserved peak alone does not establish whole-device memory savings.
+The diagnostic remains opt-in; measured lifecycle correctness and performance
+admission are separate decisions.
+
 ## Shared invariants
 
 1. VBAR pages are reclaimed only when unpinned and safe to retire.
