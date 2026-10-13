@@ -15,7 +15,7 @@ BUILD_SCRIPT = (
 
 
 def test_linux_mod1_does_not_read_windows_retirement_fields():
-    mod1 = SOURCE.split("static inline bool mod1", 1)[1].split(
+    mod1 = SOURCE.split("static inline bool mod1", 2)[2].split(
         "if (do_free)", 1
     )[0]
     windows_branch, linux_branch = mod1.split("#else", 1)
@@ -23,7 +23,9 @@ def test_linux_mod1_does_not_read_windows_retirement_fields():
     assert "rp->evicting" in windows_branch
     assert "rp->retire_unknown" in windows_branch
     assert "rp->evicting" not in linux_branch
-    assert "rp->retire_unknown" not in linux_branch
+    # Linux now keeps mapping/cleanup state too; queue retirement remains Windows-only.
+    assert "#if defined(AIMDO_XPU)" in linux_branch
+    assert "rp->retire_unknown" in linux_branch
     assert "do_unpin || rp->pin_count == 0" in linux_branch
 
 

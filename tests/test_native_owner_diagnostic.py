@@ -714,6 +714,22 @@ def test_deinit_rejects_live_diagnostic_graph_before_native_cleanup(monkeypatch)
     assert control.lib is library
 
 
+def test_deinit_rejects_live_vbar_before_hook_or_context_teardown(monkeypatch):
+    contexts = []
+    def can_deinit(context):
+        contexts.append(context)
+        return context != 23
+    library = SimpleNamespace(vbars_can_deinit=can_deinit)
+    monkeypatch.setattr(control, "lib", library)
+    monkeypatch.setattr(control, "implementation", "xpu")
+    monkeypatch.setattr(control, "devctxs", [17, 23])
+    monkeypatch.setattr(native_owner, "installed", lambda: False)
+    monkeypatch.setattr(control, "_finish_deinit", lambda *args: pytest.fail("context teardown ran"))
+    with pytest.raises(RuntimeError, match="VBAR owners remain live"):
+        control.deinit()
+    assert contexts == [17, 23] and control.lib is library
+
+
 def test_deinit_rejects_rogue_native_owner_after_graph_close(monkeypatch):
     library = SimpleNamespace()
     monkeypatch.setattr(control, "lib", library)

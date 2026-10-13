@@ -785,6 +785,13 @@ def _deinit(owner=None):
         if implementation == "xpu":
             from . import native_owner
 
+            can_deinit = getattr(lib, "vbars_can_deinit", None)
+            if can_deinit is not None:
+                can_deinit.argtypes = [ctypes.c_void_p]
+                can_deinit.restype = ctypes.c_bool
+                if any(not can_deinit(context) for context in devctxs):
+                    raise RuntimeError("cannot deinitialize AIMDO while VBAR owners remain live")
+
             if native_owner.installed():
                 native_owner.drain_deferred_graphs()
                 graphs = native_owner.graph_ownership_snapshot()

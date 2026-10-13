@@ -173,6 +173,19 @@ the existing synchronized reclaim path. Reclaim waits every registered queue.
 Unknown queues and graph-capture consumers retain the pin and raise an error;
 Linux native mode does not claim Windows external/capture lease support.
 
+On Linux XPU, a failed multi-page VBAR fault removes only the pins acquired by
+that fault. If pressure lowered the watermark past the acquired prefix, its
+now-unpinned pages are released after the registered queues complete. Separate
+live pins and cached pages below the watermark remain owned. A repeated
+physical allocation OOM remains an OOM result, allowing host offload.
+Unmap or physical-release failures retain the physical handle and accounting;
+after a failed physical release AIMDO attempts to restore the mapping. A
+completion failure or an indeterminate mapping keeps the owner until process
+exit. VBAR teardown retains unfinished handles, and deinitialization refuses
+live VBARs before removing allocator hooks or device contexts. These rules do
+not establish safety for unregistered consumers or concurrent Linux VBAR
+metadata mutation. Injected error tests are distinct from actual driver errors.
+
 ## Shared invariants
 
 1. VBAR pages are reclaimed only when unpinned and safe to retire.

@@ -3,11 +3,7 @@
 
 #define VBAR_PAGE_SIZE (32 << 20)
 
-/* A WDDM physical allocation can still fail after the sampled budget says a
- * single page fits.  Keep this second-stage margin Windows/XPU-only: Linux
- * receives exact allocator-time pressure and must retain its existing
- * behavior. */
-#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+#if defined(AIMDO_XPU)
 #define VBAR_CUDA_ERROR_UNKNOWN ((CUresult)999)
 #endif
 
@@ -18,6 +14,10 @@ typedef struct ResidentPage {
     CUmemGenericAllocationHandle handle;
     uint32_t pin_count;
     size_t serial;
+#if defined(AIMDO_XPU) && !defined(_WIN32) && !defined(_WIN64)
+    uint8_t mapped;
+    uint8_t retire_unknown;
+#endif
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
     /* One dependency per queue that actually consumed this page. The token
      * names both the queue and its fence generation. Sixty-four entries cost
@@ -115,9 +115,7 @@ SHARED_EXPORT
 void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
                        uint64_t stream);
 
-#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-static uint64_t vbar_identity_counter;
-
+#if defined(AIMDO_XPU)
 enum {
     VBAR_MAPPING_UNMAPPED = 0,
     VBAR_MAPPING_MAPPED = 1,
@@ -125,6 +123,10 @@ enum {
      * prove whether the driver removed it. Never use or reclaim this page. */
     VBAR_MAPPING_UNKNOWN = 2,
 };
+#endif
+
+#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+static uint64_t vbar_identity_counter;
 
 /* VBAR mappings are visible to the Python model thread and to allocations
  * intercepted on arbitrary runtime threads.  The retirement fence proves GPU
@@ -253,7 +255,11 @@ static inline bool vbar_retire_complete(
 }
 #else
 static inline bool vbar_page_is_mapped(const ResidentPage *rp) {
+#if defined(AIMDO_XPU)
+    return rp->handle && rp->mapped == VBAR_MAPPING_MAPPED;
+#else
     return rp->handle != 0;
+#endif
 }
 static inline void vbar_state_lock(void) {}
 static inline bool vbar_state_try_lock(void) { return true; }
@@ -398,7 +404,9 @@ int aimdo_vbar_describe_range(uint64_t address, uint64_t size, int *mapped,
 /* Undo the pins this fault has taken so far. A fault that gives up partway
  * must not leave pins behind: a pinned page is excluded from every reclaim,
  * so a leaked pin permanently removes that page from the pool. */
-static inline void vbar_unpin_range(ModelVBAR *mv, size_t first, size_t last) {
+static inline bool mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unpin);
+
+static inline bool vbar_unpin_range(ModelVBAR *mv, size_t first, size_t last) {
     for (size_t page_nr = first; page_nr < last; page_nr++) {
         ResidentPage *rp = &mv->residency_map[page_nr];
 
@@ -406,9 +414,34 @@ static inline void vbar_unpin_range(ModelVBAR *mv, size_t first, size_t last) {
             rp->pin_count--;
         }
     }
+#if defined(AIMDO_XPU) && !defined(_WIN32) && !defined(_WIN64)
+    /* Reclaim may move the watermark past this fault's pinned prefix. Once
+     * those pins are undone, normal watermark scans cannot find the pages.
+     * Keep independent pins and cached pages below the watermark intact. */
+    size_t start = first > mv->watermark ? first : mv->watermark;
+    bool synchronized = malloc_graph_sync_paused();
+    bool released = true;
+    for (size_t page_nr = start; page_nr < last; ++page_nr) {
+        ResidentPage *rp = &mv->residency_map[page_nr];
+        if (!vbar_page_is_mapped(rp) || rp->pin_count) continue;
+        if (!synchronized) {
+            synchronized = CHECK_CU_ERROR(cuCtxSynchronize());
+            if (!synchronized) {
+                /* No safe completion boundary: retain this owner until exit. */
+                for (size_t remaining = page_nr; remaining < last; ++remaining)
+                    mv->residency_map[remaining].retire_unknown = 1;
+                return false;
+            }
+        }
+        if (!mod1(mv, page_nr, true, false)) released = false;
+    }
+    return released;
+#else
+    return true;
+#endif
 }
 
-#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+#if defined(AIMDO_XPU)
 static uint8_t vbar_restore_page_mapping(ModelVBAR *mv, size_t page_nr,
                                          bool restore_resident_count) {
     ResidentPage *rp = &mv->residency_map[page_nr];
@@ -520,12 +553,18 @@ static inline bool mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unp
                             !rp->retire_unknown &&
                             !vbar_consumer_held(rp)));
 #else
-              (do_unpin || rp->pin_count == 0);
+              (do_unpin || rp->pin_count == 0)
+#if defined(AIMDO_XPU)
+              && !rp->retire_unknown
+#endif
+              ;
 #endif
     if (do_free) {
-#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+#if defined(AIMDO_XPU)
         if (!CHECK_CU_ERROR(cuMemUnmap(vaddr, VBAR_PAGE_SIZE))) {
+#if defined(_WIN32) || defined(_WIN64)
             rp->evicting = 0;
+#endif
             return false;
         }
         rp->mapped = VBAR_MAPPING_UNMAPPED;
@@ -541,14 +580,18 @@ static inline bool mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unp
                     mv->resident_count--;
                 }
             }
+#if defined(_WIN32) || defined(_WIN64)
             rp->evicting = 0;
+#endif
             return false;
         }
         total_vram_usage -= VBAR_PAGE_SIZE;
         rp->handle = 0;
         rp->mapped = VBAR_MAPPING_UNMAPPED;
+#if defined(_WIN32) || defined(_WIN64)
         rp->evicting = 0;
         vbar_retire_reset(rp);
+#endif
         mv->resident_count--;
 #else
         CHECK_CU(cuMemUnmap(vaddr, VBAR_PAGE_SIZE));
@@ -1313,6 +1356,10 @@ uint64_t vbar_get(void *devctx, void *vbar) {
 #define VBAR_FAULT_OOM               1
 #define VBAR_FAULT_ERROR             2
 
+static int vbar_fault_failed(ModelVBAR *mv, size_t first, size_t last, int reason) {
+    return vbar_unpin_range(mv, first, last) ? reason : VBAR_FAULT_ERROR;
+}
+
 static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
                              uint64_t size, uint32_t *signature) {
     ModelVBAR *mv = (ModelVBAR *)vbar;
@@ -1402,14 +1449,16 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
         ResidentPage *rp = &mv->residency_map[page_nr];
         ssize_t allocation_deficit;
 
-#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
-        if (rp->handle && rp->mapped == VBAR_MAPPING_UNKNOWN) {
+#if defined(AIMDO_XPU)
+        if (rp->handle && (rp->mapped == VBAR_MAPPING_UNKNOWN
+#if !defined(_WIN32) && !defined(_WIN64)
+                           || rp->retire_unknown
+#endif
+                           )) {
             log(AIMDO_LOG_ERROR,
                 "VBAR page %zu has an indeterminate mapping state\n",
                 (size_t)page_nr);
-            vbar_unpin_range(
-                mv, page_start, page_nr);
-            return VBAR_FAULT_ERROR;
+            return vbar_fault_failed(mv, page_start, page_nr, VBAR_FAULT_ERROR);
         }
         if (rp->handle && rp->mapped == VBAR_MAPPING_UNMAPPED) {
             /* A prior unmap succeeded but physical destroy and immediate
@@ -1420,9 +1469,7 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
                 log(AIMDO_LOG_ERROR,
                     "VBAR page %zu has an unrecoverable unmapped physical handle\n",
                     (size_t)page_nr);
-                vbar_unpin_range(
-                    mv, page_start, page_nr);
-                return VBAR_FAULT_ERROR;
+                return vbar_fault_failed(mv, page_start, page_nr, VBAR_FAULT_ERROR);
             }
         }
 #endif
@@ -1471,8 +1518,7 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
 
             if (page_end > mv->watermark) {
                 log(DEBUG, "VBAR allocation cancelled due to allocation-check watermark reduction\n");
-                vbar_unpin_range(mv, page_start, page_nr);
-                return VBAR_FAULT_OOM;
+                return vbar_fault_failed(mv, page_start, page_nr, VBAR_FAULT_OOM);
             }
         }
 
@@ -1480,7 +1526,7 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
 
         allocation_deficit = budget_deficit(VBAR_PAGE_SIZE);
         if (allocation_deficit > 0 ||
-#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+#if defined(AIMDO_XPU)
             (err = vbar_map_new_page(mv, (size_t)page_nr)) != CUDA_SUCCESS) {
 #else
             (err = three_stooges(vaddr, VBAR_PAGE_SIZE, mv->device,
@@ -1492,8 +1538,7 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
 
             if (err != CUDA_ERROR_OUT_OF_MEMORY) {
                 log(AIMDO_LOG_ERROR, "VRAM Allocation failed (non OOM)\n");
-                vbar_unpin_range(mv, page_start, page_nr);
-                return VBAR_FAULT_ERROR;
+                return vbar_fault_failed(mv, page_start, page_nr, VBAR_FAULT_ERROR);
             }
             log(DEBUG,
                 "VBAR allocator attempt exceeds available VRAM; reclaiming %zu MB ...\n",
@@ -1505,10 +1550,9 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
 #endif
             if (page_end > mv->watermark) {
                 log(DEBUG, "VBAR allocation cancelled due to backup-free watermark reduction\n");
-                vbar_unpin_range(mv, page_start, page_nr);
-                return VBAR_FAULT_OOM;
+                return vbar_fault_failed(mv, page_start, page_nr, VBAR_FAULT_OOM);
             }
-#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+#if defined(AIMDO_XPU)
             if ((err = vbar_map_new_page(mv, (size_t)page_nr)) !=
                 CUDA_SUCCESS) {
 #else
@@ -1533,15 +1577,14 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
                     if (page_end > mv->watermark) {
                         log(DEBUG,
                             "VBAR allocation cancelled after Windows XPU retry reclaim\n");
-                        vbar_unpin_range(mv, page_start, page_nr);
-                        return VBAR_FAULT_OOM;
+                        return vbar_fault_failed(mv, page_start, page_nr, VBAR_FAULT_OOM);
                     }
                     err = vbar_map_new_page(mv, (size_t)page_nr);
                 }
 #endif
             }
             if (err != CUDA_SUCCESS) {
-#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+#if defined(AIMDO_XPU)
                 if (err == CUDA_ERROR_OUT_OF_MEMORY) {
                     /* A genuine physical OOM is a memory shortage, not a
                      * malfunction. Reporting it as an error made the caller
@@ -1549,18 +1592,18 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
                      * path, and skipped the native-cache recovery that only
                      * runs for OOM. */
                     log(INFO, "VRAM Allocation OOM; weight will be offloaded\n");
-                    vbar_unpin_range(mv, page_start, page_nr);
-                    return VBAR_FAULT_OOM;
+                    return vbar_fault_failed(mv, page_start, page_nr, VBAR_FAULT_OOM);
                 }
 #endif
                 log(AIMDO_LOG_ERROR, "VRAM Allocation failed\n");
-                vbar_unpin_range(mv, page_start, page_nr);
-                return VBAR_FAULT_ERROR;
+                return vbar_fault_failed(mv, page_start, page_nr, VBAR_FAULT_ERROR);
             }
         }
-#if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
+#if defined(AIMDO_XPU)
         rp->mapped = VBAR_MAPPING_MAPPED;
+#if defined(_WIN32) || defined(_WIN64)
         rp->evicting = 0;
+#endif
 #endif
         rp->serial++;
         rp->pin_count++;
@@ -1922,6 +1965,27 @@ void vbar_free(void *devctx, void *vbar) {
     remove_vbar(mv);
     vbar_state_unlock();
     free(mv);
+#elif defined(AIMDO_XPU)
+    /* Preserve the VA and physical handle when completion or release cannot
+     * be established. An indeterminate page must remain owned until exit. */
+    if (!CHECK_CU_ERROR(cuCtxSynchronize())) return;
+    vbars_dirty = true;
+    for (size_t page_nr = 0; page_nr < mv->nr_pages; ++page_nr) {
+        ResidentPage *rp = &mv->residency_map[page_nr];
+        if (rp->retire_unknown || rp->mapped == VBAR_MAPPING_UNKNOWN) return;
+        if (rp->handle && rp->mapped == VBAR_MAPPING_UNMAPPED) {
+            if (!CHECK_CU_ERROR(cuMemRelease(rp->handle))) return;
+            total_vram_usage -= VBAR_PAGE_SIZE;
+            rp->handle = 0;
+        } else {
+            (void)mod1(mv, page_nr, true, true);
+            if (rp->handle) return;
+        }
+    }
+    if (!CHECK_CU_ERROR(cuMemAddressFree(
+            mv->vbar, mv->nr_pages * VBAR_PAGE_SIZE))) return;
+    remove_vbar(mv);
+    free(mv);
 #else
     vbar_state_lock();
     vbars_dirty = true;
@@ -1950,6 +2014,16 @@ size_t vbar_loaded_size(void *devctx, void *vbar) {
     loaded = mv->resident_count * VBAR_PAGE_SIZE;
     vbar_state_unlock();
     return loaded;
+}
+
+SHARED_EXPORT
+bool vbars_can_deinit(void *devctx) {
+    set_devctx((AimdoContext *)devctx);
+    if (!g_devctx || !highest_priority_p) return true;
+    vbar_state_lock();
+    bool empty = highest_priority.lower == &lowest_priority;
+    vbar_state_unlock();
+    return empty;
 }
 
 SHARED_EXPORT
