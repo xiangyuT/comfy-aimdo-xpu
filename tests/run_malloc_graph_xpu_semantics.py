@@ -202,6 +202,14 @@ class Suite:
             raise AssertionError(label + ': expected RuntimeError was not raised')
 
 
+class StatisticsDiagnosticSuite(Suite):
+    """Independent replay diagnostic; never counts as an upstream case pass."""
+    def stat(self, graph, expected):
+        observed = (graph.peak_used, graph.virtual_bytes, graph.physical_bytes)
+        self.stats.append({'observed': observed, 'upstream_expected': expected,
+                           'assertion_enforced': False})
+
+
 def empty(s):
     g = s.graph()
     for iteration in range(2):
@@ -1044,8 +1052,12 @@ def vmm(control):
     return list(values)
 
 
-def run(case, output, plan):
+def run(case, output, plan, *, statistics_diagnostic=False):
     assert 'torch' not in sys.modules
+    if statistics_diagnostic:
+        assert case in ('odd_sizes', 'fragmentation', 'aliasing')
+    assert type(plan['physical_xpu']) is int and plan['physical_xpu'] >= 0
+    assert str(plan['torch_affinity']) == os.environ.get('ZE_AFFINITY_MASK')
     entry = Path('/llm/ComfyUI/custom_nodes/ComfyUI-OmniXPU/runtime_bootstrap.py')
     spec = importlib.util.spec_from_file_location('xpu_semantics_bootstrap', entry)
     runtime = importlib.util.module_from_spec(spec)
@@ -1073,9 +1085,15 @@ def run(case, output, plan):
     assert avoid_alias == plan['avoid_physical_alias']
     native_hash = digest(Path(control.lib._name).read_bytes())
     assert native_hash == plan['native_sha256']
+    sidecar = Path(native_owner.__file__).parent / 'aimdo_xpu_native_owner.so'
+    sidecar_hash = digest(sidecar.read_bytes())
+    assert sidecar_hash == plan['sidecar_sha256']
+    capability = control.get_memory_compiler_capability()
+    assert capability['source_content_sha256'] == plan['native_source_content_sha256']
     assert not control.get_memory_compiler_capability()['available']
     assert native_owner.snapshot() == [0] * 17 and vmm(control) == [0] * 7
-    suite = Suite(torch, native_owner, control, output)
+    suite_type = StatisticsDiagnosticSuite if statistics_diagnostic else Suite
+    suite = suite_type(torch, native_owner, control, output)
     error = None
     try:
         globals()[case](suite)
@@ -1094,9 +1112,14 @@ def run(case, output, plan):
     assert final[0] == final[16] == 0 and final[1] == final[2] and final[12] == final[13]
     assert final_vmm == [0] * 7
     control.deinit()
-    return {'status': 'passed' if error is None else 'failed', 'case': case,
+    status = ('statistics_diagnostic_complete' if statistics_diagnostic else 'passed')
+    return {'status': status if error is None else 'failed', 'case': case,
+            'original_statistics_assertions_enforced': not statistics_diagnostic,
             'native_source_revision': manifest['source']['revision'], 'native_sha256': native_hash,
-            'torch': torch.__version__, 'device_uuid': str(props.uuid), 'physical_xpu': 0,
+            'torch': torch.__version__, 'device_uuid': str(props.uuid),
+            'physical_xpu': plan['physical_xpu'], 'torch_affinity': plan['torch_affinity'],
+            'torch_logical_index': 0, 'sidecar_sha256': sidecar_hash,
+            'native_source_content_sha256': capability['source_content_sha256'],
             'driver_sha256': driver_sha, 'driver_path': str(driver), 'driver_mappings': driver_mappings,
             'avoid_physical_alias': avoid_alias,
             'checks': suite.checks, 'stats': suite.stats, 'replays': suite.replays,
@@ -1110,13 +1133,16 @@ if __name__ == '__main__':
     parser.add_argument('--case', choices=CASES, required=True)
     parser.add_argument('--output-dir', type=Path, required=True)
     parser.add_argument('--plan', type=Path, required=True)
+    parser.add_argument('--statistics-diagnostic', action='store_true',
+                        help='Independent replay probe; not an upstream statistics pass')
     args = parser.parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=False)
     try:
-        result = run(args.case, args.output_dir, json.loads(args.plan.read_text()))
+        result = run(args.case, args.output_dir, json.loads(args.plan.read_text()),
+                     statistics_diagnostic=args.statistics_diagnostic)
     except BaseException as error:
         result = {'status': 'failed', 'case': args.case, 'harness_or_cleanup_error': repr(error),
                   'traceback': traceback.format_exc()}
     (args.output_dir / 'probe.json').write_text(json.dumps(result, indent=2) + '\n')
     print(json.dumps({key: value for key, value in result.items() if key != 'checks'}), flush=True)
-    raise SystemExit(0 if result['status'] == 'passed' else 2)
+    raise SystemExit(0 if result['status'] in ('passed', 'statistics_diagnostic_complete') else 2)

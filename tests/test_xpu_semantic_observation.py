@@ -63,3 +63,21 @@ def test_excluded_root_does_not_count_as_compiler_replay():
     assert not graph.pop()
     assert suite.replays[0]['skipped'] is True
     assert suite.replays[0]['stable'] is False
+
+
+def test_original_resource_assertion_still_stops_the_default_suite():
+    suite = object.__new__(semantics.Suite)
+    suite.stats = []
+    graph = SimpleNamespace(peak_used=32, virtual_bytes=48, physical_bytes=48)
+    with pytest.raises(AssertionError):
+        suite.stat(graph, (32, 48, 32))
+    assert suite.stats == [{'observed': (32, 48, 48),
+                            'upstream_expected': (32, 48, 32)}]
+
+
+def test_independent_resource_diagnostic_marks_unenforced_assertion():
+    suite = object.__new__(semantics.StatisticsDiagnosticSuite)
+    suite.stats = []
+    graph = SimpleNamespace(peak_used=32, virtual_bytes=48, physical_bytes=48)
+    suite.stat(graph, (32, 48, 32))
+    assert suite.stats[0]['assertion_enforced'] is False
