@@ -320,7 +320,9 @@ def test_packaging_exports_cover_python_and_native_runtime_dependencies():
     assert python_symbols <= set(builder._NATIVE_OWNER_SYMBOLS)
     native_source = (root / "src-xpu/native-owner-proxy.cpp").read_text()
     core_symbols = set(re.findall(r'dlsym\(\s*RTLD_DEFAULT,\s*"([A-Za-z0-9_]+)"', native_source))
-    assert core_symbols <= set(builder._NATIVE_OWNER_CORE_SYMBOLS) | set(builder._COMPILER_SYMBOLS)
+    assert core_symbols <= (set(builder._NATIVE_OWNER_CORE_SYMBOLS) |
+                            set(builder._NATIVE_OWNER_OPTIONAL_CORE_SYMBOLS) |
+                            set(builder._COMPILER_SYMBOLS))
 
 
 @pytest.mark.parametrize("diagnostic", [False, True])

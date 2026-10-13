@@ -92,6 +92,18 @@ the expected source revision before routing allocations. Owner destructors
 load only the published table, so a concurrent scope cannot rewrite the
 functions used by an in-flight free.
 
+The Linux diagnostic may defer a matched replay free on its creator thread's
+in-order allocation queue. It first registers an owned copy of that queue with
+the device's synchronized-reclaim registry. A free must match the current
+replay event exactly and have no registered consumer on another queue; capture,
+paused, mismatched, failed, foreign-thread and foreign-consumer releases retain
+per-owner fencing. The replay free advances only the logical cursor and keeps
+graph backing owned. Pending work is drained before returning to recording,
+remapping, abort or destruction. A failed drain retains the terminal graph and
+its physical owners until process exit. Older cores without these optional
+entry points keep the existing fenced path. This does not enable public XPU
+recording or establish a performance benefit before workload measurement.
+
 The opt-in Torch 2.14 diagnostic also exposes a bounded per-graph physical-page
 OOM injection. One failed attempt exercises the existing reclaim/retry path;
 two failed attempts exercise terminal allocation failure and graph abort. This

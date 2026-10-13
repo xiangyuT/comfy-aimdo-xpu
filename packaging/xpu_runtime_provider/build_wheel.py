@@ -61,6 +61,11 @@ _NATIVE_OWNER_CORE_SYMBOLS = (
     "xpu_allocator_get_memory_stats", "xpu_ur_hook_retire_borrowed",
     "xpu_ur_hook_get_retirement_stats",
 )
+# Resolved opportunistically by newer sidecars. Missing either keeps the
+# existing per-owner fencing; it does not invalidate a complete older payload.
+_NATIVE_OWNER_OPTIONAL_CORE_SYMBOLS = (
+    "malloc_graph_free_owned_replay", "aimdo_xpu_register_consumer_queue",
+)
 
 
 def _compiler_api_contract(source_version, files):

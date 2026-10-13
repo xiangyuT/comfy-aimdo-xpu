@@ -53,6 +53,7 @@ struct Owner {
           creator_token(creator_state->token) {}
     ~Owner();
     bool wait_consumers();
+    bool free_replay();
     enum class Kind { Native, Custom, Compiler } kind;
     c10::DataPtr native;
     void *custom_pointer = nullptr;
@@ -79,6 +80,7 @@ using CompilerRogue = bool (*)(uint64_t, int *);
 using SetDevice = bool (*)(int);
 using AllocationDriverError = int (*)();
 using ExcludedAllocation = void (*)(void *);
+using RegisterQueue = bool (*)(void *, int);
 struct CompilerFunctions {
     CompilerAlloc alloc;
     CompilerFree free;
@@ -87,6 +89,8 @@ struct CompilerFunctions {
     SetDevice set_device;
     AllocationDriverError allocation_error;
     ExcludedAllocation excluded_allocation;
+    CompilerFree free_replay;
+    RegisterQueue register_queue;
 };
 std::mutex g_compiler_binding_mutex;
 std::atomic<const CompilerFunctions *> g_compiler_functions{nullptr};
@@ -153,6 +157,9 @@ thread_local void *g_duplicate_next_compiler_pointer = nullptr;
 std::recursive_mutex &g_lifecycle_mutex = *new std::recursive_mutex();
 thread_local bool g_transition = false;
 std::atomic<uint64_t> g_active_scopes{0};
+std::atomic<uint64_t> g_compiler_replay_frees{0};
+std::atomic<uint64_t> g_compiler_waits{0};
+thread_local bool g_compiler_replay_queue_ready = false;
 
 struct AllocationOperation {
     std::unique_lock<std::recursive_mutex> guard{g_lifecycle_mutex};
@@ -164,6 +171,9 @@ struct AllocationOperation {
 bool Owner::wait_consumers() {
     if (fenced) return true;
     if (!custom_queue) return false;
+    if (kind == Kind::Compiler) {
+        g_compiler_waits.fetch_add(1, std::memory_order_relaxed);
+    }
     try {
         for (auto &queue : consumers) {
             queue.ext_oneapi_submit_barrier().wait_and_throw();
@@ -176,8 +186,40 @@ bool Owner::wait_consumers() {
     }
 }
 
+bool Owner::free_replay() {
+    const auto *functions = g_compiler_functions.load(std::memory_order_acquire);
+    if (!g_compiler_scope || !g_compiler_replay_queue_ready ||
+        g_compiler_terminal.load(std::memory_order_acquire) ||
+        g_compiler_scope_stream != compiler_stream ||
+        creator_token != current_thread_token() || !custom_queue ||
+        !functions || !functions->free_replay || !functions->set_device) return false;
+    try {
+        if (c10::xpu::current_device() != compiler_device ||
+            c10::xpu::getCurrentXPUStream(compiler_device).queue() != *custom_queue) return false;
+        std::lock_guard<std::mutex> guard(consumer_mutex);
+        for (const auto &queue : consumers) {
+            if (queue != *custom_queue) return false;
+        }
+        if (!functions->set_device(compiler_device)) return false;
+        int result = -1;
+        if (!functions->free_replay(reinterpret_cast<uintptr_t>(custom_pointer),
+                reinterpret_cast<void *>(compiler_stream), &result)) return false;
+        if (result != 0) return false;
+        if (accounted) {
+            g_compiler_live_bytes.fetch_sub(custom_bytes, std::memory_order_relaxed);
+            g_compiler_releases.fetch_add(1, std::memory_order_relaxed);
+        }
+        custom_pointer = nullptr;
+        g_compiler_replay_frees.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 Owner::~Owner() {
     if (kind == Kind::Native || !custom_pointer || !custom_queue) return;
+    if (kind == Kind::Compiler && free_replay()) return;
     if (!wait_consumers()) {
         if (kind == Kind::Compiler) {
             g_compiler_failures.fetch_add(1, std::memory_order_relaxed);
@@ -763,6 +805,14 @@ aimdo_full_proxy_scoped_raw_snapshot(uint64_t *values, size_t count) {
 }
 
 extern "C" __attribute__((visibility("default"))) bool
+aimdo_full_proxy_compiler_free_snapshot(uint64_t *values, size_t count) {
+    if (!g_proxy || !values || count != 2) return false;
+    values[0] = g_compiler_replay_frees.load(std::memory_order_relaxed);
+    values[1] = g_compiler_waits.load(std::memory_order_relaxed);
+    return true;
+}
+
+extern "C" __attribute__((visibility("default"))) bool
 aimdo_full_proxy_is_compiler_owner(void *pointer) {
     if (!g_proxy || !pointer) return false;
     std::lock_guard<std::mutex> guard(g_owner_mutex);
@@ -815,6 +865,10 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler
         dlsym(RTLD_DEFAULT, "malloc_graph_last_allocation_driver_error"));
     auto excluded_allocation = reinterpret_cast<ExcludedAllocation>(
         dlsym(RTLD_DEFAULT, "malloc_graph_note_excluded_allocation"));
+    auto free_replay = reinterpret_cast<CompilerFree>(
+        dlsym(RTLD_DEFAULT, "malloc_graph_free_owned_replay"));
+    auto register_queue = reinterpret_cast<RegisterQueue>(
+        dlsym(RTLD_DEFAULT, "aimdo_xpu_register_consumer_queue"));
     if (!source || !alloc || !free || !free_owned || !rogue || !set_device ||
         std::strcmp(source(), expected_revision) != 0) return false;
     {
@@ -826,13 +880,27 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler
                 bound->free_owned != free_owned || bound->rogue != rogue ||
                 bound->set_device != set_device ||
                 bound->allocation_error != allocation_error ||
-                bound->excluded_allocation != excluded_allocation) return false;
+                bound->excluded_allocation != excluded_allocation ||
+                bound->free_replay != free_replay ||
+                bound->register_queue != register_queue) return false;
         } else {
             auto *created = new (std::nothrow) CompilerFunctions{
-                alloc, free, free_owned, rogue, set_device, allocation_error, excluded_allocation};
+                alloc, free, free_owned, rogue, set_device, allocation_error,
+                excluded_allocation, free_replay, register_queue};
             if (!created) return false;
             // The table is immutable and retained for the sidecar's lifetime.
             g_compiler_functions.store(created, std::memory_order_release);
+        }
+    }
+    g_compiler_replay_queue_ready = false;
+    if (free_replay && register_queue) {
+        try {
+            auto *queue = reinterpret_cast<sycl::queue *>(stream);
+            g_compiler_replay_queue_ready =
+                queue->has_property<sycl::property::queue::in_order>() &&
+                register_queue(queue, c10::xpu::current_device());
+        } catch (...) {
+            // Older cores and unregistered/out-of-order queues retain fencing.
         }
     }
     g_compiler_scope_bytes = bytes;
@@ -850,6 +918,7 @@ extern "C" __attribute__((visibility("default"))) bool aimdo_full_proxy_compiler
     g_compiler_scope = false;
     g_compiler_scope_bytes = 0;
     g_compiler_scope_stream = 0;
+    g_compiler_replay_queue_ready = false;
     g_active_scopes.fetch_sub(1);
     return true;
 }

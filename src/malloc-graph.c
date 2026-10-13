@@ -140,10 +140,28 @@ typedef struct {
     unsigned test_page_create_oom_attempts;
     unsigned test_destroy_release_stage;
     bool destroy_terminal;
+    bool owner_work_pending;
 #endif
 } MallocGraph;
 
 static _Thread_local MallocGraph *active_graph;
+
+/* Replay frees can retire a DataPtr before its in-order queue completes. The
+ * graph keeps its mappings until a transition needs to change/release them.
+ * The sidecar registers that owned queue before using this private route. */
+static bool drain_owner_work(MallocGraph *g) {
+#ifdef AIMDO_XPU
+    if (g->owner_work_pending) {
+        if (!set_devctx_for_device(g->device) || cuCtxSynchronize()) {
+            g->failed = true;
+            g->destroy_terminal = true;
+            return false;
+        }
+        g->owner_work_pending = false;
+    }
+#endif
+    return true;
+}
 
 static bool rogue_va(MallocGraph *g, size_t va);
 static bool rogue_phys(MallocGraph *g, size_t phys);
@@ -483,6 +501,7 @@ static CUresult create_page(MallocGraph *g, PhysicalPage **page) {
 
 static CUresult map_reference(MallocGraph *g, CUdeviceptr address,
                               PhysicalPage *page, PhysicalPage **mapping) {
+    if (!drain_owner_work(g)) return CUDA_ERROR_UNKNOWN;
     CUmemAccessDesc access = {.location = {CU_MEM_LOCATION_TYPE_DEVICE, g->device},
                               .flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE};
     PhysicalPage *reference = physical_page_ref(page, 0);
@@ -710,6 +729,7 @@ static void free_rogue_candidates(MallocGraph *g) {
 }
 
 static bool abort_graph(MallocGraph *g) {
+    if (!drain_owner_work(g)) return false;
     if (g->aborted) {
         return true;
     }
@@ -843,6 +863,7 @@ fail:
 
 static bool start_recording(MallocGraph *g) {
     RETURN_G_FAILED(g->assert_breaks, false);
+    if (!drain_owner_work(g)) return false;
     if (!materialize(g, g->state->cursor)) {
         return false;
     }
@@ -1123,6 +1144,34 @@ bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result) {
 }
 
 #ifdef AIMDO_XPU
+/* No mapping, physical reference or event-tree mutation is permitted here.
+ * The caller proves an in-order owner queue, creator-thread release and no
+ * foreign consumers. A miss preserves the ordinary fenced owned-free path. */
+SHARED_EXPORT bool malloc_graph_free_owned_replay(CUdeviceptr ptr,
+                                                 CUstream owner_stream,
+                                                 int *result) {
+    MallocGraph *g = active_graph;
+    if (!g || !result || g->owner_thread != &active_graph ||
+        graph_failed(g) || g->paused || !g->state || g->state->recording ||
+        !owner_stream || owner_stream != g->stream) {
+        return false;
+    }
+    CUdeviceptr base = virtual_range_get(g->base);
+    CUdeviceptr small_base = virtual_range_get(g->small_base);
+    bool small = ptr >= small_base && ptr - small_base < MG_SMALL_PAGES * MG_PAGE;
+    if (!small && (ptr < base || ptr - base >= MG_PAGES * MG_PAGE ||
+                   (ptr - base) % MG_PAGE)) {
+        return false;
+    }
+    size_t value = small ? ptr - small_base : (ptr - base) / MG_PAGE;
+    Event *match = find_event(g, small ? EV_FREE_SMALL : EV_FREE, value, 0, NULL);
+    if (!match) return false;
+    g->state->cursor = match;
+    g->owner_work_pending = true;
+    *result = CUDA_SUCCESS;
+    return true;
+}
+
 SHARED_EXPORT bool malloc_graph_test_fail_next_page_creates(unsigned attempts) {
     MallocGraph *g = active_graph;
     if (!g || g->owner_thread != &active_graph || g->failed || g->paused ||
@@ -1457,6 +1506,8 @@ static bool destroy_graph(void *handle) {
 #ifdef AIMDO_XPU
     if (g->destroy_terminal) return false;
 #endif
+
+    if (!drain_owner_work(g)) return false;
 
     if (g->state && !abort_graph(g)) {
         return false;
