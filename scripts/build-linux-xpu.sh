@@ -91,7 +91,7 @@ OBJECTS+=("$BUILD_DIR/xpu-ur-usm-hook.o")
 echo "built $OUTPUT_PATH"
 
 # The Torch-facing owner is a separate, opt-in diagnostic DSO. The normal
-# 0.5.5 XPU build and its public compiler capability remain unchanged.
+# normal XPU build and its public compiler capability remain unchanged.
 NATIVE_OWNER_DIAGNOSTIC=${AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC:-0}
 case "$NATIVE_OWNER_DIAGNOSTIC" in
     0) ;;

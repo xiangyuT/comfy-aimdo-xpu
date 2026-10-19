@@ -48,7 +48,7 @@ Standalone callers can initialize the backend with
 `control.init(implementation="xpu")`. Initialization must occur before the
 first XPU stream or allocation is created.
 
-AIMDO 0.5.3 basic APIs are available in this fork. The AIMDO memory compiler
+AIMDO 0.5.6 basic APIs are available in this fork. The AIMDO memory compiler
 (recording and replaying allocation graphs) is not yet supported on XPU;
 `control.record()` and `malloc_graph.record()` raise `NotImplementedError`
 for XPU. DynamicVRAM model-weight offloading remains available.

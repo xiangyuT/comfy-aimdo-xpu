@@ -29,6 +29,12 @@ ENTRY_POINT_GROUP = "comfyui_omnixpu.runtime_providers"
 SOURCE_REPOSITORY = "https://github.com/xiangyuT/comfy-aimdo-xpu.git"
 SUPPORTED_PLATFORMS = ("linux", "win32")
 _REVISION_PATTERN = re.compile(r"[0-9a-f]{40}")
+# Official releases whose Python/compiler API has been reviewed. A provider
+# advertises its matching release only; this is not a version-range promise.
+_COMPILER_RELEASES = {
+    "0.5.5": "3b8e8c162efeb9470d912609a7a6e7a2b1c693ec",
+    "0.5.6": "08b37eec31319b7f245afdc009e34a9861565c25",
+}
 _COMPILER_SYMBOLS = (
     "malloc_graph_create", "malloc_graph_push", "malloc_graph_pop",
     "malloc_graph_pause", "malloc_graph_set_stream", "malloc_graph_abort",
@@ -83,8 +89,8 @@ def _compiler_api_contract(source_version, files):
         # This task integrates the Linux D1 payload only. Preserve the existing
         # exact-version Windows provider until its native build is reviewed.
         return None
-    if source_version != "0.5.5":
-        raise RuntimeError("Linux compiler API compatibility requires reviewed AIMDO 0.5.5")
+    if source_version not in _COMPILER_RELEASES:
+        raise RuntimeError("Linux compiler API compatibility requires a reviewed AIMDO release")
     for name, data in native:
         with tempfile.TemporaryDirectory(prefix="aimdo-abi-inspect-") as temporary:
             path = Path(temporary) / PurePosixPath(name).name
@@ -99,8 +105,8 @@ def _compiler_api_contract(source_version, files):
             if missing:
                 raise RuntimeError("compiler-aware provider is missing native exports: " + ", ".join(sorted(missing)))
     return {"schema_version": 1, "compiler_abi_revision": 1,
-            "upstream_reference_revision": "3b8e8c162efeb9470d912609a7a6e7a2b1c693ec",
-            "canonical_versions": ["0.5.5"],
+            "upstream_reference_revision": _COMPILER_RELEASES[source_version],
+            "canonical_versions": [source_version],
             "required_modules": sorted(required), "required_native_symbols": list(_COMPILER_SYMBOLS),
             "xpu_recording_supported": False}
 
@@ -110,8 +116,8 @@ def _native_owner_diagnostic_contract(source_version, torch_version, files):
     native = f"{CANONICAL_PACKAGE}/aimdo_xpu_native_owner.so"
     if native not in files:
         return None
-    if source_version != "0.5.5":
-        raise RuntimeError("native-owner diagnostic requires the AIMDO 0.5.5 compiler core")
+    if source_version not in _COMPILER_RELEASES:
+        raise RuntimeError("native-owner diagnostic requires a reviewed AIMDO compiler release")
     if f"{CANONICAL_PACKAGE}/native_owner.py" not in files:
         raise RuntimeError("native-owner diagnostic Python module is missing")
     with tempfile.TemporaryDirectory(prefix="aimdo-native-owner-inspect-") as temporary:
