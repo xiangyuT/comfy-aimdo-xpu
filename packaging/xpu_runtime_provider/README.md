@@ -137,15 +137,14 @@ No other thread drains that queue; process exit is required.
 
 For a Linux source wheel containing `malloc_graph.py`, the builder requires the
 complete provider module set and all twelve compiler ABI/provenance exports in
-`aimdo_xpu.so`. The builder accepts reviewed source releases `0.5.5` and `0.5.6`, and each
-provider declares compatibility only with its matching official release. The
-0.5.6 upstream reference is `08b37eec31319b7f245afdc009e34a9861565c25`;
-0.5.5 retains `3b8e8c162efeb9470d912609a7a6e7a2b1c693ec`. No unreviewed
-version range is admitted. The provider distribution
-keeps the source wheel's existing version. Source revision and native content
-hashes identify development changes independently of that version. Windows
-provider packaging retains its previous exact-version behavior until its native
-compiler build receives separate validation.
+`aimdo_xpu.so`. Each provider takes its version and matching official-distribution
+version directly from the source wheel's metadata. There is no manual release
+allowlist or version-to-upstream-commit table. Downstream integrations such as
+llm-scaler select and validate their software version combinations. Source
+revision and native content hashes record artifact provenance independently of
+the distribution version. Windows providers retain the source wheel's exact
+version metadata; these Linux export checks do not establish Windows native
+compiler validation.
 
 `control.get_memory_compiler_capability()` reports the built core separately
 from runtime availability. XPU recording remains unavailable until a logical
