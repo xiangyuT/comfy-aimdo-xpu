@@ -7,11 +7,11 @@ library are stored below its private `_vendor` directory. It never installs a
 top-level `comfy_aimdo` file, so the official AIMDO distribution remains
 independently upgradeable.
 
-After building `comfy_aimdo/aimdo_xpu.so` and the canonical 0.5.5 wheel, run:
+After building `comfy_aimdo/aimdo_xpu.so` and the canonical 0.5.6 wheel, run:
 
 ```bash
 python packaging/xpu_runtime_provider/build_wheel.py \
-  --source-wheel dist/comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl \
+  --source-wheel dist/comfy_aimdo-0.5.6-cp39-abi3-linux_x86_64.whl \
   --output-dir dist/provider \
   --source-revision "$(git rev-parse HEAD)" \
   --torch-version 2.13.0+xpu \
@@ -22,13 +22,15 @@ The output contains a lightweight
 `comfyui_omnixpu.runtime_providers` entry point and a manifest covering the
 canonical version, exact source revision, source-wheel hash, native-library
 hash, supported runtime, and allocator modes. Importing its metadata does not
-import PyTorch or AIMDO. The source and provider wheels both use version 0.5.5.
+import PyTorch or AIMDO. The source and provider wheels both use version 0.5.6.
 
-The provider retains its Linux and Windows runtime declarations. Local 0.5.5
-build and install validation covers Linux only. The Windows XPU build script
+The provider retains its Linux and Windows runtime declarations. Version 0.5.6
+imports upstream's NULL physical-page release guard; it adds no public XPU
+recording capability. Historical 0.5.5 build and install validation covered
+Linux only; 0.5.6 installed-runtime validation remains pending. The Windows XPU build script
 now includes upstream `disk-id.c` and its required libraries, providing the
 `aimdo_storage_fast_disk` source for `storage.fast_disk()`. A Windows build
-and runtime test are still required before this 0.5.5 API and the existing
+and runtime test are still required before the 0.5.6 API and the existing
 Windows allocator route can be claimed as validated.
 
 For the opt-in Linux B70 native-owner diagnostic, build against the selected
@@ -41,11 +43,11 @@ AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC=1 \
 AIMDO_TORCH_PYTHON=/opt/venv/bin/python \
 bash scripts/build-linux-xpu.sh
 
-SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COMFY_AIMDO=0.5.5 \
+SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COMFY_AIMDO=0.5.6 \
 /opt/venv/bin/python -m build --wheel --no-isolation --outdir dist
 
 python packaging/xpu_runtime_provider/build_wheel.py \
-  --source-wheel dist/comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl \
+  --source-wheel dist/comfy_aimdo-0.5.6-cp39-abi3-linux_x86_64.whl \
   --output-dir dist/provider \
   --source-revision "$(git rev-parse HEAD)" \
   --torch-version 2.14.0+xpu \
@@ -135,13 +137,14 @@ No other thread drains that queue; process exit is required.
 
 For a Linux source wheel containing `malloc_graph.py`, the builder requires the
 complete provider module set and all twelve compiler ABI/provenance exports in
-`aimdo_xpu.so`. This D1 source declares compatibility only with the reviewed
-official `0.5.5` API, imported at
-`3b8e8c162efeb9470d912609a7a6e7a2b1c693ec`. The provider distribution
-keeps the source wheel's existing version. Source revision and native content
-hashes identify development changes independently of that version. Windows
-provider packaging retains its previous exact-version behavior until its native
-compiler build receives separate validation.
+`aimdo_xpu.so`. Each provider takes its version and matching official-distribution
+version directly from the source wheel's metadata. There is no manual release
+allowlist or version-to-upstream-commit table. Downstream integrations such as
+llm-scaler select and validate their software version combinations. Source
+revision and native content hashes record artifact provenance independently of
+the distribution version. Windows providers retain the source wheel's exact
+version metadata; these Linux export checks do not establish Windows native
+compiler validation.
 
 `control.get_memory_compiler_capability()` reports the built core separately
 from runtime availability. XPU recording remains unavailable until a logical

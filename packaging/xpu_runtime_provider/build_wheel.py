@@ -83,8 +83,6 @@ def _compiler_api_contract(source_version, files):
         # This task integrates the Linux D1 payload only. Preserve the existing
         # exact-version Windows provider until its native build is reviewed.
         return None
-    if source_version != "0.5.5":
-        raise RuntimeError("Linux compiler API compatibility requires reviewed AIMDO 0.5.5")
     for name, data in native:
         with tempfile.TemporaryDirectory(prefix="aimdo-abi-inspect-") as temporary:
             path = Path(temporary) / PurePosixPath(name).name
@@ -99,19 +97,16 @@ def _compiler_api_contract(source_version, files):
             if missing:
                 raise RuntimeError("compiler-aware provider is missing native exports: " + ", ".join(sorted(missing)))
     return {"schema_version": 1, "compiler_abi_revision": 1,
-            "upstream_reference_revision": "3b8e8c162efeb9470d912609a7a6e7a2b1c693ec",
-            "canonical_versions": ["0.5.5"],
+            "canonical_versions": [source_version],
             "required_modules": sorted(required), "required_native_symbols": list(_COMPILER_SYMBOLS),
             "xpu_recording_supported": False}
 
 
-def _native_owner_diagnostic_contract(source_version, torch_version, files):
+def _native_owner_diagnostic_contract(torch_version, files):
     """Bind the optional D2 sidecar without declaring compiler availability."""
     native = f"{CANONICAL_PACKAGE}/aimdo_xpu_native_owner.so"
     if native not in files:
         return None
-    if source_version != "0.5.5":
-        raise RuntimeError("native-owner diagnostic requires the AIMDO 0.5.5 compiler core")
     if f"{CANONICAL_PACKAGE}/native_owner.py" not in files:
         raise RuntimeError("native-owner diagnostic Python module is missing")
     with tempfile.TemporaryDirectory(prefix="aimdo-native-owner-inspect-") as temporary:
@@ -345,7 +340,7 @@ def build_provider_wheel(
     ) = _source_wheel_contract(source_wheel)
     compiler_api = _compiler_api_contract(source_version, source_files)
     native_owner_diagnostic = _native_owner_diagnostic_contract(
-        source_version, torch_version, source_files
+        torch_version, source_files
     )
     vendored_files = {
         f"{PROVIDER_PACKAGE}/_vendor/{name}": data

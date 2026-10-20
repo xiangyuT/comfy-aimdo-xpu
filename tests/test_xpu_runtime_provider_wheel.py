@@ -43,7 +43,7 @@ def _source_wheel(
     include_native: bool = True,
     include_compiler_api: bool = False,
     include_native_owner: bool = False,
-    version: str = "0.5.5",
+    version: str = "0.5.6",
 ) -> Path:
     dist_info = f"comfy_aimdo-{version}.dist-info"
     with zipfile.ZipFile(path, "w") as archive:
@@ -80,7 +80,7 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
     monkeypatch.setenv("SOURCE_DATE_EPOCH", "1700000000")
     builder = _load_builder()
     source = _source_wheel(
-        tmp_path / "comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl"
+        tmp_path / "comfy_aimdo-0.5.6-cp39-abi3-linux_x86_64.whl"
     )
 
     provider = builder.build_provider_wheel(
@@ -92,7 +92,7 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
     )
 
     assert provider.name == (
-        "comfy_aimdo_xpu_runtime-0.5.5-cp39-abi3-linux_x86_64.whl"
+        "comfy_aimdo_xpu_runtime-0.5.6-cp39-abi3-linux_x86_64.whl"
     )
     if os.name == "posix":
         assert provider.stat().st_mode & 0o777 == 0o644
@@ -113,7 +113,7 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
         assert manifest["canonical_import"] == "comfy_aimdo"
         assert manifest["canonical_distribution"] == {
             "name": "comfy-aimdo",
-            "compatible_versions": ["0.5.5"],
+            "compatible_versions": ["0.5.6"],
         }
         assert manifest["runtime"]["platforms"] == ["linux", "win32"]
         assert manifest["source"]["revision"] == "a" * 40
@@ -137,12 +137,12 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
         ]
 
         wheel_metadata = archive.read(
-            "comfy_aimdo_xpu_runtime-0.5.5.dist-info/WHEEL"
+            "comfy_aimdo_xpu_runtime-0.5.6.dist-info/WHEEL"
         ).decode()
         assert "Root-Is-Purelib: false" in wheel_metadata
         assert "Tag: cp39-abi3-linux_x86_64" in wheel_metadata
         entry_points = archive.read(
-            "comfy_aimdo_xpu_runtime-0.5.5.dist-info/entry_points.txt"
+            "comfy_aimdo_xpu_runtime-0.5.6.dist-info/entry_points.txt"
         ).decode()
         assert "[comfyui_omnixpu.runtime_providers]" in entry_points
         assert (
@@ -154,7 +154,7 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
             csv.reader(
                 io.StringIO(
                     archive.read(
-                    "comfy_aimdo_xpu_runtime-0.5.5.dist-info/RECORD"
+                    "comfy_aimdo_xpu_runtime-0.5.6.dist-info/RECORD"
                     ).decode()
                 )
             )
@@ -165,7 +165,7 @@ def test_provider_wheel_has_disjoint_top_level_and_native_manifest(
 def test_provider_builder_requires_native_xpu_runtime(tmp_path):
     builder = _load_builder()
     source = _source_wheel(
-        tmp_path / "comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl",
+        tmp_path / "comfy_aimdo-0.5.6-cp39-abi3-linux_x86_64.whl",
         include_native=False,
     )
 
@@ -183,7 +183,7 @@ def test_provider_wheel_is_reproducible(tmp_path, monkeypatch):
     monkeypatch.setenv("SOURCE_DATE_EPOCH", "1700000000")
     builder = _load_builder()
     source = _source_wheel(
-        tmp_path / "comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl"
+        tmp_path / "comfy_aimdo-0.5.6-cp39-abi3-linux_x86_64.whl"
     )
     arguments = {
         "source_wheel": source,
@@ -202,11 +202,12 @@ def test_provider_wheel_is_reproducible(tmp_path, monkeypatch):
     assert first.read_bytes() == second.read_bytes()
 
 
-def test_linux_compiler_api_manifest_requires_complete_055_exports(tmp_path, monkeypatch):
+@pytest.mark.parametrize("version", ["0.5.5", "0.5.6"])
+def test_linux_compiler_api_manifest_requires_complete_exports(tmp_path, monkeypatch, version):
     builder = _load_builder()
     source = _source_wheel(
-        tmp_path / "comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl",
-        include_compiler_api=True,
+        tmp_path / f"comfy_aimdo-{version}-cp39-abi3-linux_x86_64.whl",
+        include_compiler_api=True, version=version,
     )
     monkeypatch.setattr(builder, "shutil", types.SimpleNamespace(which=lambda _: "nm"))
     monkeypatch.setattr(
@@ -228,24 +229,17 @@ def test_linux_compiler_api_manifest_requires_complete_055_exports(tmp_path, mon
     )
     with zipfile.ZipFile(provider) as archive:
         manifest = json.loads(archive.read("comfy_aimdo_xpu_runtime/provider.json"))
-    assert manifest["canonical_distribution"]["compatible_versions"] == ["0.5.5"]
+    assert manifest["canonical_distribution"]["compatible_versions"] == [version]
     assert manifest["api_compatibility"]["xpu_recording_supported"] is False
-    assert manifest["api_compatibility"]["upstream_reference_revision"] == (
-        "3b8e8c162efeb9470d912609a7a6e7a2b1c693ec"
-    )
-
-    with pytest.raises(RuntimeError, match="reviewed AIMDO 0.5.5"):
-        builder._compiler_api_contract("0.5.2", {
-            "comfy_aimdo/" + module + ".py": b"x"
-            for module in ("control", "torch", "malloc_graph", "host_buffer", "model_vbar", "vram_buffer")
-        } | {"comfy_aimdo/aimdo_xpu.so": b"fake"})
+    assert "upstream_reference_revision" not in manifest["api_compatibility"]
 
 
-def test_torch214_native_owner_sidecar_is_explicit_and_version_bound(tmp_path, monkeypatch):
+@pytest.mark.parametrize("version", ["0.5.5", "0.5.6"])
+def test_torch214_native_owner_sidecar_is_explicit_and_version_bound(tmp_path, monkeypatch, version):
     builder = _load_builder()
     source = _source_wheel(
-        tmp_path / "comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl",
-        include_compiler_api=True, include_native_owner=True,
+        tmp_path / f"comfy_aimdo-{version}-cp39-abi3-linux_x86_64.whl",
+        include_compiler_api=True, include_native_owner=True, version=version,
     )
     monkeypatch.setattr(builder, "shutil", types.SimpleNamespace(which=lambda _: "nm"))
     monkeypatch.setattr(
@@ -274,6 +268,7 @@ def test_torch214_native_owner_sidecar_is_explicit_and_version_bound(tmp_path, m
         "path": sidecar,
         "sha256": hashlib.sha256(b"fake-native-owner").hexdigest(),
     }
+    assert manifest["canonical_distribution"]["compatible_versions"] == [version]
     assert manifest["api_compatibility"]["xpu_recording_supported"] is False
     assert {item["path"] for item in manifest["native_artifacts"]} == {
         "comfy_aimdo_xpu_runtime/_vendor/comfy_aimdo/aimdo_xpu.so", sidecar,
@@ -304,7 +299,7 @@ def test_native_owner_payload_rejects_each_missing_required_export(tmp_path, mon
             return subprocess.CompletedProcess(command, 0, stdout="\n".join(set(selected) - {missing}))
         monkeypatch.setattr(builder.subprocess, "run", inspect)
         with pytest.raises(RuntimeError, match=missing):
-            builder._native_owner_diagnostic_contract("0.5.5", "2.14.0+xpu", files)
+            builder._native_owner_diagnostic_contract("2.14.0+xpu", files)
 
 
 def test_packaging_exports_cover_python_and_native_runtime_dependencies():
@@ -327,7 +322,7 @@ def test_packaging_exports_cover_python_and_native_runtime_dependencies():
 def test_retirement_stats_are_required_for_the_private_diagnostic_only(tmp_path, monkeypatch, diagnostic):
     builder = _load_builder()
     source = _source_wheel(
-        tmp_path / "comfy_aimdo-0.5.5-cp39-abi3-linux_x86_64.whl",
+        tmp_path / "comfy_aimdo-0.5.6-cp39-abi3-linux_x86_64.whl",
         include_compiler_api=True, include_native_owner=diagnostic,
     )
     exports = set((*builder._COMPILER_SYMBOLS, *builder._NATIVE_OWNER_SYMBOLS,
@@ -342,3 +337,45 @@ def test_retirement_stats_are_required_for_the_private_diagnostic_only(tmp_path,
             builder.build_provider_wheel(**args)
     else:
         assert builder.build_provider_wheel(**args).is_file()
+
+
+@pytest.mark.parametrize("version", ["0.5.2", "0.5.7", "0.6.0"])
+def test_complete_payload_uses_source_wheel_version_without_a_release_allowlist(tmp_path, monkeypatch, version):
+    # These are metadata fixtures, not declarations of validated releases.
+    builder = _load_builder()
+    source = _source_wheel(
+        tmp_path / f"comfy_aimdo-{version}-cp39-abi3-linux_x86_64.whl",
+        include_compiler_api=True, include_native_owner=True, version=version,
+    )
+    monkeypatch.setattr(builder.shutil, "which", lambda _: "nm")
+    monkeypatch.setattr(builder.subprocess, "run", lambda command, **kwargs:
+        subprocess.CompletedProcess(command, 0, stdout="\n".join(
+            (*builder._COMPILER_SYMBOLS, *builder._NATIVE_OWNER_SYMBOLS, *builder._NATIVE_OWNER_CORE_SYMBOLS))))
+    provider = builder.build_provider_wheel(
+        source_wheel=source, output_directory=tmp_path / "provider",
+        source_revision="f" * 40, torch_version="2.14.0+xpu", xpu_target="bmg",
+    )
+    with zipfile.ZipFile(provider) as archive:
+        manifest = json.loads(archive.read("comfy_aimdo_xpu_runtime/provider.json"))
+        metadata = archive.read(f"comfy_aimdo_xpu_runtime-{version}.dist-info/METADATA").decode()
+    assert manifest["provider_distribution"]["version"] == version
+    assert manifest["canonical_distribution"]["compatible_versions"] == [version]
+    assert manifest["api_compatibility"]["canonical_versions"] == [version]
+    assert manifest["api_compatibility"]["xpu_recording_supported"] is False
+    assert "upstream_reference_revision" not in manifest["api_compatibility"]
+    assert manifest["native_owner_diagnostic"]["enabled_by_default"] is False
+    assert f"Version: {version}\n" in metadata
+
+
+def test_compiler_payload_still_requires_each_native_export(monkeypatch):
+    builder = _load_builder()
+    files = {
+        "comfy_aimdo/" + name + ".py": b"x"
+        for name in ("control", "torch", "malloc_graph", "host_buffer", "model_vbar", "vram_buffer")
+    } | {"comfy_aimdo/aimdo_xpu.so": b"core"}
+    monkeypatch.setattr(builder.shutil, "which", lambda _: "nm")
+    for missing in builder._COMPILER_SYMBOLS:
+        monkeypatch.setattr(builder.subprocess, "run", lambda command, **kwargs:
+            subprocess.CompletedProcess(command, 0, stdout="\n".join(set(builder._COMPILER_SYMBOLS) - {missing})))
+        with pytest.raises(RuntimeError, match=missing):
+            builder._compiler_api_contract("0.5.6", files)
