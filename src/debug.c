@@ -14,6 +14,11 @@ void set_log_callback(AimdoLogCallback callback) {
 }
 
 void aimdo_log_message(int level, const char *message) {
+    /* Match log()/log_shot() for every sink, including direct backend records.
+     * ALL is the unconfigured default; NONE suppresses errors as well. */
+    if (log_level != ALL && log_level < level) {
+        return;
+    }
     if (log_callback) {
         log_callback(level, message);
     } else {

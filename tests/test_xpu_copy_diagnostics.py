@@ -142,7 +142,24 @@ def native(tmp_path_factory):
     lib.test_attempts.restype = ctypes.c_int
     lib.test_message.argtypes = [ctypes.c_char_p]
     lib.test_message.restype = None
+    lib.aimdo_log_message.argtypes = [ctypes.c_int, ctypes.c_char_p]
+    lib.aimdo_log_message.restype = None
+    for name in ("none", "critical", "error", "warning", "info", "debug",
+                 "verbose", "vverbose"):
+        setter = getattr(lib, "set_log_level_" + name)
+        setter.argtypes = []
+        setter.restype = None
     return lib
+
+
+@pytest.fixture(autouse=True)
+def restore_native_log_level(native):
+    level = ctypes.c_int.in_dll(native, "log_level")
+    previous = level.value
+    try:
+        yield
+    finally:
+        level.value = previous
 
 
 @pytest.fixture
@@ -289,3 +306,93 @@ def test_broken_python_collector_falls_back_to_stderr(collected, monkeypatch, ca
     assert "message=primary error survives a broken collector" in output
     assert "message_end parts=1" in output
     assert len(calls) > 2
+
+
+@pytest.mark.parametrize("sink", ["callback", "stderr"])
+@pytest.mark.parametrize(("setting", "threshold"), [
+    ("none", -1), ("critical", 1), ("error", 2), ("warning", 3),
+    ("info", 4), ("debug", 5), ("verbose", 6), ("vverbose", 7),
+])
+def test_native_level_setters_filter_both_sinks(native, monkeypatch, capfd,
+                                               sink, setting, threshold):
+    monkeypatch.setattr(control, "lib", native)
+    getattr(control, "set_log_" + setting)()
+    seen = []
+    callback = control._LOG_CALLBACK(lambda level, message: seen.append(level))
+    native.set_log_callback(callback if sink == "callback" else control._LOG_CALLBACK())
+    try:
+        for level in range(1, 8):
+            native.aimdo_log_message(level, f"native-level-{level}\n".encode())
+    finally:
+        native.set_log_callback(control._LOG_CALLBACK())
+    expected = [level for level in range(1, 8) if level <= threshold]
+    stderr = capfd.readouterr().err
+    if sink == "callback":
+        assert seen == expected
+        assert stderr == ""
+    else:
+        assert stderr.splitlines() == [f"native-level-{level}" for level in expected]
+
+
+@pytest.mark.parametrize("sink", ["callback", "stderr"])
+def test_unconfigured_native_level_preserves_early_diagnostics(native, capfd, sink):
+    assert ctypes.c_int.in_dll(native, "log_level").value == 0
+    seen = []
+    callback = control._LOG_CALLBACK(lambda level, message: seen.append(message))
+    native.set_log_callback(callback if sink == "callback" else control._LOG_CALLBACK())
+    try:
+        native.test_message(b"early native failure")
+    finally:
+        native.set_log_callback(control._LOG_CALLBACK())
+    stderr = capfd.readouterr().err
+    assert "message=early native failure" in (
+        b"".join(seen).decode() if sink == "callback" else stderr)
+
+
+@pytest.mark.parametrize("setting", ["none", "critical"])
+def test_native_quiet_levels_suppress_h2d_without_changing_result(
+        collected, monkeypatch, capfd, setting):
+    lib, logs = collected
+    monkeypatch.setattr(control, "lib", lib)
+    getattr(control, "set_log_" + setting)()
+    assert lib.test_run_h2d(1, 10 << 20, 0) == 999
+    assert lib.test_attempts() == 2
+    assert not logs.records
+    assert not capfd.readouterr().err
+
+
+def test_native_error_level_keeps_both_causes_with_debug_python_logger(
+        collected, monkeypatch):
+    lib, logs = collected
+    monkeypatch.setattr(control, "lib", lib)
+    control.set_log_error()
+    assert lib.test_run_h2d(1, 10 << 20, 0) == 999
+    assert "message=original copy failure" in logs.text
+    assert "message=different retry failure" in logs.text
+    assert "destination=" in logs.text
+    assert all(record.levelno == logging.ERROR for record in logs.records)
+
+
+def test_native_error_level_suppresses_recovered_retry_warning(collected, monkeypatch):
+    lib, logs = collected
+    monkeypatch.setattr(control, "lib", lib)
+    control.set_log_error()
+    size = 10 << 20
+    assert lib.test_run_h2d(2, size, 0) == 0
+    assert [lib.test_stat(i) for i in range(4)] == [1, size, 1, 1]
+    assert not logs.records
+
+
+def test_native_none_does_not_call_broken_collector_or_fallback(
+        collected, monkeypatch, capfd):
+    lib, _ = collected
+    monkeypatch.setattr(control, "lib", lib)
+    control.set_log_none()
+    calls = []
+    def broken_collector(*args, **kwargs):
+        calls.append(args)
+        raise RuntimeError("collector failed")
+    monkeypatch.setattr(control.logging, "log", broken_collector)
+    lib.test_message(b"disabled error")
+    assert not calls
+    assert not capfd.readouterr().err

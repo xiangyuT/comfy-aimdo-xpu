@@ -19,7 +19,9 @@ enum DebugLevels {
 };
 
 /* Deliver an already formatted record without the aimdo_log format limit.
- * Uses the registered collector, or stderr with an immediate flush. */
+ * Honors the native log level before calling the registered collector or
+ * writing to stderr with an immediate flush. The default ALL keeps early
+ * diagnostics visible until the application chooses a level. */
 void aimdo_log_message(int level, const char *message);
 
 #ifdef __cplusplus
