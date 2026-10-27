@@ -1,6 +1,7 @@
 #pragma once
 
 #include "gpu_dispatch.h"
+#include "debug.h"
 
 /* NOTE: cuda_runtime.h is banned here. Always use the driver APIs.
  * Keep SDK headers out of this project and add any required duck-types
@@ -119,19 +120,6 @@ typedef unsigned long long ull;
 #define K 1024
 #define M (K * K)
 #define G (M * K)
-
-enum DebugLevels {
-    __NONE__ = -1,
-    /* Default to everything so if python itegration is hosed, we see prints. */
-    ALL = 0,
-    CRITICAL,
-    AIMDO_LOG_ERROR,
-    WARNING,
-    INFO,
-    DEBUG,
-    VERBOSE,
-    VVERBOSE,
-};
 
 /* debug.c */
 extern int log_level;

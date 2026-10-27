@@ -10,6 +10,7 @@ extern "C" {
 #error "Level Zero headers were not found"
 #endif
 #include "vmm-manager.h"
+#include "copy-diagnostics.h"
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 #include <sycl/sycl.hpp>
 
@@ -785,6 +786,8 @@ CUresult xpu_physical_release(CUmemGenericAllocationHandle handle) {
 
 CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
                                    size_t size, CUstream stream) {
+    using aimdo_xpu::log_h2d_exception;
+    using aimdo_xpu::log_h2d_record;
     auto queue = resolve_queue(stream);
     if (!queue) {
         return kCudaErrorUnknown;
@@ -814,12 +817,31 @@ CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
          * transfer shrinks the staging requirement, so retry once in smaller
          * pieces before giving up. */
         constexpr size_t kSplitChunk = 8ULL * 1024 * 1024;
+        const int initial_level = size > kSplitChunk ? WARNING : AIMDO_LOG_ERROR;
+
+        // Save the primary exception before retrying or querying the driver:
+        // either operation can fail too. Every record carries the copy ID.
+        const auto log_initial = [&](int level, const char *stage) {
+            log_h2d_exception(level, call, stage, error.what());
+            log_h2d_record(level, call, stage,
+                             "sycl_code=%d category=%s", code.value(),
+                             code.category().name());
+            log_h2d_record(level, call, stage,
+                             "queue=%p destination=%p source=%p size=%zu",
+                             static_cast<void *>(queue.get()),
+                             reinterpret_cast<void *>(destination), source, size);
+        };
+        log_initial(initial_level, "initial");
 
         if (size > kSplitChunk) {
+            size_t split_offset = 0;
+            size_t split_size = 0;
             try {
                 const auto *bytes = static_cast<const unsigned char *>(source);
                 for (size_t done = 0; done < size; done += kSplitChunk) {
                     const size_t piece = std::min(kSplitChunk, size - done);
+                    split_offset = done;
+                    split_size = piece;
                     queue->memcpy(
                         reinterpret_cast<void *>(destination + done),
                         bytes + done, piece).wait_and_throw();
@@ -830,11 +852,30 @@ CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
                     1, std::memory_order_relaxed);
                 g_stats[kHostToDeviceSplitRetries].fetch_add(
                     1, std::memory_order_relaxed);
+                log_h2d_record(WARNING, call, "split_retry",
+                                 "result=recovered size=%zu", size);
                 trace_sync("h2d", "end_split", call, queue.get(), size);
                 return CUDA_SUCCESS;
+            } catch (const sycl::exception &retry_error) {
+                log_h2d_exception(AIMDO_LOG_ERROR, call, "split_retry",
+                                    retry_error.what());
+                const std::error_code retry_code = retry_error.code();
+                log_h2d_record(AIMDO_LOG_ERROR, call, "split_retry",
+                                 "sycl_code=%d category=%s",
+                                 retry_code.value(), retry_code.category().name());
+            } catch (const std::exception &retry_error) {
+                log_h2d_exception(AIMDO_LOG_ERROR, call, "split_retry",
+                                    retry_error.what());
             } catch (...) {
-                // Fall through and report the original failure.
+                log_h2d_exception(AIMDO_LOG_ERROR, call, "split_retry",
+                                    "<non-standard exception>");
             }
+            log_h2d_record(AIMDO_LOG_ERROR, call, "split_retry",
+                             "result=failed offset=%zu piece_size=%zu",
+                             split_offset, split_size);
+            // ERROR-only collectors must retain the original cause and copy
+            // identity, too. Recovered copies keep their initial WARNING.
+            log_initial(AIMDO_LOG_ERROR, "failed_initial");
         }
         /* Report what the driver itself believes at the moment of failure.
          * DXGI Budget said roughly 4 GiB was still available when a 64 MiB
@@ -872,43 +913,45 @@ CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
             case sycl::usm::alloc::shared: destination_kind = "usm_shared"; break;
             default:                       destination_kind = "not_usm_vmm"; break;
             }
+        } catch (const std::exception &diagnostic_error) {
+            log_h2d_exception(AIMDO_LOG_ERROR, call, "diagnostics",
+                                diagnostic_error.what());
         } catch (...) {
+            log_h2d_exception(AIMDO_LOG_ERROR, call, "diagnostics",
+                                "<non-standard exception>");
         }
-        std::fprintf(
-            stderr,
-            "[AIMDO XPU ERROR] op=h2d queue=%p destination=%p size=%zu "
-            "sycl_code=%d category=%s driver_free=%zu driver_total=%zu "
-            "dest_kind=%s vbar=%d all_mapped=%d min_pin=%u first_page=%llu "
-            "span=%llu first_unmapped=%lld message=%s\n",
-            static_cast<void *>(queue.get()), reinterpret_cast<void *>(destination),
-            size, code.value(), code.category().name(),
-            free_bytes, total_bytes, destination_kind, vbar_hit, vbar_mapped,
-            vbar_pin, static_cast<unsigned long long>(vbar_page),
-            static_cast<unsigned long long>(vbar_span),
-            vbar_unmapped == UINT64_MAX ? -1LL
-                                        : static_cast<long long>(vbar_unmapped),
-            error.what());
-        std::fflush(stderr);
+        log_h2d_record(AIMDO_LOG_ERROR, call, "diagnostics",
+                         "driver_free=%zu driver_total=%zu", free_bytes,
+                         total_bytes);
+        log_h2d_record(AIMDO_LOG_ERROR, call, "diagnostics",
+                         "dest_kind=%s vbar=%d", destination_kind, vbar_hit);
+        if (vbar_hit) {
+            log_h2d_record(AIMDO_LOG_ERROR, call, "diagnostics",
+                             "all_mapped=%d min_pin=%u first_page=%llu "
+                             "span=%llu first_unmapped=%lld",
+                             vbar_mapped, vbar_pin,
+                             static_cast<unsigned long long>(vbar_page),
+                             static_cast<unsigned long long>(vbar_span),
+                             vbar_unmapped == UINT64_MAX
+                                 ? -1LL : static_cast<long long>(vbar_unmapped));
+        }
         trace_sync("h2d", "error", call, queue.get(), size);
         return kCudaErrorUnknown;
     } catch (const std::exception &error) {
-        std::fprintf(
-            stderr,
-            "[AIMDO XPU ERROR] op=h2d queue=%p destination=%p size=%zu "
-            "exception=%s\n",
-            static_cast<void *>(queue.get()), reinterpret_cast<void *>(destination),
-            size, error.what());
-        std::fflush(stderr);
+        log_h2d_exception(AIMDO_LOG_ERROR, call, "initial", error.what());
+        log_h2d_record(AIMDO_LOG_ERROR, call, "initial",
+                         "queue=%p destination=%p source=%p size=%zu",
+                         static_cast<void *>(queue.get()),
+                         reinterpret_cast<void *>(destination), source, size);
         trace_sync("h2d", "error", call, queue.get(), size);
         return kCudaErrorUnknown;
     } catch (...) {
-        std::fprintf(
-            stderr,
-            "[AIMDO XPU ERROR] op=h2d queue=%p destination=%p size=%zu "
-            "exception=<non-standard>\n",
-            static_cast<void *>(queue.get()), reinterpret_cast<void *>(destination),
-            size);
-        std::fflush(stderr);
+        log_h2d_exception(AIMDO_LOG_ERROR, call, "initial",
+                            "<non-standard exception>");
+        log_h2d_record(AIMDO_LOG_ERROR, call, "initial",
+                         "queue=%p destination=%p source=%p size=%zu",
+                         static_cast<void *>(queue.get()),
+                         reinterpret_cast<void *>(destination), source, size);
         trace_sync("h2d", "error", call, queue.get(), size);
         return kCudaErrorUnknown;
     }
