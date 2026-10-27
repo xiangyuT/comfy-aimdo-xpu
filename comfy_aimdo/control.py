@@ -189,8 +189,25 @@ def _install_xpu_allocator_backend(torch_module, aimdo_torch_module, mode):
 
 
 def _native_log(level, message):
-    logging.log(_LOG_LEVELS.get(level, logging.DEBUG),
-                message.decode("utf-8", errors="replace").rstrip())
+    text = message.decode("utf-8", errors="replace").rstrip("\r\n")
+    try:
+        logging.log(_LOG_LEVELS.get(level, logging.DEBUG), text)
+    except Exception:
+        # ctypes discards exceptions escaping a void callback. Preserve the
+        # native diagnostic even when a Python collector/handler raises.
+        pending = (text + "\n").encode("utf-8", errors="replace")
+        try:
+            while pending:
+                try:
+                    written = os.write(2, pending)
+                except InterruptedError:
+                    continue
+                if written <= 0:
+                    break
+                pending = pending[written:]
+        except OSError:
+            # A closed stderr cannot be recovered from inside a log callback.
+            pass
 
 
 def detect_vendor():

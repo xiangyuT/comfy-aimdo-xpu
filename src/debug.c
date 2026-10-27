@@ -13,6 +13,15 @@ void set_log_callback(AimdoLogCallback callback) {
     log_callback = callback;
 }
 
+void aimdo_log_message(int level, const char *message) {
+    if (log_callback) {
+        log_callback(level, message);
+    } else {
+        fputs(message, stderr);
+        fflush(stderr);
+    }
+}
+
 void aimdo_log(int level, const char *file, int line, const char *format, ...) {
     char message[2048];
     int prefix_length;
@@ -29,12 +38,7 @@ void aimdo_log(int level, const char *file, int line, const char *format, ...) {
     vsnprintf(message + prefix, sizeof(message) - prefix, format, args);
     va_end(args);
 
-    if (log_callback) {
-        log_callback(level, message);
-    } else {
-        fputs(message, stderr);
-        fflush(stderr);
-    }
+    aimdo_log_message(level, message);
 }
 
 static inline void set_log_level(int level) {
