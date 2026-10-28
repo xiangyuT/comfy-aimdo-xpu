@@ -15,7 +15,7 @@ BUILD_SCRIPT = (
 
 
 def test_linux_mod1_does_not_read_windows_retirement_fields():
-    mod1 = SOURCE.split("static inline bool mod1", 1)[1].split(
+    mod1 = SOURCE.split("static inline int mod1", 1)[1].split(
         "if (do_free)", 1
     )[0]
     windows_branch, linux_branch = mod1.split("#else", 1)
@@ -30,8 +30,8 @@ def test_linux_mod1_does_not_read_windows_retirement_fields():
 def test_platform_neutral_entry_points_are_declared_before_first_use():
     range_declaration = SOURCE.index("int aimdo_vbar_describe_range(")
     range_wrapper = SOURCE.index("int aimdo_vbar_describe_address(")
-    stream_declaration = SOURCE.index("void vbar_unpin_stream(")
-    stream_wrapper = SOURCE.index("void vbar_unpin(")
+    stream_declaration = SOURCE.index("bool vbar_unpin_stream(")
+    stream_wrapper = SOURCE.index("bool vbar_unpin(")
 
     assert range_declaration < range_wrapper
     assert stream_declaration < stream_wrapper
@@ -67,7 +67,7 @@ def test_graph_stubs_preserve_windows_fallback_without_shadowing_linux_core(tmp_
 int main(void) {
     CUdeviceptr pointer = 123;
     int result = 99;
-    assert(!malloc_graph_alloc(&pointer, 8, NULL) && pointer == 123);
+    assert(!malloc_graph_alloc(&pointer, 8, NULL, &result) && pointer == 123);
     assert(!malloc_graph_free(pointer, NULL, &result) && result == 99);
     assert(!malloc_graph_sync_paused());
     assert(!free_rogue(pointer, &result) && result == 99);

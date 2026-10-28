@@ -957,6 +957,32 @@ CUresult xpu_memcpy_host_to_device(CUdeviceptr destination, const void *source,
     }
 }
 
+// The common writer reuses its pageable staging slot after this call. Complete
+// DtoH on the validated source queue before publishing success, just as HtoD
+// completes before the reader reuses its slot.
+CUresult xpu_memcpy_device_to_host(void *destination, CUdeviceptr source,
+                                   size_t size, CUstream stream) {
+    auto queue = resolve_queue(stream);
+    if (!queue || (!destination && size) || (!source && size)) {
+        return kCudaErrorUnknown;
+    }
+    try {
+        queue->memcpy(destination, reinterpret_cast<const void *>(source), size)
+            .wait_and_throw();
+        return CUDA_SUCCESS;
+    } catch (const std::exception &error) {
+        char record[1024];
+        std::snprintf(record, sizeof(record),
+            "XPU DtoH failed: queue=%p source=%p destination=%p size=%zu error=%s\n",
+            static_cast<void *>(queue.get()),
+            reinterpret_cast<const void *>(source), destination, size, error.what());
+        aimdo_log_message(AIMDO_LOG_ERROR, record);
+    } catch (...) {
+        aimdo_log_message(AIMDO_LOG_ERROR, "XPU DtoH failed: non-standard exception");
+    }
+    return kCudaErrorUnknown;
+}
+
 CUresult xpu_event_create(CUevent *event, unsigned int) {
     if (!event) {
         return kCudaErrorUnknown;
@@ -1867,6 +1893,7 @@ bool aimdo_cuda_runtime_init(void) {
     g_cuda.p_cuMemUnmap = xpu_virtual_unmap;
     g_cuda.p_cuMemRelease = xpu_physical_release;
     g_cuda.p_cuMemcpyHtoDAsync = xpu_memcpy_host_to_device;
+    g_cuda.p_cuMemcpyDtoHAsync = xpu_memcpy_device_to_host;
     g_cuda.p_cuEventCreate = xpu_event_create;
     g_cuda.p_cuEventDestroy = xpu_event_destroy;
     g_cuda.p_cuEventRecord = xpu_event_record;

@@ -98,7 +98,7 @@ def test_windows_direct_file_reader_reclaims_before_submitting_h2d():
     assert "post_reclaim_deficit = budget_deficit(chunk);" in windows_path
     assert "vbars_request_reclaim(post_reclaim_deficit);" in windows_path
     assert source.index("reclaimed_pages = vbars_free_all_retired();") < source.index(
-        "CUresult copy_result = cuMemcpyHtoDAsync"
+        "CUresult copy_result = write ? cuMemcpyDtoHAsync"
     )
     assert '"[AIMDO XPU RECLAIM] op=pre_h2d destination=%p "' in windows_path
     assert '"post_reclaim_deficit=%lld\\n"' in windows_path
@@ -186,8 +186,8 @@ def test_windows_speculative_reclaim_preserves_active_vbar():
     ).read_text(encoding="utf-8")
     normalized = " ".join(source.split())
 
-    assert "static size_t vbars_free_except(" in source
-    assert "if (i == preserved)" in source
+    assert "static bool vbars_free_except(" in source
+    assert "i == preserved || (!allow_pageout && i->pageout_callback)" in source
     assert "return vbars_free_except(size, NULL);" in source
     assert (
         "void vbars_prepare_allocation(void *devctx, void *vbar, "
@@ -207,7 +207,7 @@ def test_windows_speculative_reclaim_preserves_active_vbar():
     prepare = prepare.split("\n}\n", 1)[0]
     assert "one_time_setup();" not in prepare
 
-    free_except = source.split("static size_t vbars_free_except", 1)[1]
+    free_except = source.split("static bool vbars_free_internal", 1)[1]
     free_except = free_except.split("\n}\n", 1)[0]
     assert free_except.index("vbar_state_lock();") < free_except.index(
         "one_time_setup();"
@@ -221,7 +221,7 @@ def test_vbar_fault_reclaims_the_actual_deficit_before_retry():
 
     assert "allocation_deficit = budget_deficit(VBAR_PAGE_SIZE);" in source
     assert "allocation_deficit > (ssize_t)VBAR_PAGE_SIZE" in source
-    assert "vbars_free((ssize_t)retry_reclaim);" in source
+    assert "if (!vbars_free((ssize_t)retry_reclaim))" in source
 
 
 def test_vbar_fault_wddm_retry_margin_is_windows_xpu_only():
@@ -333,7 +333,7 @@ def test_windows_unpin_publishes_queue_token_before_idle_state():
     source = (
         Path(__file__).resolve().parents[1] / "src" / "model-vbar.c"
     ).read_text(encoding="utf-8")
-    unpin = source.rsplit("void vbar_unpin_stream", 1)[1]
+    unpin = source.rsplit("bool vbar_unpin_stream", 1)[1]
     unpin = unpin.split("\n}\n", 1)[0]
 
     token_snapshot = unpin.index("retirement_token = vbar_consumer_dependency(")
@@ -466,7 +466,7 @@ def test_windows_unmap_release_failure_keeps_metadata_truthful():
     source = (
         Path(__file__).resolve().parents[1] / "src" / "model-vbar.c"
     ).read_text(encoding="utf-8")
-    mod1 = source.split("static inline bool mod1", 1)[1]
+    mod1 = source.split("static inline int mod1", 1)[1]
     mod1 = mod1.split("static size_t vbars_free_except", 1)[0]
 
     assert "if (!CHECK_CU_ERROR(cuMemUnmap" in mod1
@@ -477,7 +477,7 @@ def test_windows_unmap_release_failure_keeps_metadata_truthful():
     assert mod1.index("cuMemRelease") < mod1.index("rp->handle = 0;")
 
     map_new = source.split("static CUresult vbar_map_new_page", 1)[1]
-    map_new = map_new.split("static inline bool mod1", 1)[0]
+    map_new = map_new.split("static inline int mod1", 1)[0]
     assert "if (rp->handle)" in map_new
     assert "VBAR_MAPPING_UNKNOWN" in map_new
     assert "total_vram_usage += VBAR_PAGE_SIZE;" in map_new

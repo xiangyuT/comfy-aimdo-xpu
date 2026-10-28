@@ -6,10 +6,12 @@ import sys
 import time
 import weakref
 from contextlib import contextmanager
+import logging
 
 from . import control
 
 lib = control.lib
+PageoutCallback = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_uint64, ctypes.c_uint64)
 
 _trace_enabled = os.environ.get("AIMDO_XPU_VBAR_TRACE") == "1"
 _boundary_trace_enabled = (
@@ -61,6 +63,7 @@ if _unpin_stream_supported:
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
         ctypes.c_uint64,
     ]
+    lib.vbar_unpin_stream.restype = ctypes.c_bool
 if _consumer_registration_supported:
     lib.vbar_register_consumer_stream.argtypes = [
         ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64,
@@ -157,12 +160,13 @@ def current_inference_memory_budget(device):
 
 # Bindings
 if lib is not None:
-    lib.vbar_allocate.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int]
+    lib.vbar_allocate.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int, PageoutCallback]
     lib.vbar_allocate.restype = ctypes.c_void_p
 
     lib.vbar_set_watermark_limit.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
 
     lib.vbar_set_watermark.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
+    lib.vbar_set_watermark.restype = ctypes.c_bool
 
     lib.vbars_reset_watermark_limits.argtypes = [ctypes.c_void_p]
 
@@ -183,12 +187,13 @@ if lib is not None:
     lib.vbar_fault.restype = ctypes.c_int
 
     lib.vbar_unpin.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64, ctypes.c_uint64]
+    lib.vbar_unpin.restype = ctypes.c_bool
 
     lib.vbar_loaded_size.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
     lib.vbar_loaded_size.restype = ctypes.c_size_t
 
     lib.vbar_free_memory.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint64]
-    lib.vbar_free_memory.restype = ctypes.c_uint64
+    lib.vbar_free_memory.restype = ctypes.c_int64
 
     lib.vbars_analyze.argtypes = [ctypes.c_void_p, ctypes.c_bool]
     lib.vbars_analyze.restype = ctypes.c_uint64
@@ -285,9 +290,20 @@ def _release_native_cache(device):
 
 
 class ModelVBAR:
-    def __init__(self, size, device):
+    def __init__(self, size, device, pageout_callback=None):
+        """The optional callback completes writeback before returning, without reentering VBAR APIs."""
+        def invoke(offset, size):
+            try:
+                pageout_callback(offset, size)
+                return True
+            except BaseException:
+                # ctypes cannot unwind a Python exception through the native caller.
+                logging.exception("VBAR pageout callback failed")
+                return False
+
+        self._pageout_callback = PageoutCallback(invoke) if pageout_callback is not None else PageoutCallback()
         self._devctx = control.get_devctx(device)
-        self._ptr = lib.vbar_allocate(self._devctx, int(size), device)
+        self._ptr = lib.vbar_allocate(self._devctx, int(size), device, self._pageout_callback)
         if not self._ptr:
             raise MemoryError("VBAR allocation failed")
         self.device = device
@@ -395,9 +411,7 @@ class ModelVBAR:
                     # pre-fault range after that real release, then let the
                     # ordinary fault recheck current pressure. An explicit
                     # caller watermark is preserved; no range is widened.
-                    lib.vbar_set_watermark(
-                        self._devctx, self._ptr,
-                        native_watermark * (32 * 1024 ** 2))
+                    self.set_watermark(native_watermark * (32 * 1024 ** 2))
                 # The shortage was at least partly Torch's own dead cache,
                 # which AIMDO has no other way to reclaim. Retry once now that
                 # it is back, rather than streaming this weight from host.
@@ -474,11 +488,13 @@ class ModelVBAR:
             # may consume weights on a non-default stream, and a retirement
             # fence submitted only to the default queue does not order that
             # work: reclaiming on that proof caused DEVICE_LOST.
-            lib.vbar_unpin_stream(
+            success = lib.vbar_unpin_stream(
                 self._devctx, self._ptr, offset, size,
                 _consumer_queue_ptr(self.device, stream))
-            return
-        lib.vbar_unpin(self._devctx, self._ptr, offset, size)
+        else:
+            success = lib.vbar_unpin(self._devctx, self._ptr, offset, size)
+        if not success:
+            raise RuntimeError("VBAR unpin failed")
 
     def loaded_size(self):
         return lib.vbar_loaded_size(self._devctx, self._ptr)
@@ -487,10 +503,14 @@ class ModelVBAR:
         lib.vbar_set_watermark_limit(self._devctx, self._ptr, size_bytes)
 
     def set_watermark(self, size_bytes):
-        lib.vbar_set_watermark(self._devctx, self._ptr, size_bytes)
+        if not lib.vbar_set_watermark(self._devctx, self._ptr, size_bytes):
+            raise RuntimeError("VBAR set_watermark failed")
 
     def free_memory(self, size_bytes):
-        return lib.vbar_free_memory(self._devctx, self._ptr, int(size_bytes))
+        freed = lib.vbar_free_memory(self._devctx, self._ptr, int(size_bytes))
+        if freed < 0:
+            raise RuntimeError("VBAR free_memory failed")
+        return freed
 
     def get_nr_pages(self):
         return lib.vbar_get_nr_pages(self._devctx, self._ptr)
@@ -549,7 +569,7 @@ class ModelVBAR:
             result["pages"] = states
         return result
 
-    def __del__(self):
+    def close(self):
         ptr = getattr(self, "_ptr", None)
         aimdo_lib = getattr(control, "lib", None)
         if aimdo_lib is not None and ptr:
@@ -561,6 +581,10 @@ class ModelVBAR:
                 ctypes.c_void_p(self._devctx), ctypes.c_void_p(ptr)
             )
             self._ptr = None
+            self._pageout_callback = None
+
+    def __del__(self):
+        self.close()
 
 
 class VBARConsumerLease:

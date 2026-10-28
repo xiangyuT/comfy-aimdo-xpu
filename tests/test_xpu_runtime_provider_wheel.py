@@ -202,7 +202,7 @@ def test_provider_wheel_is_reproducible(tmp_path, monkeypatch):
     assert first.read_bytes() == second.read_bytes()
 
 
-@pytest.mark.parametrize("version", ["0.5.5", "0.5.6"])
+@pytest.mark.parametrize("version", ["0.5.5", "0.5.6", "0.6.0"])
 def test_linux_compiler_api_manifest_requires_complete_exports(tmp_path, monkeypatch, version):
     builder = _load_builder()
     source = _source_wheel(
@@ -234,7 +234,7 @@ def test_linux_compiler_api_manifest_requires_complete_exports(tmp_path, monkeyp
     assert "upstream_reference_revision" not in manifest["api_compatibility"]
 
 
-@pytest.mark.parametrize("version", ["0.5.5", "0.5.6"])
+@pytest.mark.parametrize("version", ["0.5.5", "0.5.6", "0.6.0"])
 def test_torch214_native_owner_sidecar_is_explicit_and_version_bound(tmp_path, monkeypatch, version):
     builder = _load_builder()
     source = _source_wheel(

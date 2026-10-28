@@ -73,7 +73,7 @@ struct ScopedRaw {
     bool deleting = false;
 };
 
-using CompilerAlloc = bool (*)(uint64_t *, size_t, void *);
+using CompilerAlloc = bool (*)(uint64_t *, size_t, void *, int *);
 using CompilerFree = bool (*)(uint64_t, void *, int *);
 using CompilerRogue = bool (*)(uint64_t, int *);
 using SetDevice = bool (*)(int);
@@ -446,8 +446,9 @@ public:
             if (synthetic_duplicate) {
                 address = reinterpret_cast<uintptr_t>(synthetic_duplicate);
             } else {
+                int allocation_status = 0;
                 const bool handled = functions->alloc(&address, bytes,
-                    reinterpret_cast<void *>(g_compiler_scope_stream));
+                    reinterpret_cast<void *>(g_compiler_scope_stream), &allocation_status);
                 if (!address && functions->allocation_error &&
                     functions->allocation_error() == 2) {
                     C10_THROW_ERROR(OutOfMemoryError,

@@ -50,6 +50,8 @@ typedef struct ModelVBAR {
     void *lower;
 
     size_t resident_count;
+    uint64_t pageout_size;
+    bool (*pageout_callback)(uint64_t offset, uint64_t size);
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
     uint64_t identity;
@@ -112,7 +114,7 @@ int aimdo_vbar_describe_range(uint64_t address, uint64_t size, int *mapped,
                               unsigned *pin, uint64_t *page_index,
                               uint64_t *unmapped_page, uint64_t *pages_spanned);
 SHARED_EXPORT
-void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
+bool vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
                        uint64_t stream);
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
@@ -510,7 +512,8 @@ static CUresult vbar_map_new_page(ModelVBAR *mv, size_t page_nr) {
 }
 #endif
 
-static inline bool mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unpin) {
+/* -1: writeback failed, 0: retained, 1: freed. */
+static inline int mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unpin) {
     ResidentPage *rp = &mv->residency_map[page_nr];
     CUdeviceptr vaddr = mv->vbar + page_nr * VBAR_PAGE_SIZE;
 
@@ -523,6 +526,18 @@ static inline bool mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unp
               (do_unpin || rp->pin_count == 0);
 #endif
     if (do_free) {
+        if (mv->pageout_callback) {
+            uint64_t offset = page_nr * VBAR_PAGE_SIZE;
+            size_t size = MIN(VBAR_PAGE_SIZE, mv->pageout_size - offset);
+            /* Also cover eviction while malloc-graph synchronization is paused. */
+            if (!CHECK_CU(cuCtxSynchronize())) {
+                return -1;
+            }
+            /* The owner saves complete tensors intersecting this range before unmapping. */
+            if (!mv->pageout_callback(offset, size)) {
+                return -1;
+            }
+        }
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
         if (!CHECK_CU_ERROR(cuMemUnmap(vaddr, VBAR_PAGE_SIZE))) {
             rp->evicting = 0;
@@ -565,13 +580,13 @@ static inline bool mod1(ModelVBAR *mv, size_t page_nr, bool do_free, bool do_unp
     return do_free;
 }
 
-static size_t vbars_free_except(ssize_t size, ModelVBAR *preserved) {
+static bool vbars_free_internal(ssize_t size, ModelVBAR *preserved, bool allow_pageout) {
     size_t pages_needed;
     bool dirty = false;
     bool sync = !malloc_graph_sync_paused();
 
     if (size <= 0) {
-        return 0;
+        return true;
     }
 
     vbar_state_lock();
@@ -582,7 +597,7 @@ static size_t vbars_free_except(ssize_t size, ModelVBAR *preserved) {
 
     for (ModelVBAR *i = lowest_priority.higher; pages_needed && i != &highest_priority;
          i = i->higher) {
-        if (i == preserved) {
+        if (i == preserved || (!allow_pageout && i->pageout_callback)) {
             continue;
         }
         for (;pages_needed && i->watermark > i->watermark_limit; i->watermark--) {
@@ -595,9 +610,12 @@ static size_t vbars_free_except(ssize_t size, ModelVBAR *preserved) {
                 }
                 dirty = true;
             }
-            if (mod1(i, i->watermark - 1, true, false)) {
-                pages_needed--;
+            int freed = mod1(i, i->watermark - 1, true, false);
+            if (freed < 0) {
+                vbar_state_unlock();
+                return false;
             }
+            pages_needed -= freed;
         }
     }
 
@@ -606,12 +624,25 @@ static size_t vbars_free_except(ssize_t size, ModelVBAR *preserved) {
     }
 
     vbar_state_unlock();
-    return pages_needed;
+    return true;
 }
 
-size_t vbars_free(ssize_t size) {
+static bool vbars_free_except(ssize_t size, ModelVBAR *preserved) {
+    return vbars_free_internal(size, preserved, true);
+}
+
+bool vbars_free(ssize_t size) {
     return vbars_free_except(size, NULL);
 }
+
+#ifdef AIMDO_XPU
+/* Runtime allocation callbacks hold allocator/UR locks. Python writeback must
+ * run at the model-owner boundary, where fault/watermark/unpin can report its
+ * failure. Keep writable pages resident here instead of re-entering Python. */
+bool vbars_free_for_allocator(ssize_t size) {
+    return vbars_free_internal(size, NULL, false);
+}
+#endif
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
 /* Publish pressure from a runtime allocation/copy callback without touching
@@ -736,7 +767,7 @@ static size_t vbar_commit_candidates(VbarEvictionCandidate *candidates,
         /* The metadata lock now freezes fault/register/unpin across final
          * validation and physical unmap. */
         rp->evicting = 0;
-        if (mod1(mv, candidate->page_nr, true, false)) {
+        if (mod1(mv, candidate->page_nr, true, false) > 0) {
             freed++;
         }
     }
@@ -761,7 +792,7 @@ static size_t vbar_freeze_retired_candidates(
         size_t floor;
         size_t page_nr;
 
-        if (mv == preserved) {
+        if (mv == preserved || mv->pageout_callback) {
             continue;
         }
         floor = mv->watermark < mv->watermark_limit
@@ -1050,7 +1081,7 @@ static inline size_t spend_surplus_on_cursor(ModelVBAR *mv, size_t target, size_
     return cursor;
 }
 
-static void vbars_free_for_vbar(ModelVBAR *mv, size_t target, ssize_t surplus) {
+static bool vbars_free_for_vbar(ModelVBAR *mv, size_t target, ssize_t surplus) {
     size_t cursor = move_cursor_to_absent(mv, 0);
     bool synced = false;
 
@@ -1068,7 +1099,11 @@ static void vbars_free_for_vbar(ModelVBAR *mv, size_t target, ssize_t surplus) {
                 CHECK_CU(cuCtxSynchronize());
                 synced = true;
             }
-            if (mod1(i, i->watermark - 1, true, false)) {
+            int freed = mod1(i, i->watermark - 1, true, false);
+            if (freed < 0) {
+                return false;
+            }
+            if (freed) {
                 surplus += (ssize_t)VBAR_PAGE_SIZE;
                 cursor = spend_surplus_on_cursor(mv, target, cursor, &surplus);
             }
@@ -1078,6 +1113,7 @@ static void vbars_free_for_vbar(ModelVBAR *mv, size_t target, ssize_t surplus) {
     if (synced) {
         CHECK_CU(cuCtxSynchronize());
     }
+    return true;
 }
 
 static inline void remove_vbar(ModelVBAR *mv) {
@@ -1099,8 +1135,10 @@ static inline void insert_vbar_last(ModelVBAR *mv) {
     lowest_priority.higher = mv;
 }
 
+/* The optional callback completes writeback before returning. No VBAR reentry. */
 SHARED_EXPORT
-void *vbar_allocate(void *devctx, uint64_t size, int device) {
+void *vbar_allocate(void *devctx, uint64_t size, int device,
+                    bool (*pageout_callback)(uint64_t, uint64_t)) {
     ModelVBAR *mv;
     size_t allocation_size;
     size_t nr_pages;
@@ -1131,8 +1169,6 @@ void *vbar_allocate(void *devctx, uint64_t size, int device) {
         }
     }
 #endif
-    size = (uint64_t)nr_pages * VBAR_PAGE_SIZE;
-
     if (!vbar_metadata_allocation_size(nr_pages, &allocation_size)) {
         log(AIMDO_LOG_ERROR,
             "VBAR page metadata size overflow: %zu pages\n", nr_pages);
@@ -1142,6 +1178,10 @@ void *vbar_allocate(void *devctx, uint64_t size, int device) {
         log(CRITICAL, "Host OOM\n");
         return NULL;
     }
+
+    mv->pageout_size = size;
+    mv->pageout_callback = pageout_callback;
+    size = (uint64_t)nr_pages * VBAR_PAGE_SIZE;
 
     /* FIXME: Do I care about alignment? Does Cuda just look after itself? */
     if (!CHECK_CU(cuMemAddressReserve(&mv->vbar, size, 0, 0, 0))) {
@@ -1179,7 +1219,7 @@ void vbar_set_watermark_limit(void *devctx, void *vbar, uint64_t size) {
 }
 
 SHARED_EXPORT
-void vbar_set_watermark(void *devctx, void *vbar, uint64_t size) {
+bool vbar_set_watermark(void *devctx, void *vbar, uint64_t size) {
     ModelVBAR *mv = (ModelVBAR *)vbar;
     size_t watermark = VBAR_GET_PAGE_NR_UP(size);
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
@@ -1211,13 +1251,17 @@ void vbar_set_watermark(void *devctx, void *vbar, uint64_t size) {
     if (watermark < mv->watermark) {
         CHECK_CU(cuCtxSynchronize());
         for (size_t page_nr = watermark; page_nr < mv->watermark; page_nr++) {
-            mod1(mv, page_nr, true, false);
+            if (mod1(mv, page_nr, true, false) < 0) {
+                vbar_state_unlock();
+                return false;
+            }
         }
     }
 
     mv->watermark = watermark;
     vbar_state_unlock();
 #endif
+    return true;
 }
 
 SHARED_EXPORT
@@ -1360,7 +1404,9 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
      * vbar_fault(); doing it here would retain the outer recursive lock across
      * both phases and defeat fault/eviction revalidation. */
 #else
-    vbars_free(budget_deficit(0));
+    if (!vbars_free(budget_deficit(0))) {
+        return VBAR_FAULT_ERROR;
+    }
 #endif
 
     if (page_end > mv->watermark) {
@@ -1461,11 +1507,14 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
                 }
             }
 #else
-            vbars_free_for_vbar(mv, page_end,
+            if (!vbars_free_for_vbar(mv, page_end,
                                 (ssize_t)vram_capacity -
                                 ((ssize_t)(total_vram_usage +
                                            (page_end - page_nr) * VBAR_PAGE_SIZE) +
-                                 (ssize_t)simple_vram_headroom));
+                                 (ssize_t)simple_vram_headroom))) {
+                vbar_unpin_range(mv, page_start, page_nr);
+                return VBAR_FAULT_ERROR;
+            }
 #endif
             miss_alloc_checked = true;
 
@@ -1501,7 +1550,10 @@ static int vbar_fault_locked(void *devctx, void *vbar, uint64_t offset,
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
             vbars_free_retired((ssize_t)retry_reclaim);
 #else
-            vbars_free((ssize_t)retry_reclaim);
+            if (!vbars_free((ssize_t)retry_reclaim)) {
+                vbar_unpin_range(mv, page_start, page_nr);
+                return VBAR_FAULT_ERROR;
+            }
 #endif
             if (page_end > mv->watermark) {
                 log(DEBUG, "VBAR allocation cancelled due to backup-free watermark reduction\n");
@@ -1591,8 +1643,8 @@ int vbar_fault(void *devctx, void *vbar, uint64_t offset, uint64_t size,
 }
 
 SHARED_EXPORT
-void vbar_unpin(void *devctx, void *vbar, uint64_t offset, uint64_t size) {
-    vbar_unpin_stream(devctx, vbar, offset, size, 0);
+bool vbar_unpin(void *devctx, void *vbar, uint64_t offset, uint64_t size) {
+    return vbar_unpin_stream(devctx, vbar, offset, size, 0);
 }
 
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
@@ -1776,7 +1828,7 @@ int vbar_consumer_release(void *devctx, void *vbar, uint64_t offset,
 #endif
 
 SHARED_EXPORT
-void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
+bool vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
                        uint64_t stream) {
     ModelVBAR *mv = (ModelVBAR *)vbar;
 #if defined(AIMDO_XPU) && (defined(_WIN32) || defined(_WIN64))
@@ -1837,7 +1889,13 @@ void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
             rp->pin_count--;
         }
 #endif
-        mod1(mv, page_nr, free_above_watermark && page_nr >= mv->watermark, false);
+    }
+    /* Release every consumer pin even if a subsequent writeback fails. */
+    for (uint64_t page_nr = VBAR_GET_PAGE_NR(offset); page_nr < page_end && page_nr < mv->nr_pages; page_nr++) {
+        if (mod1(mv, page_nr, free_above_watermark && page_nr >= mv->watermark, false) < 0) {
+            vbar_state_unlock();
+            return false;
+        }
     }
 
 #if !defined(AIMDO_XPU) || (!defined(_WIN32) && !defined(_WIN64))
@@ -1847,6 +1905,7 @@ void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
 #endif
 
     vbar_state_unlock();
+    return true;
 }
 
 SHARED_EXPORT
@@ -1863,6 +1922,7 @@ void vbar_free(void *devctx, void *vbar) {
         return;
     }
     mv->closing = 1;
+    mv->pageout_callback = NULL; /* Close discards even when live consumers defer release. */
     vbar_state_unlock();
 
     /* Closing prevents new faults.  The first drain covers existing submitted
@@ -1892,6 +1952,7 @@ void vbar_free(void *devctx, void *vbar) {
 
     vbar_state_lock();
     vbars_dirty = true;
+    mv->pageout_callback = NULL;
     for (uint64_t page_nr = 0; page_nr < mv->nr_pages; page_nr++) {
         ResidentPage *rp = &mv->residency_map[page_nr];
         if (rp->pin_count || vbar_consumer_held(rp) ||
@@ -1928,6 +1989,7 @@ void vbar_free(void *devctx, void *vbar) {
 
     CHECK_CU(cuCtxSynchronize());
 
+    mv->pageout_callback = NULL; /* Destruction discards rather than pages out. */
     for (uint64_t page_nr = 0; page_nr < mv->nr_pages; page_nr++) {
         mod1(mv, page_nr, true, true);
     }
@@ -2035,7 +2097,7 @@ void vbar_get_page_states(void *devctx, void *vbar, uint64_t *out,
 #endif
 
 SHARED_EXPORT
-uint64_t vbar_free_memory(void *devctx, void *vbar, uint64_t size) {
+int64_t vbar_free_memory(void *devctx, void *vbar, uint64_t size) {
     ModelVBAR *mv = (ModelVBAR *)vbar;
     size_t pages_to_free = VBAR_GET_PAGE_NR_UP(size);
     size_t pages_freed = 0;
@@ -2082,15 +2144,18 @@ uint64_t vbar_free_memory(void *devctx, void *vbar, uint64_t size) {
         /* In theory we should never have pins here, but
          * respect pins if it really comes up.
          */
-        if (mod1(mv, mv->watermark - 1, true, false)) {
-            pages_to_free--;
-            pages_freed++;
+        int freed = mod1(mv, mv->watermark - 1, true, false);
+        if (freed < 0) {
+            vbar_state_unlock();
+            return -1;
         }
+        pages_to_free -= freed;
+        pages_freed += freed;
     }
 
     CHECK_CU(cuCtxSynchronize());
 
     vbar_state_unlock();
 #endif
-    return (uint64_t)pages_freed * VBAR_PAGE_SIZE;
+    return (int64_t)pages_freed * VBAR_PAGE_SIZE;
 }

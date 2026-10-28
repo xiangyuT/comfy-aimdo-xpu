@@ -100,11 +100,13 @@ def test_fault_retries_with_original_watermark_only_after_release(native, monkey
     def restore(ctx, ptr, size):
         calls.append(("restore", size))
         current[0] = size // (32 * 1024 ** 2)
+        return True
     monkeypatch.setattr(model_vbar, "lib", SimpleNamespace(
         vbar_get_watermark=lambda *args: current[0], vbar_fault=fault,
         vbar_set_watermark=restore))
     monkeypatch.setattr(control, "capture_xpu_oom_snapshot", lambda *args, **kwargs: None)
     vbar = SimpleNamespace(base_addr=4096, device=0, _devctx=1, _ptr=2)
+    vbar.set_watermark = lambda size: model_vbar.ModelVBAR.set_watermark(vbar, size)
     result = model_vbar.ModelVBAR.fault(vbar, 4096, 32 * 1024 ** 2)
     assert (result is not None) == bool(watermark and released)
     assert calls == ([("fault", watermark), ("restore", watermark * 32 * 1024 ** 2),
@@ -118,7 +120,7 @@ def test_linux_native_unpin_registers_queue_before_releasing_pin(native, monkeyp
         calls.append(("register", queue, device))
         return registered
     lib = SimpleNamespace(aimdo_xpu_register_consumer_queue=register,
-        vbar_unpin=lambda *args: calls.append(("unpin", *args)))
+        vbar_unpin=lambda *args: (calls.append(("unpin", *args)) or True))
     monkeypatch.setattr(model_vbar, "lib", lib)
     monkeypatch.setattr(model_vbar, "_consumer_queue_ptr", lambda device, stream: 1234)
     vbar = SimpleNamespace(base_addr=4096, device=0, _devctx=1, _ptr=2)
