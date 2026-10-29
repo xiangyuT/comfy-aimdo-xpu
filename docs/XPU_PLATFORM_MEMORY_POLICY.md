@@ -173,6 +173,22 @@ the existing synchronized reclaim path. Reclaim waits every registered queue.
 Unknown queues and graph-capture consumers retain the pin and raise an error;
 Linux native mode does not claim Windows external/capture lease support.
 
+## Writable VBAR backing
+
+With the 0.6.0 pageout callback, a model-owner eviction completes writeback
+before unmapping. A callback exception is returned as an error and retains the
+page, allowing the owner to repair its backing and retry. Every pin in an
+unpin range is released before pageout starts, including when a later write
+fails. The callback receives the requested logical length of the last page.
+
+XPU runtime allocation callbacks skip VBARs with writable backing. They cannot
+call Python while Torch or Unified Runtime holds allocator locks; fault,
+watermark and explicit free are the owner boundaries that may perform those
+writes. This can reduce allocator-time reclaim and leaves genuine allocation
+failure to the ordinary allocator retry/OOM path. Windows nonblocking retired
+page scans likewise skip writable VBARs; this Linux migration does not qualify
+Windows writeback.
+
 ## Shared invariants
 
 1. VBAR pages are reclaimed only when unpinned and safe to retire.

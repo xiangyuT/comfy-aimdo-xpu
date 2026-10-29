@@ -7,14 +7,14 @@ library are stored below its private `_vendor` directory. It never installs a
 top-level `comfy_aimdo` file, so the official AIMDO distribution remains
 independently upgradeable.
 
-After building `comfy_aimdo/aimdo_xpu.so` and the canonical 0.5.6 wheel, run:
+After building `comfy_aimdo/aimdo_xpu.so` and the canonical 0.6.0 wheel, run:
 
 ```bash
 python packaging/xpu_runtime_provider/build_wheel.py \
-  --source-wheel dist/comfy_aimdo-0.5.6-cp39-abi3-linux_x86_64.whl \
+  --source-wheel dist/comfy_aimdo-0.6.0-cp39-abi3-linux_x86_64.whl \
   --output-dir dist/provider \
   --source-revision "$(git rev-parse HEAD)" \
-  --torch-version 2.13.0+xpu \
+  --torch-version 2.14.0+xpu \
   --xpu-target bmg
 ```
 
@@ -22,16 +22,19 @@ The output contains a lightweight
 `comfyui_omnixpu.runtime_providers` entry point and a manifest covering the
 canonical version, exact source revision, source-wheel hash, native-library
 hash, supported runtime, and allocator modes. Importing its metadata does not
-import PyTorch or AIMDO. The source and provider wheels both use version 0.5.6.
+import PyTorch or AIMDO. The source and provider wheels both use version 0.6.0.
 
-The provider retains its Linux and Windows runtime declarations. Version 0.5.6
-imports upstream's NULL physical-page release guard; it adds no public XPU
-recording capability. Historical 0.5.5 build and install validation covered
-Linux only; 0.5.6 installed-runtime validation remains pending. The Windows XPU build script
-now includes upstream `disk-id.c` and its required libraries, providing the
-`aimdo_storage_fast_disk` source for `storage.fast_disk()`. A Windows build
-and runtime test are still required before the 0.5.6 API and the existing
-Windows allocator route can be claimed as validated.
+The provider retains its Linux and Windows runtime declarations. The 0.6.0
+source adds writable VBAR callbacks and a bounded device-to-file staging path.
+On XPU, DtoH completes on the validated source queue before its staging slot
+is reused. Callback failures propagate and retain unsaved pages. Runtime
+allocation callbacks skip writable VBARs to avoid Python reentry under allocator
+locks; the model-owner boundary performs writeback. See
+[the platform memory policy](../../docs/XPU_PLATFORM_MEMORY_POLICY.md).
+
+Historical 0.5.5/0.5.6 build and install evidence applies only to those exact
+artifacts. The Windows build retains the storage detection and allocator
+implementation; Linux results do not establish Windows writeback validation.
 
 For the opt-in Linux B70 native-owner diagnostic, build against the selected
 Torch XPU release and oneAPI C++20 compiler. The llm-scaler integration currently
@@ -43,11 +46,11 @@ AIMDO_XPU_BUILD_NATIVE_OWNER_DIAGNOSTIC=1 \
 AIMDO_TORCH_PYTHON=/opt/venv/bin/python \
 bash scripts/build-linux-xpu.sh
 
-SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COMFY_AIMDO=0.5.6 \
+SETUPTOOLS_SCM_PRETEND_VERSION_FOR_COMFY_AIMDO=0.6.0 \
 /opt/venv/bin/python -m build --wheel --no-isolation --outdir dist
 
 python packaging/xpu_runtime_provider/build_wheel.py \
-  --source-wheel dist/comfy_aimdo-0.5.6-cp39-abi3-linux_x86_64.whl \
+  --source-wheel dist/comfy_aimdo-0.6.0-cp39-abi3-linux_x86_64.whl \
   --output-dir dist/provider \
   --source-revision "$(git rev-parse HEAD)" \
   --torch-version 2.14.0+xpu \

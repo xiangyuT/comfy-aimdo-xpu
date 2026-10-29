@@ -466,13 +466,23 @@ SHARED_EXPORT int malloc_graph_last_allocation_driver_error(void) {
 }
 #endif
 
+#ifdef AIMDO_XPU
+#define free_vbars_for_graph_allocation vbars_free_for_allocator
+#else
+#define free_vbars_for_graph_allocation vbars_free
+#endif
+
 static CUresult create_page(MallocGraph *g, PhysicalPage **page) {
     CUresult r;
 
-    vbars_free(budget_deficit(MG_PAGE));
+    if (!free_vbars_for_graph_allocation(budget_deficit(MG_PAGE))) {
+        return CUDA_ERROR_UNKNOWN;
+    }
     r = alloc_graph_page(g, page);
     if (r == CUDA_ERROR_OUT_OF_MEMORY) {
-        vbars_free(MG_PAGE);
+        if (!free_vbars_for_graph_allocation(MG_PAGE)) {
+            return CUDA_ERROR_UNKNOWN;
+        }
         r = alloc_graph_page(g, page);
     }
 #ifdef AIMDO_XPU
@@ -913,7 +923,7 @@ static size_t small_allocation_offset(MallocGraph *g, size_t bytes) {
     return offset;
 }
 
-bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
+bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream, int *result) {
 #ifdef AIMDO_XPU
     last_allocation_driver_error = CUDA_SUCCESS;
 #endif
@@ -923,6 +933,7 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
         return false;
     }
 
+    *result = CUDA_ERROR_OUT_OF_MEMORY;
     *ptr = 0;
     size_t va = 0;
 
@@ -934,6 +945,7 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
             *ptr = type == EV_ALLOC_SMALL
                 ? virtual_range_get(g->small_base) + match->value
                 : virtual_range_get(g->base) + match->value * MG_PAGE;
+            *result = CUDA_SUCCESS;
             return true;
         }
         RETURN_G_FAILED(g->failed, true);
@@ -957,7 +969,11 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
                 PhysicalPage **page = &g->small_physical_pages[g->small_pages];
                 CUdeviceptr addr = virtual_range_get(g->small_base) + g->small_pages * MG_PAGE;
                 CUresult r = create_page(g, page);
-                RETURN_G_FAILED(r, true);
+                if (r) {
+                    g->failed = true;
+                    *result = r;
+                    return true;
+                }
                 g->small_pages++;
                 RETURN_G_FAILED(map_reference(g, addr, *page,
                                 &g->small_mapped_pages[g->small_pages - 1]), true);
@@ -977,6 +993,7 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
         track_allocation(g, allocation);
         add_used(g, bytes);
         *ptr = virtual_range_get(g->small_base) + offset;
+        *result = CUDA_SUCCESS;
         return true;
     }
 
@@ -1026,8 +1043,20 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
                    (g->allocations.physical_live[p] || rogue_phys(g, p))) {
                 p++;
             }
-            RETURN_G_FAILED(p >= MG_PAGES, true);
-            RETURN_G_FAILED(map_page(g, va + j, p), true);
+            if (p >= MG_PAGES) {
+                g->failed = true;
+                *result = CUDA_ERROR_OUT_OF_MEMORY;
+                return true;
+            }
+            CUresult r = map_page(g, va + j, p);
+            if (r) {
+                g->failed = true;
+                *result = r;
+#ifdef AIMDO_XPU
+                last_allocation_driver_error = r;
+#endif
+                return true;
+            }
         }
         g->allocations.physical_live[g->va_phys[va + j]] = true;
     }
@@ -1039,6 +1068,7 @@ bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream) {
     track_allocation(g, allocation);
     add_used(g, pages * MG_PAGE);
     *ptr = virtual_range_get(g->base) + va * MG_PAGE;
+    *result = CUDA_SUCCESS;
     return true;
 }
 

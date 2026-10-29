@@ -100,6 +100,7 @@ void *aimdo_find_loaded_module(const char *const *libraries, size_t library_coun
 #define cuMemUnmap                  g_cuda.p_cuMemUnmap
 #define cuMemRelease                g_cuda.p_cuMemRelease
 #define cuMemcpyHtoDAsync           g_cuda.p_cuMemcpyHtoDAsync
+#define cuMemcpyDtoHAsync           g_cuda.p_cuMemcpyDtoHAsync
 #define cuEventCreate               g_cuda.p_cuEventCreate
 #define cuEventDestroy              g_cuda.p_cuEventDestroy
 #define cuEventRecord               g_cuda.p_cuEventRecord
@@ -228,7 +229,10 @@ static inline void va_pool_cleanup(void) {}
 #endif
 
 /* model_vbar.c */
-size_t vbars_free(ssize_t size);
+bool vbars_free(ssize_t size);
+#ifdef AIMDO_XPU
+bool vbars_free_for_allocator(ssize_t size);
+#endif
 SHARED_EXPORT
 uint64_t vbars_analyze(void *devctx, bool only_dirty);
 
@@ -243,7 +247,7 @@ size_t vbars_free_retired(ssize_t size);
 size_t vbars_free_all_retired(void);
 void vbars_request_reclaim(ssize_t size);
 SHARED_EXPORT
-void vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
+bool vbar_unpin_stream(void *devctx, void *vbar, uint64_t offset, uint64_t size,
                        uint64_t stream);
 SHARED_EXPORT
 bool vbar_register_consumer_stream(void *devctx, void *vbar, uint64_t offset,
@@ -270,7 +274,7 @@ int aimdo_cuda_malloc_async(CUdeviceptr *devPtr, size_t size, CUstream hStream,
 int aimdo_cuda_free_async(CUdeviceptr devPtr, CUstream hStream,
                           CUresult (*true_cuMemFreeAsync)(CUdeviceptr, CUstream));
 
-bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream);
+bool malloc_graph_alloc(CUdeviceptr *ptr, size_t size, CUstream stream, int *result);
 bool malloc_graph_free(CUdeviceptr ptr, CUstream stream, int *result);
 #ifdef AIMDO_XPU
 SHARED_EXPORT
