@@ -110,7 +110,33 @@ def test_fault_retries_with_original_watermark_only_after_release(native, monkey
     result = model_vbar.ModelVBAR.fault(vbar, 4096, 32 * 1024 ** 2)
     assert (result is not None) == bool(watermark and released)
     assert calls == ([("fault", watermark), ("restore", watermark * 32 * 1024 ** 2),
-                      ("fault", watermark)] if released else [("fault", watermark)])
+                      ("fault", watermark)] if released and watermark else [("fault", watermark)])
+    assert state["flushes"] == int(bool(watermark))
+
+
+@pytest.mark.parametrize("offset,size", [
+    (32 * 1024 ** 2, 1),
+    (32 * 1024 ** 2 - 1, 2),
+    (64 * 1024 ** 2, 32 * 1024 ** 2),
+])
+def test_fault_above_existing_watermark_preserves_torch_cache(native, monkeypatch, offset, size):
+    state, hints = native
+    faults = []
+    snapshots = []
+    monkeypatch.setattr(model_vbar, "lib", SimpleNamespace(
+        vbar_get_watermark=lambda *args: 1,
+        vbar_fault=lambda *args: (faults.append(args) or 1),
+        vbar_set_watermark=lambda *args: pytest.fail("Denied range must not reopen")))
+    monkeypatch.setattr(control, "capture_xpu_oom_snapshot",
+                        lambda *args, **kwargs: snapshots.append(kwargs))
+    vbar = SimpleNamespace(base_addr=4096, device=0, _devctx=1, _ptr=2)
+    vbar.set_watermark = lambda n: model_vbar.ModelVBAR.set_watermark(vbar, n)
+    assert model_vbar.ModelVBAR.fault(vbar, vbar.base_addr + offset, size) is None
+    assert len(faults) == 1
+    assert state["flushes"] == 0
+    assert state["reserved"] == 64
+    assert not hints
+    assert snapshots == [{"stage": "vbar_fault_host_offload", "request_bytes": size}]
 
 
 @pytest.mark.parametrize("registered", [True, False])

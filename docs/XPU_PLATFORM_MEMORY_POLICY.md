@@ -162,11 +162,48 @@ After a real allocator OOM, retry accounts for tracked bytes actually returned
 on the same device/context before choosing a residual reclaim amount.
 
 The reverse direction runs at a failed VBAR fault, outside the UR callback.
+On Linux native mode, a range already above its pre-fault watermark remains
+on the existing host-streaming route without flushing Torch's cache. Linux
+does not reopen that range, and recovery restores only the pre-fault watermark,
+so returning cached Torch storage cannot admit that request. A range that was
+inside the watermark before the failed fault retains the recovery below.
 It retries the fault once only if `torch.xpu.empty_cache()` reduced reserved
 bytes. An unchanged unsuccessful cache state is suppressed until allocator
 state changes. This Linux path does not inherit Windows WDDM time or size
 thresholds. These mechanisms require target-local runtime and workflow
 validation; a configured default alone makes no performance claim.
+
+### Why the pre-fault boundary matters
+
+Let `P` be the native VBAR page size (32 MiB), `W0` the watermark in pages
+before the first fault, and `E = offset + size` for a valid nonempty request.
+Linux rejects a request whose rounded-up end page exceeds its watermark.
+When `E > W0 * P`, emptying Torch's cache and restoring `W0` cannot admit
+that request. It only removes buffers that later Torch operations could reuse.
+The denied request therefore retains its existing host-streaming result without
+that cache flush. The page size is an allocator ABI constant, not a model width
+or a hardware-SKU restriction.
+
+The snapshot must precede the native call. A request with `E <= W0 * P` may
+still fail when allocation pressure lowers the watermark during that call.
+After a real cache release, restoring `W0` and retrying once can recover this
+case; testing only the reduced post-fault watermark would suppress valid
+recovery. The retry retains the native budget and per-page allocation checks.
+
+This distinction can matter when dynamic model weights repeatedly access an
+already excluded range while Torch repeatedly reuses activation or workspace
+buffers. Losing those buffers creates new segment allocations; under native
+budget pressure, the UR hook can return a synthetic OOM so Torch releases its
+cache and retries. That allocator path may synchronize the device. Avoiding an
+unrecoverable weight fault's cache flush can reduce this repeated cycle without
+raising the memory budget or removing consumer waits.
+
+The trigger is the failed-range/cache-reuse pattern, not the model name,
+quantization label or GPU. Mostly resident weights, rare denied faults or no
+reusable Torch cache offer little reason to expect a benefit. Driver OOM and
+synthetic budget OOM must be distinguished in target-local measurements.
+Windows watermark reopening and non-native allocator modes keep their existing
+recovery behavior; they are outside this Linux-native optimization.
 
 Before Linux native unpin, the actual Torch consumer queue is registered with
 the existing synchronized reclaim path. Reclaim waits every registered queue.
