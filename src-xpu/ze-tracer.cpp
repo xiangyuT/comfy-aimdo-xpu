@@ -25,6 +25,7 @@ typedef struct XpuNativeAllocation {
     void *ptr;
     size_t size;
     int device;
+    bool accounted;
     struct XpuNativeAllocation *next;
 } XpuNativeAllocation;
 
@@ -53,6 +54,7 @@ extern bool aimdo_xpu_sample_pressure(int device, size_t size);
 extern bool aimdo_xpu_prepare_allocation(int device, size_t size);
 extern bool aimdo_xpu_retry_allocation(int device, size_t size);
 extern bool aimdo_xpu_account_allocation(int device, int64_t delta);
+extern bool aimdo_xpu_ur_accounting_active(void);
 extern void aimdo_xpu_record_native_allocation(size_t size);
 extern void aimdo_xpu_record_native_release(size_t size);
 
@@ -64,6 +66,7 @@ static size_t xpu_allocation_hash(void *ptr) {
 void aimdo_xpu_note_native_allocation(void *ptr, size_t size, int device) {
     XpuNativeAllocation *entry;
     size_t bucket;
+    bool account;
 
     if (!ptr || size == 0 || device < 0 || !g_xpu_allocation_lock_initialized) {
         return;
@@ -72,9 +75,11 @@ void aimdo_xpu_note_native_allocation(void *ptr, size_t size, int device) {
     if (!entry) {
         return;
     }
+    account = !aimdo_xpu_ur_accounting_active();
     entry->ptr = ptr;
     entry->size = size;
     entry->device = device;
+    entry->accounted = account;
     bucket = xpu_allocation_hash(ptr);
 
     EnterCriticalSection(&g_xpu_allocation_lock);
@@ -82,7 +87,9 @@ void aimdo_xpu_note_native_allocation(void *ptr, size_t size, int device) {
     g_xpu_allocations[bucket] = entry;
     LeaveCriticalSection(&g_xpu_allocation_lock);
 
-    aimdo_xpu_account_allocation(device, (int64_t)size);
+    if (account) {
+        aimdo_xpu_account_allocation(device, (int64_t)size);
+    }
     aimdo_xpu_record_native_allocation(size);
 }
 
@@ -110,7 +117,9 @@ void aimdo_xpu_note_native_release(void *ptr) {
     if (!entry) {
         return;
     }
-    aimdo_xpu_account_allocation(entry->device, -(int64_t)entry->size);
+    if (entry->accounted) {
+        aimdo_xpu_account_allocation(entry->device, -(int64_t)entry->size);
+    }
     aimdo_xpu_record_native_release(entry->size);
     free(entry);
 }
