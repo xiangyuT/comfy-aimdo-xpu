@@ -99,7 +99,10 @@ static ze_result_t ZE_APICALL aimdo_zeMemAllocDevice(
         /* The Unified Runtime hook already applied the AIMDO budget to this
          * request one layer above, before the driver was entered. Running a
          * second control loop here would sample and reclaim against pressure
-         * that has just been arbitrated, so this path only accounts. */
+         * that has just been arbitrated, so this path skips arbitration and
+         * only notes the allocation: it registers the pointer and records the
+         * statistic, and bills the ledger only when the call is not nested
+         * inside an active UR allocation (which already billed it). */
         result = true_zeMemAllocDevice(context, descriptor, size, alignment,
                                        device_handle, pointer);
         if (result == ZE_RESULT_SUCCESS && pointer && *pointer) {
