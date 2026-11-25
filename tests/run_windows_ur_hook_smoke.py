@@ -84,12 +84,14 @@ def main():
 
     device = torch.device("xpu", arguments.device)
     torch.xpu.empty_cache()
+    baseline_usage = control.get_total_vram_usage()
     tensors = [
         torch.empty(arguments.alloc_mib * MIB, dtype=torch.uint8, device=device)
         for _ in range(3)
     ]
     torch.xpu.synchronize()
     during = control.get_xpu_ur_hook_stats()
+    during_usage = control.get_total_vram_usage()
 
     report.check(
         "3. torch allocations reach AIMDO's own hook",
@@ -120,6 +122,7 @@ def main():
     torch.xpu.empty_cache()
     torch.xpu.synchronize()
     after = control.get_xpu_ur_hook_stats()
+    after_usage = control.get_total_vram_usage()
 
     report.check(
         "7. releases are observed and credited back",
@@ -132,9 +135,16 @@ def main():
         after["tracked_alloc_bytes"] == after["tracked_free_bytes"],
         f"alloc={after['tracked_alloc_bytes']} free={after['tracked_free_bytes']}",
     )
+    expected_delta = during["tracked_alloc_bytes"] - before["tracked_alloc_bytes"]
+    actual_delta = during_usage - baseline_usage
+    report.check(
+        "9. total_vram_usage accounts UR allocations once without L0 double-counting",
+        actual_delta == expected_delta and after_usage == baseline_usage,
+        f"during_delta={actual_delta} expected={expected_delta} after_usage={after_usage} baseline={baseline_usage}",
+    )
 
     control.deinit()
-    report.check("9. the hook detaches cleanly", True, "deinit returned")
+    report.check("10. the hook detaches cleanly", True, "deinit returned")
 
     print()
     for key, value in after.items():

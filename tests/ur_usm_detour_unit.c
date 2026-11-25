@@ -26,6 +26,7 @@ static int g_evict_calls;
 static int g_real_alloc_calls;
 static int g_real_free_calls;
 static int g_fail_next_real_alloc;
+static int g_accounting_active_in_real_alloc;
 
 #include "../src-xpu/ur-usm-detour.c"
 
@@ -85,6 +86,7 @@ static ur_result_t __cdecl fake_alloc(ur_context_handle_t context,
     (void)description;
     (void)pool;
     ++g_real_alloc_calls;
+    g_accounting_active_in_real_alloc = aimdo_xpu_ur_accounting_active() ? 1 : 0;
     if (g_fail_next_real_alloc) {
         g_fail_next_real_alloc = 0;
         if (pointer) {
@@ -125,6 +127,7 @@ static void reset(void) {
     g_real_alloc_calls = 0;
     g_real_free_calls = 0;
     g_fail_next_real_alloc = 0;
+    g_accounting_active_in_real_alloc = -1;
     test_reset_state();
     true_urUSMDeviceAlloc = fake_alloc;
     true_urUSMFree = fake_free;
@@ -148,6 +151,8 @@ static void test_within_budget_passes_through(void) {
           UR_RESULT_SUCCESS);
     CHECK(pointer != NULL);
     CHECK(g_real_alloc_calls == 1);
+    CHECK(g_accounting_active_in_real_alloc == 1);
+    CHECK(!aimdo_xpu_ur_accounting_active());
     CHECK(g_evict_calls == 0);
     CHECK(g_stats[kSyntheticOomCalls] == 0);
     CHECK(g_accounted_bytes == 4096);
@@ -240,8 +245,11 @@ static void test_disable_succeeds_with_live_segments(void) {
 
     /* Once disabled the hook must not arbitrate at all. */
     g_script_deficit = 1 << 20;
+    g_accounting_active_in_real_alloc = -1;
     CHECK(aimdo_urUSMDeviceAlloc(NULL, NULL, NULL, NULL, 4096, &pointer) ==
           UR_RESULT_SUCCESS);
+    CHECK(g_accounting_active_in_real_alloc == 0);
+    CHECK(!aimdo_xpu_ur_accounting_active());
     CHECK(g_stats[kPassThroughAllocCalls] == 1);
     CHECK(g_evict_calls == 0);
 }
@@ -478,6 +486,26 @@ static void test_publishing_rearms_the_mechanism(void) {
     CHECK(g_stats[kSyntheticOomCalls] == 1);
 }
 
+/* The UR accounting guard must be active while the real driver allocation runs
+ * on the tracked path and clear as soon as the call returns, including when
+ * the driver itself fails with out-of-memory. */
+static void test_ur_accounting_clears_on_runtime_oom(void) {
+    void *pointer = (void *)(uintptr_t)0xdeadbeef;
+
+    reset();
+    InterlockedExchange(&g_test_request_kind, kTestRequestDirect);
+    g_script_deficit = 0;
+    g_fail_next_real_alloc = 1;
+
+    CHECK(!aimdo_xpu_ur_accounting_active());
+    CHECK(aimdo_urUSMDeviceAlloc(NULL, NULL, NULL, NULL, 4096, &pointer) ==
+          UR_RESULT_ERROR_OUT_OF_DEVICE_MEMORY);
+    CHECK(pointer == NULL);
+    CHECK(g_real_alloc_calls == 1);
+    CHECK(g_accounting_active_in_real_alloc == 1);
+    CHECK(!aimdo_xpu_ur_accounting_active());
+}
+
 int main(void) {
     test_within_budget_passes_through();
     test_torch_request_fails_then_retry_evicts();
@@ -489,6 +517,7 @@ int main(void) {
     test_no_refusal_when_torch_has_no_cache();
     test_stale_cache_estimate_is_corrected();
     test_publishing_rearms_the_mechanism();
+    test_ur_accounting_clears_on_runtime_oom();
     benchmark_classification();
 
     if (g_failures) {

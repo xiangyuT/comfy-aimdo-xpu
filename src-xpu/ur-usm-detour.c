@@ -153,6 +153,11 @@ static __declspec(thread) size_t t_retry_size;
 static __declspec(thread) int t_retry_reason;
 static __declspec(thread) LONG64 t_retry_generation;
 static __declspec(thread) LONG64 t_retry_returned_bytes;
+static __declspec(thread) int t_ur_accounting_depth;
+
+bool aimdo_xpu_ur_accounting_active(void) {
+    return t_ur_accounting_depth > 0;
+}
 
 /* Bytes PyTorch is holding in its own cache, per device.
  *
@@ -470,8 +475,14 @@ static ur_result_t allocate_and_account(
     ur_context_handle_t context, ur_device_handle_t device,
     const ur_usm_desc_t *description, ur_usm_pool_handle_t pool, size_t size,
     void **pointer, int aimdo_device) {
-    ur_result_t result =
-        true_urUSMDeviceAlloc(context, device, description, pool, size, pointer);
+    ur_result_t result;
+
+    /* Nested Level Zero hooks observe the underlying zeMemAllocDevice on this
+     * thread; mark UR ownership so total_vram_usage is credited once here. */
+    ++t_ur_accounting_depth;
+    result = true_urUSMDeviceAlloc(context, device, description, pool, size,
+                                   pointer);
+    --t_ur_accounting_depth;
 
     if (is_oom(result)) {
         stat_add(kRuntimeOomCalls, 1);
